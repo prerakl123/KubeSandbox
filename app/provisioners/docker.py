@@ -34,12 +34,13 @@ from app.domain.execution import (
     VARIABLE_DUMP_PATH,
     BatchCommand,
     BatchRunResult,
+    FileEntry,
     SandboxHandle,
     SandboxSpec,
     SandboxState,
     SandboxStatus,
 )
-from app.provisioners.base import PTYStream
+from app.provisioners.base import PTYEvent, PTYStream, parse_find_output
 from app.provisioners.resources import parse_cpu_to_nanocpus, parse_memory_to_bytes
 
 logger = get_logger(__name__)
@@ -50,6 +51,25 @@ _SANDBOX_UID = 10001
 # aiodocker's container.exec() defaults to root when `user` is omitted (see its own
 # docstring) — every exec here must be explicit, or "no root, ever" silently breaks.
 _SANDBOX_EXEC_USER = f"{_SANDBOX_UID}:{_SANDBOX_UID}"
+# `-A`: attach to this session if it already exists, else create it — a single command
+# gives us create-or-reattach for free (doc §20 Phase 4 "reattach-after-disconnect").
+# Requires `dtach` baked into the golden image (components/*/Dockerfile).
+#
+# Originally implemented with tmux, confirmed live NOT to work in these containers:
+# tmux >=3.4 tries to move every new pane into its own cgroup via a systemd D-Bus
+# call (`spawn_pane: moving pane to new cgroup failed: failed to connect to session
+# bus: No medium found`), which is fatal here — no systemd/dbus exists in this
+# minimal, non-root container, and adding one just to satisfy tmux would be a much
+# bigger, security-relevant change than switching multiplexers. Confirmed live even a
+# fully-detached `tmux new-session -d` session dies immediately (0 sessions after),
+# ruling out a client-attach-specific issue. `dtach` has no such dependency — it's a
+# single-purpose attach/detach wrapper around one pty, exactly what's needed here.
+# `-e none`: disable dtach's own detach-escape-key handling entirely (default Ctrl-\)
+# — SIGQUIT is delivered as that same control byte (see PTYStream docstring), and we
+# don't want dtach intercepting it; detach only ever happens via the WS connection
+# actually dropping. `-z`: pass Ctrl-Z straight through to the shell instead of dtach
+# swallowing it as a host-side suspend key (there's no real host job control here).
+_INTERACTIVE_SHELL_CMD = ["dtach", "-A", "/tmp/.kubesandbox-attach.sock", "-e", "none", "-z", "/bin/bash"]
 
 
 def _half_close_stdin(stream: Stream) -> None:
@@ -319,24 +339,17 @@ class DockerProvisioner:
             variables=variables,
         )
 
-    async def _read_variable_dump(self, container: aiodocker.docker.DockerContainer) -> dict | None:
-        """Reads via `exec` (`cat`) rather than the archive/`docker cp` API — confirmed
-        against a live daemon that `get_archive` can't find a file that was written into
-        a tmpfs mount on a ReadonlyRootfs container (a Docker archive-endpoint
-        limitation with this exact configuration, matching the `put_archive` issue
-        already worked around in `put_files`), even though the file demonstrably exists
-        from the writer's own point of view — it wrote it with no exception raised."""
-        try:
-            exec_obj = await container.exec(
-                cmd=["cat", VARIABLE_DUMP_PATH],
-                stdout=True,
-                stderr=True,
-                user=_SANDBOX_EXEC_USER,
-            )
-        except DockerError as exc:
-            logger.warning("variable_dump_read_failed", stage="exec_create", error=str(exc))
-            return None
-
+    async def _exec_capture(
+        self, container: aiodocker.docker.DockerContainer, cmd: list[str]
+    ) -> tuple[int, bytes]:
+        """Run `cmd` via `exec` and capture its combined stdout+stderr as raw bytes —
+        shared by variable-dump reading, file download, and tree listing, all of which
+        read via `exec` (`cat`/`find`) rather than the archive/`docker cp` API:
+        confirmed against a live daemon that `get_archive` can't find a file written
+        into a tmpfs mount on a ReadonlyRootfs container (the same archive-endpoint
+        limitation already worked around in `put_files`), even though the file
+        demonstrably exists from the writer's own point of view."""
+        exec_obj = await container.exec(cmd=cmd, stdout=True, stderr=True, user=_SANDBOX_EXEC_USER)
         output = bytearray()
         stream = exec_obj.start(detach=False)
         try:
@@ -348,12 +361,18 @@ class DockerProvisioner:
         finally:
             with contextlib.suppress(Exception):
                 await stream.close()
-
         info = await exec_obj.inspect()
-        if info.get("ExitCode"):
-            logger.warning(
-                "variable_dump_read_failed", stage="cat_exit", exit_code=info.get("ExitCode")
-            )
+        return info.get("ExitCode") or 0, bytes(output)
+
+    async def _read_variable_dump(self, container: aiodocker.docker.DockerContainer) -> dict | None:
+        try:
+            exit_code, output = await self._exec_capture(container, ["cat", VARIABLE_DUMP_PATH])
+        except DockerError as exc:
+            logger.warning("variable_dump_read_failed", stage="exec_create", error=str(exc))
+            return None
+
+        if exit_code:
+            logger.warning("variable_dump_read_failed", stage="cat_exit", exit_code=exit_code)
             return None
 
         try:
@@ -362,10 +381,90 @@ class DockerProvisioner:
             logger.warning("variable_dump_read_failed", stage="parse", error=str(exc))
             return None
 
+    async def get_file(self, handle: SandboxHandle, path: str) -> bytes:
+        container = self._docker.containers.container(handle.native_ref)
+        try:
+            exit_code, output = await self._exec_capture(container, ["cat", path])
+        except DockerError as exc:
+            raise ProvisionerError(f"failed to read {path!r}: {exc}") from exc
+        if exit_code:
+            raise ProvisionerError(
+                f"failed to read {path!r} (exit {exit_code}): {output.decode(errors='replace')!r}"
+            )
+        return output
+
+    async def list_tree(self, handle: SandboxHandle, path: str) -> list[FileEntry]:
+        container = self._docker.containers.container(handle.native_ref)
+        cmd = ["find", path, "-mindepth", "1", "-printf", "%y|%P\n"]
+        try:
+            exit_code, output = await self._exec_capture(container, cmd)
+        except DockerError as exc:
+            raise ProvisionerError(f"failed to list {path!r}: {exc}") from exc
+        if exit_code:
+            raise ProvisionerError(
+                f"failed to list {path!r} (exit {exit_code}): {output.decode(errors='replace')!r}"
+            )
+        return parse_find_output(output.decode(errors="replace"))
+
     # -- interactive (Phase 4) -----------------------------------------------------------
 
     async def attach(self, handle: SandboxHandle) -> PTYStream:
-        raise NotImplementedError(
-            "Interactive PTY attach is Phase 4 (doc roadmap §20); DockerProvisioner "
-            "currently only supports batch execution (doc §5.1)."
-        )
+        container = self._docker.containers.container(handle.native_ref)
+        try:
+            exec_obj = await container.exec(
+                cmd=_INTERACTIVE_SHELL_CMD,
+                stdin=True,
+                stdout=True,
+                stderr=True,
+                tty=True,
+                workdir="/workspace",
+                user=_SANDBOX_EXEC_USER,
+            )
+        except DockerError as exc:
+            if exc.status == 404:
+                raise SandboxNotFoundError(handle.sandbox_id) from exc
+            raise ProvisionerError(f"failed to open interactive attach: {exc}") from exc
+
+        stream = exec_obj.start(detach=False)
+        # Single explicit init point before read_out()/write_in() might run
+        # concurrently from separate WS-gateway pump tasks — both methods lazily call
+        # _init() themselves, but only the first caller should race the handshake;
+        # same reasoning as exec_batch's _pump doing this before write_in/half-close.
+        await stream._init()  # noqa: SLF001 — no public API for this, see docker.py module docstring
+        return DockerPTYStream(exec_obj, stream)
+
+
+class DockerPTYStream:
+    """Wraps an aiodocker tty=True Exec/Stream pair as a PTYStream (doc §5.2). Under
+    tty=True, aiodocker's own parser (`_ExecParser`) never multiplexes stdout/stderr —
+    it hands back everything as one raw channel (see aiodocker/stream.py), matching
+    real PTY semantics (stdout+stderr are the same fd once a tty is allocated). Unlike
+    batch exec, there's no stream-embedded exit status either way; the exit code is
+    only available via `exec_obj.inspect()` once the stream reports EOF."""
+
+    def __init__(self, exec_obj: aiodocker.execs.Exec, stream: Stream) -> None:
+        self._exec_obj = exec_obj
+        self._stream = stream
+        self._exited = False
+
+    async def write_stdin(self, data: bytes) -> None:
+        await self._stream.write_in(data)
+
+    async def resize(self, *, cols: int, rows: int) -> None:
+        await self._exec_obj.resize(h=rows, w=cols)
+
+    async def read(self) -> PTYEvent | None:
+        if self._exited:
+            return None
+        msg = await self._stream.read_out()
+        if msg is None:
+            self._exited = True
+            with contextlib.suppress(DockerError):
+                info = await self._exec_obj.inspect()
+                return PTYEvent(kind="exit", exit_code=info.get("ExitCode") or 0)
+            return None
+        return PTYEvent(kind="output", data=msg.data)
+
+    async def close(self) -> None:
+        with contextlib.suppress(Exception):
+            await self._stream.close()

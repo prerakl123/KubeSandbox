@@ -99,3 +99,10 @@ class BatchRunResult(BaseModel):
     truncated: bool = False
     timed_out: bool = False
     variables: dict[str, Any] | None = None
+
+
+class FileEntry(BaseModel):
+    """One entry from Provisioner.list_tree() (doc §5.4)."""
+
+    path: str  # relative to the requested root
+    is_dir: bool

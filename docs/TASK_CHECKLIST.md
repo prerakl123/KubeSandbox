@@ -6,10 +6,12 @@ of the roadmap table, not a re-statement of it — each phase's one-line "delive
 below is exploded into the actual concrete pieces of work it implies across the rest of
 the doc (§3–§19).
 
-**Summary: 57 / 103 items complete — Phase 0 (20/21), Phase 1 (21/21, fully
-live-verified), Phase 2 (10/10, fully live-verified), and Phase 3 (6/6, fully
-live-verified against a real kind cluster). Phases 4–9 and the cross-cutting section
-are 0% started.**
+**Summary: 64 / 103 items complete — Phase 0 (20/21), Phase 1 (21/21, fully
+live-verified), Phase 2 (10/10, fully live-verified), Phase 3 (6/6, fully
+live-verified against a real kind cluster), and Phase 4 (7/7, implemented,
+unit-tested — 100 unit tests passing — and live-verified against a real Docker
+daemon via a relayed hand-off loop, since this session has no direct Docker/kind
+access). Phases 5–9 and the cross-cutting section remain 0% started.**
 Phase 1 is no longer just "built" — it has been driven end-to-end against real Docker,
 real Postgres, and the actual golden image, via `POST /v1/execute` returning correct
 `stdout`/`stderr`/`exit_code`/`variables` with no leaked containers afterward. See
@@ -415,16 +417,157 @@ mocks — golden images loaded via `kind load docker-image`:
 
 ---
 
-## Phase 4 — Interactive PTY (0/7)
+## Phase 4 — Interactive PTY (7/7, implemented, unit-tested, and live-verified)
 
-- [ ] `WS /v1/sandboxes/{id}/attach`
-- [ ] `PTYStream` implementation in `DockerProvisioner` (currently `raise
-      NotImplementedError` — the method exists purely as a documented placeholder)
-- [ ] `PTYStream` implementation in `KubernetesProvisioner`
-- [ ] `resize`/`signal` client-frame handling
-- [ ] Single-viewer enforcement (409 on a concurrent second attach attempt)
-- [ ] Reattach-after-disconnect grace window
-- [ ] `GET/PUT /v1/sandboxes/{id}/files`, `GET /v1/sandboxes/{id}/tree`
+- [x] `WS /v1/sandboxes/{id}/attach` — `app/streaming/ws_gateway.py`. Auth via a
+      `?api_key=` query param (browsers can't set custom WS headers on a handshake),
+      resolved through the same `_resolve_principal` helper `X-API-Key` uses
+      (`app/api/deps.py`), honoring `auth.disabled` for local dev.
+- [x] `PTYStream` implementation in `DockerProvisioner` — `attach()` execs
+      `dtach -A /tmp/.kubesandbox-attach.sock -e none -z /bin/bash` with `tty=True`;
+      `DockerPTYStream` wraps the aiodocker `Exec`/`Stream` pair, resize via
+      `Exec.resize(h=,w=)`. (Originally `tmux`; see "Bugs found" below for why that
+      doesn't work in these containers at all.)
+- [x] `PTYStream` implementation in `KubernetesProvisioner` — same dtach invocation
+      over the channel-framed exec WebSocket `exec_batch` already uses, but held open
+      for the session's lifetime; resize sends `{"Width":,"Height":}` JSON on
+      `RESIZE_CHANNEL` (4).
+- [x] `resize`/`signal` client-frame handling — `app/streaming/pty_protocol.py`
+      defines the JSON+base64 wire frames (`stdin`/`resize`/`signal` from the client,
+      `stdout`/`exit` from the server). **Signals are not a separate transport
+      primitive on either backend** — a PTY has no "send signal" verb; the WS gateway
+      maps `signal: SIGINT|SIGQUIT|SIGTSTP` to the matching control byte (Ctrl-C/
+      Ctrl-\/Ctrl-Z) and writes it via `write_stdin`, exactly how `docker exec -t`/
+      `kubectl exec -t`/every real terminal deliver signals. `SIGTERM`/`SIGKILL` are
+      not representable this way — a documented limitation, not an oversight; a caller
+      wanting a hard kill destroys the sandbox instead.
+- [x] Single-viewer enforcement (409 on a concurrent second attach attempt) — one
+      Redis key (`attach:{sandbox_id}`) holds the attached identity with a
+      heartbeat-refreshed TTL; a *different* identity attaching while it's live is
+      rejected with a real HTTP 409 raised before `websocket.accept()` (FastAPI sends
+      this as a genuine HTTP error during the handshake, not a WS close code).
+- [x] Reattach-after-disconnect grace window — falls out of the same lock for free:
+      on disconnect the key is simply left to expire naturally (no separate
+      bookkeeping) rather than deleted; the *same* identity reconnecting before it
+      lapses is let straight back in. Reattaching resumes the *same* live shell (cwd,
+      env, running jobs) via dtach's `-A` (attach-or-create) flag — required adding
+      `dtach` to every interactively-used golden image
+      (`components/base`, `components/languages/{python,node,go}`).
+- [x] `GET/PUT /v1/sandboxes/{id}/files`, `GET /v1/sandboxes/{id}/tree` —
+      `Provisioner.get_file`/`list_tree` added to both backends (Docker via `exec`
+      `cat`/`find -printf`, reusing/generalizing the existing variable-dump capture
+      helper; Kubernetes via a new byte-preserving `_run_exec_raw` so a binary
+      download isn't corrupted by `_run_exec`'s lossy UTF-8 decode). Bounded to
+      `/workspace` with no `..` escape, validated once at the API layer.
+
+### Prerequisite this phase needed but the checklist didn't spell out
+
+`attach()`/`.../runs`/the file APIs all need an addressable sandbox that outlives a
+single request — today only `POST /v1/execute`'s ephemeral acquire→run→destroy existed.
+Added the doc §17 CRUD surface `SandboxService` was missing:
+`create_sandbox`/`get_sandbox`/`get_sandbox_status`/`destroy_sandbox`/`run_in_sandbox`/
+`open_pty`/`get_file`/`put_file`/`list_tree`, and `app/api/v1/sandboxes.py`
+(`POST /v1/sandboxes`, `GET/DELETE /v1/sandboxes/{id}`, `POST .../runs`, plus the file
+routes above). Same reasoning as Phase 0 quietly adding the `base` component alongside
+Phase 2's template work — a hard dependency the phase can't function without.
+
+Also added, not on the original checklist but load-bearing for the above:
+`app/persistence/redis.py` (doc §10.1 describes Redis for exactly this — session/
+attach registry — but no client existed yet), and a full OpenAPI/Swagger documentation
+pass across every HTTP route (summaries, per-field descriptions, centralized tag
+metadata, Schemas section hidden in Swagger UI) since the sandbox lifecycle surface
+more than doubled the API in this phase.
+
+### Bugs found and fixed during live verification (relayed hand-off)
+
+None of these were visible to the unit tests (which use `FakeProvisioner`/mocked K8s
+clients) — both only surfaced once `attach()` ran against a real container. Live
+verification for Phase 4 was a **relayed** loop (the assistant has no direct
+Docker/kind daemon access this session — see "Known scope boundaries" below), but the
+bugs found and the fixes needed are identical to a direct session; only the mechanism
+of discovery differs.
+
+1. **tmux's fallback shell resolves to `nologin`, killing the session instantly.**
+   The first `attach()` implementation ran `tmux new-session -A -s ks-main` with no
+   explicit pane command, so tmux fell back to the current user's `/etc/passwd` shell
+   entry — every sandbox user is created with `--shell /usr/sbin/nologin` (doc §6 "no
+   root, no admin" hardening, Phase 0/1). `nologin` exits immediately, killing the
+   pane and, since it's the only one, tearing the whole tmux session/server down with
+   it. Confirmed live: the client got tmux's own `[exited]` message and `exit_code: 0`
+   (a clean tmux shutdown, not a crash) instead of a prompt. First fix attempt: name
+   the shell explicitly — `tmux new-session -A -s ks-main /bin/bash` — bypassing
+   `/etc/passwd`. This also surfaced that `python:3.12-slim`/`node:20-slim` don't ship
+   `bash` by default (only `components/base`'s Dockerfile had ever installed it).
+2. **tmux itself doesn't work in these containers at all, independent of the shell
+   fix above.** Even with the explicit `/bin/bash` fix, `attach()` still immediately
+   returned `[exited]`/`exit_code: 0`. Debugged live by testing tmux directly via
+   `docker exec -it` (bypassing the app entirely) with `tmux -vv` verbose logging:
+   `spawn_pane: moving pane to new cgroup failed: failed to connect to session bus:
+   No medium found` — tmux >=3.4 tries to move every new pane into its own cgroup via
+   a systemd D-Bus call, and this is apparently fatal to the pane in this build, not
+   merely a warning. Confirmed conclusively with `tmux new-session -d` (fully
+   detached, zero clients involved at all): the server still had "0 sessions" and had
+   exited immediately after, ruling out anything client/attach-specific — the pane's
+   process itself never survives. Installing a dbus/systemd stack just to satisfy
+   tmux inside an intentionally minimal, non-root sandbox container would be a much
+   bigger (and security-relevant) change than swapping tools, so **tmux was replaced
+   with `dtach`** — a small, single-purpose attach/detach wrapper around one pty with
+   no cgroup/systemd/dbus dependency at all: `dtach -A
+   /tmp/.kubesandbox-attach.sock -e none -z /bin/bash` (`-e none` disables dtach's own
+   detach-escape-key handling, since detach should only ever happen via the WS
+   connection actually dropping, not an in-band control byte that could collide with
+   `signal: SIGQUIT`'s Ctrl-\; `-z` passes Ctrl-Z straight through to the shell
+   instead of dtach swallowing it as a host-side suspend key).
+
+Exactly the kind of bug this project's live-verification practice exists to catch —
+both depend on real `/etc/passwd` entries, a real container's init system (or lack of
+one), and a terminal multiplexer's actual process-spawning behavior, none of which a
+`FakeProvisioner`-backed unit test can exercise.
+
+### Live verification (Phase 4)
+
+Run via a **relayed hand-off loop**, not directly by the assistant — this session has
+no direct Docker/kind daemon access (the sandboxed shell gets `permission denied` on
+the Docker socket), so exact commands were handed to the user, output pasted back,
+bugs fixed and re-handed-off. Same end result as Phases 1–3's direct live
+verification, just relayed — and it's exactly this practice that caught both bugs
+above, neither of which a `FakeProvisioner`-backed unit test could have. Confirmed
+against the real `python` golden image, rebuilt with `dtach`:
+
+- `POST /v1/sandboxes` (create) → `GET /v1/sandboxes/{id}` (status) → `POST
+  .../runs` (batch run against the warm sandbox, confirmed it does **not** get
+  destroyed afterward, unlike `/v1/execute`) → `DELETE` (destroy).
+- `PUT`/`GET /v1/sandboxes/{id}/files` and `GET /v1/sandboxes/{id}/tree` — round-
+  tripped a file and confirmed the tree listing matched (this is also what confirmed
+  `find -printf` works as expected in the golden image, not just assumed).
+- **Interactive attach + reattach — the core of this phase — confirmed working
+  end to end** via `scripts/ws_attach_demo.py`: attached, ran `pwd`/`export
+  FOO=bar`/`cd /tmp`, disconnected (Ctrl-D on the client), reattached with a fresh
+  client process, and confirmed `pwd` → `/tmp` and `echo $FOO` → `bar` — proving the
+  `dtach`-backed session genuinely persisted server-side across a disconnect, not
+  just that a new shell happened to start.
+
+### Known scope boundaries (Phase 4)
+
+- **Single-viewer 409 and explicit destroy-cleanup weren't separately re-confirmed
+  live this round** (attach/reattach — the one behavior that could only be proven
+  against a real container — took priority and consumed the verification pass). Both
+  are lower-risk: the 409/reattach-grace logic is pure Redis-based application code
+  with 10 dedicated unit tests (`tests/unit/test_ws_gateway.py`) and no
+  Docker/tmux/dtach-specific behavior to surprise it, unlike the attach mechanism
+  itself.
+- **File upload is UTF-8 text only** (matching `put_files()`'s existing str-content
+  contract, the same one batch execution's `files` argument uses) — a binary upload is
+  rejected with a 400 rather than silently corrupted. Download is binary-safe.
+- **The live-verification session's kind cluster was incidentally destroyed** by an
+  overly-broad `docker rm -f --filter name=kubesandbox-` cleanup command mid-session
+  (it also matched the kind node container, `kubesandbox-dev-control-plane`) —
+  unrelated to any Phase 4 code; flagged here since Phase 3/5's Kubernetes-path live
+  verification will need `kind delete cluster && kind create cluster` to rebuild it
+  before it can run again. The `docker-compose` infra (Postgres/Redis/MinIO/registry)
+  was also caught by the same filter but recovered cleanly — those containers attach
+  to named volumes that `docker rm` (without `-v`) never touches, so `docker compose
+  up -d` recreated them with all data intact.
 
 ---
 

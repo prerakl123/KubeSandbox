@@ -33,13 +33,20 @@ import json
 import os
 import time
 import uuid
+from dataclasses import dataclass
 from datetime import UTC, datetime
 
 from aiohttp import WSMsgType
 from kubernetes_asyncio import client, config
 from kubernetes_asyncio.client.exceptions import ApiException
 from kubernetes_asyncio.stream import WsApiClient
-from kubernetes_asyncio.stream.ws_client import ERROR_CHANNEL, STDERR_CHANNEL, STDIN_CHANNEL, STDOUT_CHANNEL
+from kubernetes_asyncio.stream.ws_client import (
+    ERROR_CHANNEL,
+    RESIZE_CHANNEL,
+    STDERR_CHANNEL,
+    STDIN_CHANNEL,
+    STDOUT_CHANNEL,
+)
 
 from app.core.errors import ProvisionerError, SandboxNotFoundError
 from app.core.logging import get_logger
@@ -47,12 +54,13 @@ from app.domain.execution import (
     VARIABLE_DUMP_PATH,
     BatchCommand,
     BatchRunResult,
+    FileEntry,
     SandboxHandle,
     SandboxSpec,
     SandboxState,
     SandboxStatus,
 )
-from app.provisioners.base import PTYStream
+from app.provisioners.base import PTYEvent, PTYStream, parse_find_output
 
 logger = get_logger(__name__)
 
@@ -65,6 +73,13 @@ _POD_READY_TIMEOUT_SECONDS = 60
 _FILE_OP_TIMEOUT_SECONDS = 30
 _CLOSE_CHANNEL_INDEX = 255  # v5.channel.k8s.io: closes one stream without ending the connection
 _STDIN_CHUNK_BYTES = 512 * 1024
+# `-A`: attach to this session if it already exists, else create it — a single command
+# gives us create-or-reattach for free (doc §20 Phase 4 "reattach-after-disconnect").
+# Requires `dtach` baked into the golden image (components/*/Dockerfile) — swapped in
+# for tmux, which doesn't work in these containers at all (confirmed live: fatal
+# cgroup-via-systemd-dbus failure with no dbus available); see docker.py's copy of
+# this constant for the full explanation.
+_INTERACTIVE_SHELL_CMD = ["dtach", "-A", "/tmp/.kubesandbox-attach.sock", "-e", "none", "-z", "/bin/bash"]
 
 
 class _MultiProtocolWsApiClient(WsApiClient):
@@ -76,6 +91,19 @@ class _MultiProtocolWsApiClient(WsApiClient):
         headers = dict(headers or {})
         headers["sec-websocket-protocol"] = "v5.channel.k8s.io, v4.channel.k8s.io"
         return await super().request(method, url, query_params=query_params, headers=headers, **kwargs)
+
+
+@dataclass(frozen=True)
+class _RawExecResult:
+    """Same shape as BatchRunResult minus the fields only exec_batch's caller needs
+    (run_id) and with stdout/stderr as raw bytes rather than lossily-decoded str."""
+
+    exit_code: int
+    stdout: bytes
+    stderr: bytes
+    duration_ms: int
+    truncated: bool
+    timed_out: bool
 
 
 def _volume_name(path: str) -> str:
@@ -415,6 +443,31 @@ class KubernetesProvisioner:
         timeout_seconds: int,
         max_output_bytes: int,
     ) -> BatchRunResult:
+        raw = await self._run_exec_raw(
+            namespace, command, stdin=stdin, timeout_seconds=timeout_seconds, max_output_bytes=max_output_bytes
+        )
+        return BatchRunResult(
+            run_id=str(uuid.uuid4()),
+            exit_code=raw.exit_code,
+            stdout=raw.stdout.decode(errors="replace"),
+            stderr=raw.stderr.decode(errors="replace"),
+            duration_ms=raw.duration_ms,
+            truncated=raw.truncated,
+            timed_out=raw.timed_out,
+        )
+
+    async def _run_exec_raw(
+        self,
+        namespace: str,
+        command: list[str],
+        *,
+        stdin: bytes,
+        timeout_seconds: int,
+        max_output_bytes: int,
+    ) -> _RawExecResult:
+        """Same exec/demux plumbing as `_run_exec`, but returns raw bytes instead of
+        lossily-decoded str — get_file() needs this so downloading a binary file
+        doesn't get corrupted by a `errors="replace"` UTF-8 decode."""
         try:
             ws_ctx = await self._exec_v1.connect_get_namespaced_pod_exec(
                 _POD_NAME,
@@ -482,20 +535,109 @@ class KubernetesProvisioner:
         else:
             raise ProvisionerError(f"exec session in {namespace!r} closed with no exit status")
 
-        return BatchRunResult(
-            run_id=str(uuid.uuid4()),
+        return _RawExecResult(
             exit_code=exit_code,
-            stdout=stdout_buf.decode(errors="replace"),
-            stderr=stderr_buf.decode(errors="replace"),
+            stdout=bytes(stdout_buf),
+            stderr=bytes(stderr_buf),
             duration_ms=duration_ms,
             truncated=truncated,
             timed_out=timed_out,
         )
 
+    async def get_file(self, handle: SandboxHandle, path: str) -> bytes:
+        raw = await self._run_exec_raw(
+            handle.native_ref,
+            ["cat", path],
+            stdin=b"",
+            timeout_seconds=_FILE_OP_TIMEOUT_SECONDS,
+            max_output_bytes=10_000_000,
+        )
+        if raw.exit_code:
+            raise ProvisionerError(
+                f"failed to read {path!r} (exit {raw.exit_code}): "
+                f"{raw.stderr.decode(errors='replace')!r}"
+            )
+        return raw.stdout
+
+    async def list_tree(self, handle: SandboxHandle, path: str) -> list[FileEntry]:
+        result = await self._run_exec(
+            handle.native_ref,
+            ["find", path, "-mindepth", "1", "-printf", "%y|%P\n"],
+            stdin=b"",
+            timeout_seconds=_FILE_OP_TIMEOUT_SECONDS,
+            max_output_bytes=5_000_000,
+        )
+        if result.exit_code:
+            raise ProvisionerError(
+                f"failed to list {path!r} (exit {result.exit_code}): {result.stderr or result.stdout!r}"
+            )
+        return parse_find_output(result.stdout)
+
     # -- interactive (Phase 4) -----------------------------------------------------------
 
     async def attach(self, handle: SandboxHandle) -> PTYStream:
-        raise NotImplementedError(
-            "Interactive PTY attach is Phase 4 (doc roadmap §20); KubernetesProvisioner "
-            "currently only supports batch execution (doc §5.1)."
-        )
+        try:
+            ws_ctx = await self._exec_v1.connect_get_namespaced_pod_exec(
+                _POD_NAME,
+                handle.native_ref,
+                container=_MAIN_CONTAINER,
+                command=_INTERACTIVE_SHELL_CMD,
+                stderr=True,
+                stdin=True,
+                stdout=True,
+                tty=True,
+                _preload_content=False,
+            )
+        except ApiException as exc:
+            if exc.status == 404:
+                raise SandboxNotFoundError(handle.sandbox_id) from exc
+            raise ProvisionerError(f"failed to open interactive attach: {exc}") from exc
+
+        # Held open for the PTYStream's whole lifetime (unlike exec_batch's `async
+        # with`, which is scoped to one bundled call) — closed explicitly by
+        # KubernetesPTYStream.close().
+        ws = await ws_ctx.__aenter__()
+        return KubernetesPTYStream(ws_ctx, ws)
+
+
+class KubernetesPTYStream:
+    """Wraps the same channel-framed exec WebSocket `exec_batch`/`_run_exec` use, but
+    held open for a whole interactive session instead of one bundled call. Under
+    tty=True the remote PTY still merges stdout/stderr (real PTY semantics, matching
+    Docker's tty behavior — see docker.py's DockerPTYStream) but the server keeps
+    sending the exit-status control frame on ERROR_CHANNEL exactly as it does for
+    non-tty exec, so exit detection reuses that same frame."""
+
+    def __init__(self, ws_ctx, ws) -> None:
+        self._ws_ctx = ws_ctx
+        self._ws = ws
+        self._exited = False
+
+    async def write_stdin(self, data: bytes) -> None:
+        await self._ws.send_bytes(bytes([STDIN_CHANNEL]) + data)
+
+    async def resize(self, *, cols: int, rows: int) -> None:
+        payload = json.dumps({"Width": cols, "Height": rows}).encode()
+        await self._ws.send_bytes(bytes([RESIZE_CHANNEL]) + payload)
+
+    async def read(self) -> PTYEvent | None:
+        if self._exited:
+            return None
+        async for msg in self._ws:
+            if msg.type not in (WSMsgType.BINARY, WSMsgType.TEXT):
+                continue
+            data = msg.data if isinstance(msg.data, (bytes, bytearray)) else msg.data.encode()
+            if not data:
+                continue
+            channel, payload = data[0], data[1:]
+            if channel in (STDOUT_CHANNEL, STDERR_CHANNEL):
+                return PTYEvent(kind="output", data=bytes(payload))
+            if channel == ERROR_CHANNEL:
+                self._exited = True
+                return PTYEvent(kind="exit", exit_code=WsApiClient.parse_error_data(bytes(payload)))
+        self._exited = True
+        return None
+
+    async def close(self) -> None:
+        with contextlib.suppress(Exception):
+            await self._ws_ctx.__aexit__(None, None, None)

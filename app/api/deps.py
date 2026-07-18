@@ -8,7 +8,8 @@ from __future__ import annotations
 
 import hashlib
 
-from fastapi import Depends, Header, HTTPException, Request, status
+import redis.asyncio as redis
+from fastapi import Depends, Header, HTTPException, Request, WebSocket, status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -53,10 +54,7 @@ async def _get_or_create_local_dev_principal(session: AsyncSession) -> Principal
     return Principal(tenant_id=tenant.id, user_id=user.id, role=user.role)
 
 
-async def get_current_principal(
-    session: AsyncSession = Depends(get_session),
-    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
-) -> Principal:
+async def _resolve_principal(session: AsyncSession, api_key: str | None) -> Principal:
     settings = get_settings()
 
     if settings.auth.disabled:
@@ -64,20 +62,36 @@ async def get_current_principal(
         await session.commit()
         return principal
 
-    if not x_api_key:
-        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "missing X-API-Key header")
+    if not api_key:
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "missing API key")
 
-    api_key = (
+    row = (
         await session.execute(
-            select(ApiKey).where(
-                ApiKey.key_hash == _hash_api_key(x_api_key), ApiKey.revoked.is_(False)
-            )
+            select(ApiKey).where(ApiKey.key_hash == _hash_api_key(api_key), ApiKey.revoked.is_(False))
         )
     ).scalar_one_or_none()
-    if api_key is None:
+    if row is None:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "invalid or revoked API key")
 
-    return Principal(tenant_id=api_key.tenant_id, user_id=None, role="service")
+    return Principal(tenant_id=row.tenant_id, user_id=None, role="service")
+
+
+async def get_current_principal(
+    session: AsyncSession = Depends(get_session),
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+) -> Principal:
+    return await _resolve_principal(session, x_api_key)
+
+
+async def get_ws_principal(
+    websocket: WebSocket,
+    session: AsyncSession = Depends(get_session),
+) -> Principal:
+    """WS counterpart to get_current_principal: browsers can't set custom headers on a
+    WebSocket handshake, so the API key travels as a `?api_key=` query param instead
+    (doc §5.2's WS attach contract). Shares `_resolve_principal` so `auth.disabled`
+    local-dev behavior and API-key hashing/lookup never drift between the two."""
+    return await _resolve_principal(session, websocket.query_params.get("api_key"))
 
 
 async def require_admin(principal: Principal = Depends(get_current_principal)) -> Principal:
@@ -96,11 +110,27 @@ def get_provisioner(request: Request) -> Provisioner:
     return request.app.state.provisioner
 
 
+def get_redis(request: Request) -> redis.Redis:
+    return request.app.state.redis
+
+
+def get_redis_ws(websocket: WebSocket) -> redis.Redis:
+    return websocket.app.state.redis
+
+
+def get_provisioner_ws(websocket: WebSocket) -> Provisioner:
+    return websocket.app.state.provisioner
+
+
 def get_sandbox_service(
     registry: Registry = Depends(get_registry),
     provisioner: Provisioner = Depends(get_provisioner),
 ) -> SandboxService:
     return SandboxService(registry, provisioner)
+
+
+def get_sandbox_service_ws(websocket: WebSocket) -> SandboxService:
+    return SandboxService(websocket.app.state.registry, websocket.app.state.provisioner)
 
 
 def get_entitlement_service(session: AsyncSession = Depends(get_session)) -> EntitlementService:

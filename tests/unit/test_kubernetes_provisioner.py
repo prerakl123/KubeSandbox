@@ -289,3 +289,94 @@ async def test_exec_batch_raises_sandbox_not_found_on_404(provisioner):
 
     with pytest.raises(SandboxNotFoundError):
         await provisioner.exec_batch(_handle(), BatchCommand(command=["echo", "hi"]))
+
+
+# -- file APIs (Phase 4, doc §5.4) -----------------------------------------------------
+
+
+async def test_get_file_returns_raw_bytes(provisioner):
+    conn = FakeWsConn(
+        [
+            FakeWsMessage(WSMsgType.BINARY, bytes([1]) + b"raw \xff bytes"),
+            FakeWsMessage(WSMsgType.BINARY, bytes([3]) + b'{"metadata":{},"status":"Success"}'),
+        ]
+    )
+    provisioner._exec_v1.connect_get_namespaced_pod_exec.return_value = FakeWsCtx(conn)
+
+    content = await provisioner.get_file(_handle(), "/workspace/main.py")
+    assert content == b"raw \xff bytes"  # not lossily decoded
+
+
+async def test_get_file_raises_on_nonzero_exit(provisioner):
+    conn = FakeWsConn(
+        [
+            FakeWsMessage(WSMsgType.BINARY, bytes([2]) + b"No such file"),
+            FakeWsMessage(
+                WSMsgType.BINARY,
+                bytes([3]) + b'{"metadata":{},"status":"Failure","details":{"causes":[{"message":"1"}]}}',
+            ),
+        ]
+    )
+    provisioner._exec_v1.connect_get_namespaced_pod_exec.return_value = FakeWsCtx(conn)
+
+    with pytest.raises(ProvisionerError, match="No such file"):
+        await provisioner.get_file(_handle(), "/workspace/missing.py")
+
+
+async def test_list_tree_parses_find_output(provisioner):
+    conn = FakeWsConn(
+        [
+            FakeWsMessage(WSMsgType.BINARY, bytes([1]) + b"f|main.py\nd|sub\n"),
+            FakeWsMessage(WSMsgType.BINARY, bytes([3]) + b'{"metadata":{},"status":"Success"}'),
+        ]
+    )
+    provisioner._exec_v1.connect_get_namespaced_pod_exec.return_value = FakeWsCtx(conn)
+
+    entries = await provisioner.list_tree(_handle(), "/workspace")
+    assert {(e.path, e.is_dir) for e in entries} == {("main.py", False), ("sub", True)}
+
+
+# -- interactive attach (Phase 4) -------------------------------------------------------
+
+
+async def test_attach_opens_tty_exec_with_dtach_reattach_command(provisioner):
+    conn = FakeWsConn([])
+    provisioner._exec_v1.connect_get_namespaced_pod_exec.return_value = FakeWsCtx(conn)
+
+    pty = await provisioner.attach(_handle())
+
+    call = provisioner._exec_v1.connect_get_namespaced_pod_exec.call_args
+    assert call.kwargs["tty"] is True
+    assert call.kwargs["command"] == [
+        "dtach", "-A", "/tmp/.kubesandbox-attach.sock", "-e", "none", "-z", "/bin/bash"
+    ]
+    await pty.close()
+
+
+async def test_attach_pty_stream_relays_output_resize_and_exit(provisioner):
+    conn = FakeWsConn(
+        [
+            FakeWsMessage(WSMsgType.BINARY, bytes([1]) + b"hello\n"),
+            FakeWsMessage(WSMsgType.BINARY, bytes([3]) + b'{"metadata":{},"status":"Success"}'),
+        ]
+    )
+    provisioner._exec_v1.connect_get_namespaced_pod_exec.return_value = FakeWsCtx(conn)
+
+    pty = await provisioner.attach(_handle())
+
+    await pty.write_stdin(b"ls\n")
+    assert conn.sent[-1] == bytes([0]) + b"ls\n"  # STDIN_CHANNEL
+
+    await pty.resize(cols=100, rows=40)
+    assert conn.sent[-1] == bytes([4]) + b'{"Width": 100, "Height": 40}'  # RESIZE_CHANNEL
+
+    event = await pty.read()
+    assert event.kind == "output"
+    assert event.data == b"hello\n"
+
+    event = await pty.read()
+    assert event.kind == "exit"
+    assert event.exit_code == 0
+
+    assert await pty.read() is None
+    await pty.close()

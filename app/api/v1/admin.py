@@ -1,21 +1,20 @@
 from __future__ import annotations
 
 from fastapi import APIRouter, Depends, Query
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from app.api.deps import Principal, get_entitlement_service, require_admin
 from app.services.entitlement_service import EntitlementService
 
-router = APIRouter(prefix="/v1/admin", tags=["admin"])
+router = APIRouter(prefix="/v1/admin", tags=["Admin"])
 
 
 class EntitlementIn(BaseModel):
-    scope: str
-    """"tenant" | "user"."""
-    scope_id: str
-    component_name: str
-    version_range: str = "*"
-    visible: bool = True
+    scope: str = Field(description="'tenant' or 'user'.")
+    scope_id: str = Field(description="The tenant id or user id this entitlement applies to.")
+    component_name: str = Field(description="Bare component name (not versioned) this entitlement covers.")
+    version_range: str = Field(default="*", description="'*' (any version) or an exact version string.")
+    visible: bool = Field(default=True, description="Whether this scope may see/select the component.")
 
 
 class EntitlementOut(EntitlementIn):
@@ -23,22 +22,26 @@ class EntitlementOut(EntitlementIn):
 
 
 class PublishGrantIn(BaseModel):
-    scope: str
-    scope_id: str
-    category: str
-    """One of the Component categories, or "template" (doc §3.6)."""
-    allowed: bool = True
+    scope: str = Field(description="'tenant' or 'user'.")
+    scope_id: str = Field(description="The tenant id or user id this grant applies to.")
+    category: str = Field(description="One of the Component categories, or 'template' (doc §3.6).")
+    allowed: bool = Field(default=True, description="Whether this scope may publish its own private components/templates in this category.")
 
 
 class PublishGrantOut(PublishGrantIn):
     id: str
 
 
-@router.get("/entitlements", response_model=list[EntitlementOut])
+@router.get(
+    "/entitlements",
+    response_model=list[EntitlementOut],
+    summary="List catalog entitlements",
+    description="What a tenant/user scope may see and select from the component catalog (doc §3.6). Admin-only.",
+)
 async def list_entitlements(
-    scope: str | None = Query(default=None),
-    scope_id: str | None = Query(default=None),
-    component_name: str | None = Query(default=None),
+    scope: str | None = Query(default=None, description="Filter to 'tenant' or 'user' scoped entries."),
+    scope_id: str | None = Query(default=None, description="Filter to one tenant id or user id."),
+    component_name: str | None = Query(default=None, description="Filter to one component name."),
     _: Principal = Depends(require_admin),
     service: EntitlementService = Depends(get_entitlement_service),
 ) -> list[EntitlementOut]:
@@ -58,7 +61,12 @@ async def list_entitlements(
     ]
 
 
-@router.patch("/entitlements", response_model=EntitlementOut)
+@router.patch(
+    "/entitlements",
+    response_model=EntitlementOut,
+    summary="Set a catalog entitlement",
+    description="Create or update what a tenant/user scope may see and select (doc §3.6). Admin-only.",
+)
 async def upsert_entitlement(
     body: EntitlementIn,
     _: Principal = Depends(require_admin),
@@ -81,11 +89,16 @@ async def upsert_entitlement(
     )
 
 
-@router.get("/publish-grants", response_model=list[PublishGrantOut])
+@router.get(
+    "/publish-grants",
+    response_model=list[PublishGrantOut],
+    summary="List publish grants",
+    description="Who may publish their own private components/templates, and in which category (doc §3.6). Admin-only.",
+)
 async def list_publish_grants(
-    scope: str | None = Query(default=None),
-    scope_id: str | None = Query(default=None),
-    category: str | None = Query(default=None),
+    scope: str | None = Query(default=None, description="Filter to 'tenant' or 'user' scoped entries."),
+    scope_id: str | None = Query(default=None, description="Filter to one tenant id or user id."),
+    category: str | None = Query(default=None, description="Filter to one category, or 'template'."),
     _: Principal = Depends(require_admin),
     service: EntitlementService = Depends(get_entitlement_service),
 ) -> list[PublishGrantOut]:
@@ -99,7 +112,12 @@ async def list_publish_grants(
     ]
 
 
-@router.patch("/publish-grants", response_model=PublishGrantOut)
+@router.patch(
+    "/publish-grants",
+    response_model=PublishGrantOut,
+    summary="Set a publish grant",
+    description="Create or update whether a tenant/user scope may publish its own private components/templates in a category (doc §3.6). Admin-only.",
+)
 async def upsert_publish_grant(
     body: PublishGrantIn,
     _: Principal = Depends(require_admin),

@@ -4,18 +4,19 @@ from fastapi import APIRouter
 
 from app.core.config import get_settings
 
-router = APIRouter(tags=["health"])
+router = APIRouter(tags=["Health"])
 
 
-@router.get("/healthz")
+@router.get("/healthz", summary="Liveness probe")
 async def healthz() -> dict:
-    """Liveness: process is up. Never checks dependencies."""
+    """Process is up. Never checks dependencies (DB/Redis/provisioner) — that's
+    `/readyz`'s job. A `kubelet`/orchestrator liveness probe should hit this one."""
     return {"status": "ok"}
 
 
-@router.get("/readyz")
+@router.get("/readyz", summary="Readiness probe")
 async def readyz() -> dict:
-    """Readiness: dependencies the API needs are reachable.
+    """Dependencies the API needs are reachable.
 
     Kept dependency-free at import time; real DB/Redis pings are wired in once
     app/persistence/db.py exists (Phase 0 follow-up) so this can run standalone today.

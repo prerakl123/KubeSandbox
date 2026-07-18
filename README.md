@@ -2,11 +2,17 @@
 
 Sandbox-provisioning control plane. See `docs/ARCHITECTURE_AND_PLAN.md` for the full
 design, and `docs/TASK_CHECKLIST.md` for an honest per-item completion status. This
-covers local setup through the Phase 0–3 slice: config, DB, the `python`/`node`/`go`/
+covers local setup through the Phase 0–4 slice: config, DB, the `python`/`node`/`go`/
 `bash`/`git`/`base` components, `DockerProvisioner` **and** `KubernetesProvisioner`,
-`POST /v1/execute` (ad-hoc language or SandboxTemplate composition), the
-component/template/entitlement registry APIs, and the Kustomize sandbox-primitive
-manifests (NetworkPolicy/RBAC/ResourceQuota/LimitRange/RuntimeClass).
+`POST /v1/execute` (ad-hoc language or SandboxTemplate composition), the non-ephemeral
+sandbox lifecycle (`POST /v1/sandboxes`, batch runs, file upload/download/tree, and
+interactive PTY attach over WebSocket), the component/template/entitlement registry
+APIs, and the Kustomize sandbox-primitive manifests (NetworkPolicy/RBAC/ResourceQuota/
+LimitRange/RuntimeClass).
+
+Full interactive API docs (every endpoint annotated — summaries, parameter
+descriptions, grouped by tag) are served at `http://localhost:8000/docs` once the app
+is running.
 
 ## Prerequisites
 
@@ -31,7 +37,9 @@ docker compose up -d
 
 # 3. Build each component's golden image (BuildManager/Kaniko is Phase 6 — for now
 #    these are one-time manual builds, matching docs §8.1's local fallback). The tags
-#    must match each component.yaml's spec.source.image exactly.
+#    must match each component.yaml's spec.source.image exactly. All four now include
+#    `dtach` (Phase 4 interactive attach reattach) — if you built these before Phase 4,
+#    rebuild them, there's no other way to pick up the Dockerfile change.
 docker build -t kubesandbox/python:3.12.4-slim components/languages/python
 docker build -t kubesandbox/node:20.15.0-slim components/languages/node
 docker build -t kubesandbox/go:1.22.5-slim components/languages/go
@@ -97,6 +105,56 @@ curl -s http://localhost:8000/v1/execute \
       }' | python3 -m json.tool
 ```
 
+### Try the sandbox lifecycle + interactive PTY attach (Phase 4)
+
+Unlike `/v1/execute`'s ephemeral acquire→run→destroy, `POST /v1/sandboxes` creates a
+sandbox that sticks around until you explicitly destroy it — which is what
+interactive attach and repeated batch runs both need:
+
+```bash
+# 1. Create a sandbox (note the id in the response)
+curl -s http://localhost:8000/v1/sandboxes \
+  -H 'Content-Type: application/json' \
+  -d '{"language": "python"}' | python3 -m json.tool
+
+SANDBOX_ID=<paste the "id" from above>
+
+# 2. Check its live status
+curl -s http://localhost:8000/v1/sandboxes/$SANDBOX_ID | python3 -m json.tool
+
+# 3. Run a batch command against it (doesn't destroy it, unlike /v1/execute)
+curl -s http://localhost:8000/v1/sandboxes/$SANDBOX_ID/runs \
+  -H 'Content-Type: application/json' \
+  -d '{"code": "print(\"still here\")"}' | python3 -m json.tool
+
+# 4. Upload/download/list workspace files
+curl -s -X PUT "http://localhost:8000/v1/sandboxes/$SANDBOX_ID/files?path=notes.txt" \
+  --data-binary "hello workspace"
+curl -s "http://localhost:8000/v1/sandboxes/$SANDBOX_ID/files?path=notes.txt"
+curl -s "http://localhost:8000/v1/sandboxes/$SANDBOX_ID/tree" | python3 -m json.tool
+
+# 5. Attach an interactive terminal (needs the `websockets` dev dependency, already
+#    in pyproject.toml's dev group)
+uv run python scripts/ws_attach_demo.py $SANDBOX_ID
+```
+
+In the attach session, try `pwd`, `export FOO=bar`, `cd /tmp` — then Ctrl-D to
+disconnect the demo client and re-run the same `ws_attach_demo.py` command. The
+reattached session should still be in `/tmp` with `$FOO` still set: attach runs
+`dtach -A ... /bin/bash` inside the sandbox, so a reattach resumes the *same* shell
+rather than starting a fresh one (doc §5.2's "reattach as the same viewer") — not
+tmux, which turned out not to work in these containers at all (see
+`docs/TASK_CHECKLIST.md`'s Phase 4 "bug found and fixed during live verification").
+
+While one client is attached, a second `ws_attach_demo.py` run against the same
+`SANDBOX_ID` (from another terminal, before the first disconnects) should be rejected
+outright — single-viewer enforcement, doc §5.2's "no collaboration in v1".
+
+```bash
+# 6. Tear it down when done
+curl -s -X DELETE http://localhost:8000/v1/sandboxes/$SANDBOX_ID -w '%{http_code}\n'
+```
+
 ### Browse the registry
 
 ```bash
@@ -136,6 +194,8 @@ kind create cluster --config deploy/kind/kind-config.yaml
 kubectl apply -k deploy/overlays/local
 
 # 4. Load each golden image into the kind node (it doesn't share the host Docker cache)
+#    — reload after any Dockerfile rebuild (e.g. Phase 4's dtach addition); kind caches
+#    by image id, not by tag, so a stale in-cluster image otherwise silently persists.
 kind load docker-image kubesandbox/python:3.12.4-slim --name kubesandbox-dev
 kind load docker-image kubesandbox/node:20.15.0-slim kubesandbox/go:1.22.5-slim kubesandbox/base:1.0 --name kubesandbox-dev
 
@@ -177,11 +237,13 @@ skip-with-a-clear-reason behavior if it isn't.
 ## Layout
 
 See `docs/ARCHITECTURE_AND_PLAN.md` §18 for the full intended repository layout; this
-slice implements the Phase 0–3 subset of it (config, manifests/registry, domain models,
+slice implements the Phase 0–4 subset of it (config, manifests/registry, domain models,
 DB + migrations, the `python`/`node`/`go`/`bash`/`git`/`base` components,
 `DockerProvisioner` and `KubernetesProvisioner`, `SandboxService` (ad-hoc + SandboxTemplate
-composition), `/v1/execute`, the component/template/entitlement/publish-grant registry
-APIs, and the Kustomize sandbox-primitive manifests under `deploy/`). Everything else in
-that layout (interactive PTY, database sidecars, the real build system, pooling,
-billing, execution-time entitlement enforcement) is later-phase work per the roadmap in
-§20 — see `docs/TASK_CHECKLIST.md` for the exact per-item status and known gaps.
+composition + the non-ephemeral sandbox lifecycle), `/v1/execute`, `/v1/sandboxes`
+(create/status/destroy/runs/files/tree), `WS /v1/sandboxes/{id}/attach` (interactive
+PTY), the component/template/entitlement/publish-grant registry APIs, and the
+Kustomize sandbox-primitive manifests under `deploy/`). Everything else in that layout
+(database sidecars, the real build system, pooling, billing, execution-time
+entitlement enforcement) is later-phase work per the roadmap in §20 — see
+`docs/TASK_CHECKLIST.md` for the exact per-item status and known gaps.
