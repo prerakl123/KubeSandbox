@@ -2,13 +2,17 @@
 
 Sandbox-provisioning control plane. See `docs/ARCHITECTURE_AND_PLAN.md` for the full
 design, and `docs/TASK_CHECKLIST.md` for an honest per-item completion status. This
-covers local setup through the Phase 0–4 slice: config, DB, the `python`/`node`/`go`/
+covers local setup through the Phase 0–5 slice: config, DB, the `python`/`node`/`go`/
 `bash`/`git`/`base` components, `DockerProvisioner` **and** `KubernetesProvisioner`,
 `POST /v1/execute` (ad-hoc language or SandboxTemplate composition), the non-ephemeral
 sandbox lifecycle (`POST /v1/sandboxes`, batch runs, file upload/download/tree, and
 interactive PTY attach over WebSocket), the component/template/entitlement registry
-APIs, and the Kustomize sandbox-primitive manifests (NetworkPolicy/RBAC/ResourceQuota/
-LimitRange/RuntimeClass).
+APIs, the Kustomize sandbox-primitive manifests (NetworkPolicy/RBAC/ResourceQuota/
+LimitRange/RuntimeClass), and database sidecars (`postgresql`/`mysql`/`redis`
+composed into a sandbox as a real second container, with a non-superuser role/ACL user
+provisioned by a `ComponentHook` — see "Try a database sidecar" below; all three are
+live-verified end to end against real containers, see `docs/TASK_CHECKLIST.md`'s
+Phase 5 section).
 
 Full interactive API docs (every endpoint annotated — summaries, parameter
 descriptions, grouped by tag) are served at `http://localhost:8000/docs` once the app
@@ -155,6 +159,91 @@ outright — single-viewer enforcement, doc §5.2's "no collaboration in v1".
 curl -s -X DELETE http://localhost:8000/v1/sandboxes/$SANDBOX_ID -w '%{http_code}\n'
 ```
 
+### Try a database sidecar (Phase 5)
+
+Three single-DB companion templates — `templates/python-{postgres,mysql,redis}-lab.yaml`
+— each compose `python@3.12.4` (main) with one DB component as a real second
+container, reachable from main over localhost only. No local `docker build` needed
+for any of them: `postgres:16-alpine`/`mysql:8.4`/`redis:7-alpine` are pulled as-is
+from Docker Hub, unlike the `kubesandbox/*` golden images. All three are
+live-verified end to end against real containers (see `docs/TASK_CHECKLIST.md`'s
+Phase 5 "Live verification" section).
+
+`psql`/`mysql`/`redis-cli` live in each sidecar image, not main's (main's own DB
+access would normally go through a client library, e.g. `psycopg2`, not shelling out
+to a CLI) — so steps 3 below exec directly into the sidecar container rather than
+through `/v1/sandboxes/.../runs`.
+
+**Postgres:**
+
+```bash
+curl -s http://localhost:8000/v1/sandboxes \
+  -H 'Content-Type: application/json' \
+  -d '{"language": "python", "template": "python-postgres-lab@1.0"}' | python3 -m json.tool
+SANDBOX_ID=<paste the "id" from above>
+
+# main got a scoped DATABASE_URL it never saw the admin password for
+# (components/databases/postgresql/hooks.py created this role, not main's image)
+DSN=$(curl -s http://localhost:8000/v1/sandboxes/$SANDBOX_ID/runs \
+  -H 'Content-Type: application/json' \
+  -d '{"code": "import os\nprint(os.environ[\"DATABASE_URL\"])"}' | python3 -c 'import json,sys; print(json.load(sys.stdin)["stdout"].strip())')
+
+docker exec "kubesandbox-${SANDBOX_ID}-postgresql" psql "$DSN" -c "select current_user, current_database();"
+docker exec "kubesandbox-${SANDBOX_ID}-postgresql" psql "$DSN" -c "CREATE ROLE escalated SUPERUSER;"
+
+curl -s -X DELETE http://localhost:8000/v1/sandboxes/$SANDBOX_ID -w '%{http_code}\n'
+```
+
+Expect `sandbox_user`/`sandbox` for the `select`, and `permission denied to create
+role` for the `CREATE ROLE ... SUPERUSER` attempt.
+
+**MySQL** (same shape, `mysql` has no native URI support so the DSN gets parsed into
+separate flags):
+
+```bash
+curl -s http://localhost:8000/v1/sandboxes \
+  -H 'Content-Type: application/json' \
+  -d '{"language": "python", "template": "python-mysql-lab@1.0"}' | python3 -m json.tool
+SANDBOX_ID=<paste the "id" from above>
+
+read -r MYSQL_USER MYSQL_PW MYSQL_HOST MYSQL_PORT MYSQL_DB <<< $(curl -s http://localhost:8000/v1/sandboxes/$SANDBOX_ID/runs \
+  -H 'Content-Type: application/json' \
+  -d '{"code": "import os\nfrom urllib.parse import urlparse\nu = urlparse(os.environ[\"DATABASE_URL\"])\nprint(u.username, u.password, u.hostname, u.port, u.path.lstrip(\"/\"))"}' \
+  | python3 -c 'import json,sys; print(json.load(sys.stdin)["stdout"].strip())')
+
+docker exec "kubesandbox-${SANDBOX_ID}-mysql" mysql -u "$MYSQL_USER" -p"$MYSQL_PW" -h 127.0.0.1 "$MYSQL_DB" -e "SELECT CURRENT_USER(), DATABASE();"
+docker exec "kubesandbox-${SANDBOX_ID}-mysql" mysql -u "$MYSQL_USER" -p"$MYSQL_PW" -h 127.0.0.1 "$MYSQL_DB" -e "CREATE USER 'escalated'@'%' IDENTIFIED BY 'Str0ngPassword1';"
+
+curl -s -X DELETE http://localhost:8000/v1/sandboxes/$SANDBOX_ID -w '%{http_code}\n'
+```
+
+Expect `sandbox_user@%`/`sandbox` for the `SELECT`, and "Access denied; you need (at
+least one of) the CREATE USER privilege(s)" for the `CREATE USER` attempt.
+
+**Redis** (no SQL-style role model — `on_provision` creates a scoped ACL user, then
+disables the previously-unauthenticated default user):
+
+```bash
+curl -s http://localhost:8000/v1/sandboxes \
+  -H 'Content-Type: application/json' \
+  -d '{"language": "python", "template": "python-redis-lab@1.0"}' | python3 -m json.tool
+SANDBOX_ID=<paste the "id" from above>
+
+DSN=$(curl -s http://localhost:8000/v1/sandboxes/$SANDBOX_ID/runs \
+  -H 'Content-Type: application/json' \
+  -d '{"code": "import os\nprint(os.environ[\"DATABASE_URL\"])"}' | python3 -c 'import json,sys; print(json.load(sys.stdin)["stdout"].strip())')
+
+docker exec "kubesandbox-${SANDBOX_ID}-redis" redis-cli -u "$DSN" ACL WHOAMI
+docker exec "kubesandbox-${SANDBOX_ID}-redis" redis-cli -u "$DSN" FLUSHALL
+docker exec "kubesandbox-${SANDBOX_ID}-redis" redis-cli PING   # unauthenticated — should fail
+
+curl -s -X DELETE http://localhost:8000/v1/sandboxes/$SANDBOX_ID -w '%{http_code}\n'
+```
+
+Expect `sandbox_user` for `ACL WHOAMI`, `NOPERM ... no permissions to run the
+'flushall' command` for `FLUSHALL`, and `NOAUTH Authentication required` for the
+unauthenticated `PING` (confirming the default user really was disabled).
+
 ### Browse the registry
 
 ```bash
@@ -237,13 +326,15 @@ skip-with-a-clear-reason behavior if it isn't.
 ## Layout
 
 See `docs/ARCHITECTURE_AND_PLAN.md` §18 for the full intended repository layout; this
-slice implements the Phase 0–4 subset of it (config, manifests/registry, domain models,
+slice implements the Phase 0–5 subset of it (config, manifests/registry, domain models,
 DB + migrations, the `python`/`node`/`go`/`bash`/`git`/`base` components,
 `DockerProvisioner` and `KubernetesProvisioner`, `SandboxService` (ad-hoc + SandboxTemplate
 composition + the non-ephemeral sandbox lifecycle), `/v1/execute`, `/v1/sandboxes`
 (create/status/destroy/runs/files/tree), `WS /v1/sandboxes/{id}/attach` (interactive
-PTY), the component/template/entitlement/publish-grant registry APIs, and the
-Kustomize sandbox-primitive manifests under `deploy/`). Everything else in that layout
-(database sidecars, the real build system, pooling, billing, execution-time
-entitlement enforcement) is later-phase work per the roadmap in §20 — see
-`docs/TASK_CHECKLIST.md` for the exact per-item status and known gaps.
+PTY), the component/template/entitlement/publish-grant registry APIs, the Kustomize
+sandbox-primitive manifests under `deploy/`, and database sidecars
+(`components/databases/{postgresql,mysql,redis}`, multi-container composition in both
+provisioners, and the `ComponentHook` loader that provisions each sidecar's scoped
+role). Everything else in that layout (the real build system, pooling, billing,
+execution-time entitlement enforcement) is later-phase work per the roadmap in §20 —
+see `docs/TASK_CHECKLIST.md` for the exact per-item status and known gaps.

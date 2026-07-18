@@ -59,8 +59,15 @@ from app.domain.execution import (
     SandboxSpec,
     SandboxState,
     SandboxStatus,
+    SidecarSpec,
 )
 from app.provisioners.base import PTYEvent, PTYStream, parse_find_output
+from app.provisioners.resources import (
+    format_bytes_to_memory,
+    format_nanocpus_to_cpu,
+    parse_cpu_to_nanocpus,
+    parse_memory_to_bytes,
+)
 
 logger = get_logger(__name__)
 
@@ -109,6 +116,44 @@ class _RawExecResult:
 def _volume_name(path: str) -> str:
     slug = path.strip("/").replace("/", "-") or "root"
     return f"vol-{slug}"
+
+
+def _sidecar_volume_name(sidecar_name: str, path: str) -> str:
+    """Namespaced separately from _volume_name so a sidecar's writable path can never
+    collide with main's (or another sidecar's) volume name, even if two components
+    happen to declare the same path string."""
+    slug = path.strip("/").replace("/", "-") or "root"
+    return f"vol-{sidecar_name}-{slug}"
+
+
+def _total_resources(spec: SandboxSpec) -> tuple[str, str]:
+    """Sum of main + every sidecar's resource request, in k8s quantity strings —
+    what the namespace's ResourceQuota must actually allow (doc §20 Phase 5): each
+    sidecar adds its own request on top of main's, so a quota sized to main alone
+    would reject pod admission the moment a sidecar is attached."""
+    cpu_nanos = parse_cpu_to_nanocpus(spec.resources.cpu) + sum(
+        parse_cpu_to_nanocpus(s.resources.cpu) for s in spec.sidecars
+    )
+    memory_bytes = parse_memory_to_bytes(spec.resources.memory) + sum(
+        parse_memory_to_bytes(s.resources.memory) for s in spec.sidecars
+    )
+    return format_nanocpus_to_cpu(cpu_nanos), format_bytes_to_memory(memory_bytes)
+
+
+def _max_single_container_resources(spec: SandboxSpec) -> tuple[str, str]:
+    """Largest single container's cpu/memory request across main + sidecars — the
+    LimitRange's `max` must allow this or a sidecar requesting more than main alone
+    would fail admission, even though the *namespace total* (see _total_resources) is
+    still within quota."""
+    cpu_nanos = max(
+        [parse_cpu_to_nanocpus(spec.resources.cpu)]
+        + [parse_cpu_to_nanocpus(s.resources.cpu) for s in spec.sidecars]
+    )
+    memory_bytes = max(
+        [parse_memory_to_bytes(spec.resources.memory)]
+        + [parse_memory_to_bytes(s.resources.memory) for s in spec.sidecars]
+    )
+    return format_nanocpus_to_cpu(cpu_nanos), format_bytes_to_memory(memory_bytes)
 
 
 class KubernetesProvisioner:
@@ -183,6 +228,10 @@ class KubernetesProvisioner:
             backend="kubernetes",
             native_ref=namespace,
             created_at=datetime.now(UTC),
+            # A sidecar's "native ref" is just its own container name — containers in
+            # one pod are already addressed by name, unlike Docker where each sidecar
+            # is a genuinely separate container with its own id.
+            sidecar_refs={s.name: s.name for s in spec.sidecars},
         )
 
     async def _create_network_policy(self, namespace: str) -> None:
@@ -200,12 +249,16 @@ class KubernetesProvisioner:
         await self._networking_v1.create_namespaced_network_policy(namespace, policy)
 
     async def _create_resource_quota(self, namespace: str, spec: SandboxSpec) -> None:
+        # "pods": "1" still holds — a sidecar is another *container* in the one
+        # sandbox Pod, not a second Pod. cpu/memory must cover main + every sidecar's
+        # request, or admission rejects the pod the moment a sidecar is attached.
+        total_cpu, total_memory = _total_resources(spec)
         hard = {
             "pods": "1",
-            "requests.cpu": spec.resources.cpu,
-            "requests.memory": spec.resources.memory,
-            "limits.cpu": spec.resources.cpu,
-            "limits.memory": spec.resources.memory,
+            "requests.cpu": total_cpu,
+            "requests.memory": total_memory,
+            "limits.cpu": total_cpu,
+            "limits.memory": total_memory,
         }
         if spec.resources.ephemeral_storage_mb is not None:
             value = f"{spec.resources.ephemeral_storage_mb}Mi"
@@ -218,15 +271,24 @@ class KubernetesProvisioner:
         await self._core_v1.create_namespaced_resource_quota(namespace, quota)
 
     async def _create_limit_range(self, namespace: str, spec: SandboxSpec) -> None:
-        # Defaults for any future sidecar that omits its own resources (Phase 5) — the
-        # sandbox's own main container always sets resources explicitly regardless.
-        limits = {"cpu": spec.resources.cpu, "memory": spec.resources.memory}
+        # `default`/`default_request`: fallback for any container that omits its own
+        # resources — none does today (main and every sidecar always set theirs
+        # explicitly), so this is a defensive default, not load-bearing.
+        # `max`: must allow the LARGEST single container's request, not just main's —
+        # a sidecar asking for more than main alone would otherwise fail admission
+        # even though the namespace-total ResourceQuota (see _create_resource_quota)
+        # has room for it.
+        default_limits = {"cpu": spec.resources.cpu, "memory": spec.resources.memory}
+        max_cpu, max_memory = _max_single_container_resources(spec)
         limit_range = client.V1LimitRange(
             metadata=client.V1ObjectMeta(name="sandbox-limits", namespace=namespace),
             spec=client.V1LimitRangeSpec(
                 limits=[
                     client.V1LimitRangeItem(
-                        type="Container", default=limits, default_request=limits, max=limits
+                        type="Container",
+                        default=default_limits,
+                        default_request=default_limits,
+                        max={"cpu": max_cpu, "memory": max_memory},
                     )
                 ]
             ),
@@ -285,7 +347,8 @@ class KubernetesProvisioner:
                             client.V1VolumeMount(name=_volume_name(p), mount_path=p)
                             for p in spec.writable_paths
                         ],
-                    )
+                    ),
+                    *(self._sidecar_container(s) for s in spec.sidecars),
                 ],
                 # Disk-backed (not `medium: Memory`) emptyDir on purpose: a Memory-backed
                 # emptyDir is tmpfs under the hood, and Docker's own tmpfs mounts needed an
@@ -296,10 +359,66 @@ class KubernetesProvisioner:
                 volumes=[
                     client.V1Volume(name=_volume_name(p), empty_dir=client.V1EmptyDirVolumeSource())
                     for p in spec.writable_paths
+                ]
+                + [
+                    client.V1Volume(
+                        name=_sidecar_volume_name(s.name, p), empty_dir=client.V1EmptyDirVolumeSource()
+                    )
+                    for s in spec.sidecars
+                    for p in s.writable_paths
                 ],
             ),
         )
         await self._core_v1.create_namespaced_pod(namespace, pod)
+
+    def _sidecar_container(self, sidecar: SidecarSpec) -> client.V1Container:
+        """A sidecar shares the pod's network namespace natively (containers in one
+        Pod always do) — that alone gives main<->sidecar localhost reachability
+        without touching the namespace's default-deny NetworkPolicy, which governs
+        pod-to-pod traffic over the CNI, not same-pod loopback traffic (doc §3.3's
+        `reachableFrom: same-pod-only`).
+
+        Runs as its OWN uid/gid (sidecar.uid), overriding the pod-wide
+        securityContext's _SANDBOX_UID — a database image has its own expected user
+        and can't be forced into the sandbox's uid. Not read-only-root, unlike main:
+        a vetted database image is trusted infra, not sandboxed user code, and needs
+        to write well beyond one declared data directory (sockets, logs, temp files)
+        just to start up.
+        """
+        resource_requests = {"cpu": sidecar.resources.cpu, "memory": sidecar.resources.memory}
+        readiness_probe = None
+        if sidecar.health_check:
+            # initial_delay + period*failure_threshold ~= _POD_READY_TIMEOUT_SECONDS,
+            # so a slow-starting sidecar gets roughly as long as _wait_ready itself
+            # allows before the whole acquire() call times out anyway.
+            readiness_probe = client.V1Probe(
+                _exec=client.V1ExecAction(command=list(sidecar.health_check)),
+                initial_delay_seconds=1,
+                period_seconds=2,
+                failure_threshold=30,
+            )
+        return client.V1Container(
+            name=sidecar.name,
+            image=sidecar.image,
+            env=[client.V1EnvVar(name=k, value=v) for k, v in sidecar.env.items()],
+            resources=client.V1ResourceRequirements(
+                requests=resource_requests, limits=dict(resource_requests)
+            ),
+            ports=[client.V1ContainerPort(name=p.name, container_port=p.container_port) for p in sidecar.ports],
+            security_context=client.V1SecurityContext(
+                allow_privilege_escalation=False,
+                capabilities=client.V1Capabilities(drop=["ALL"]),
+                read_only_root_filesystem=False,
+                run_as_non_root=True,
+                run_as_user=sidecar.uid,
+                run_as_group=sidecar.uid,
+            ),
+            volume_mounts=[
+                client.V1VolumeMount(name=_sidecar_volume_name(sidecar.name, p), mount_path=p)
+                for p in sidecar.writable_paths
+            ],
+            readiness_probe=readiness_probe,
+        )
 
     async def _wait_ready(self, namespace: str) -> None:
         deadline = time.monotonic() + _POD_READY_TIMEOUT_SECONDS
@@ -409,6 +528,33 @@ class KubernetesProvisioner:
             variables=variables,
         )
 
+    async def exec_in(
+        self,
+        handle: SandboxHandle,
+        target: str,
+        command: list[str],
+        *,
+        stdin: bytes = b"",
+        timeout_seconds: int = 30,
+        max_output_bytes: int = 1_000_000,
+    ) -> BatchRunResult:
+        if target != "main" and target not in handle.sidecar_refs:
+            raise ProvisionerError(f"sandbox {handle.sandbox_id} has no sidecar named {target!r}")
+        container = _MAIN_CONTAINER if target == "main" else target
+        try:
+            return await self._run_exec(
+                handle.native_ref,
+                command,
+                stdin=stdin,
+                timeout_seconds=timeout_seconds,
+                max_output_bytes=max_output_bytes,
+                container=container,
+            )
+        except SandboxNotFoundError:
+            raise
+        except ApiException as exc:
+            raise ProvisionerError(f"failed to start exec in {target!r}: {exc}") from exc
+
     async def _read_variable_dump(self, namespace: str) -> dict | None:
         try:
             result = await self._run_exec(
@@ -442,9 +588,15 @@ class KubernetesProvisioner:
         stdin: bytes,
         timeout_seconds: int,
         max_output_bytes: int,
+        container: str = _MAIN_CONTAINER,
     ) -> BatchRunResult:
         raw = await self._run_exec_raw(
-            namespace, command, stdin=stdin, timeout_seconds=timeout_seconds, max_output_bytes=max_output_bytes
+            namespace,
+            command,
+            stdin=stdin,
+            timeout_seconds=timeout_seconds,
+            max_output_bytes=max_output_bytes,
+            container=container,
         )
         return BatchRunResult(
             run_id=str(uuid.uuid4()),
@@ -464,15 +616,18 @@ class KubernetesProvisioner:
         stdin: bytes,
         timeout_seconds: int,
         max_output_bytes: int,
+        container: str = _MAIN_CONTAINER,
     ) -> _RawExecResult:
         """Same exec/demux plumbing as `_run_exec`, but returns raw bytes instead of
         lossily-decoded str — get_file() needs this so downloading a binary file
-        doesn't get corrupted by a `errors="replace"` UTF-8 decode."""
+        doesn't get corrupted by a `errors="replace"` UTF-8 decode. `container`
+        defaults to `_MAIN_CONTAINER`; exec_in() (Phase 5) passes a sidecar's name
+        instead to run admin commands against it."""
         try:
             ws_ctx = await self._exec_v1.connect_get_namespaced_pod_exec(
                 _POD_NAME,
                 namespace,
-                container=_MAIN_CONTAINER,
+                container=container,
                 command=command,
                 stderr=True,
                 stdin=True,

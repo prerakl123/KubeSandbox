@@ -17,12 +17,13 @@ template declared.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from app.core.errors import KubeSandboxError
-from app.domain.execution import ResourceSpec, SandboxSpec, WeightClass
+from app.domain.execution import ResourceSpec, SandboxSpec, SidecarPort, SidecarSpec, WeightClass
 from app.domain.manifests import Component, SandboxTemplate
 from app.extensions.loader import Registry
+from app.services.credentials import DbCredentials, generate_db_credentials
 
 _WEIGHT_ORDER = {WeightClass.LIGHT: 0, WeightClass.STANDARD: 1, WeightClass.HEAVY: 2}
 
@@ -34,10 +35,16 @@ class RenderedTemplateSpec:
     main_components: list[Component]
     """kind == mainTool — actually runnable in today's single-container Provisioner."""
     sidecar_components: list[Component]
-    """kind != mainTool — declared by the template but not yet materialized; running
-    them as real additional containers is Phase 5 (doc §4.3/§20 checklist)."""
-    ttl_idle: str
-    ttl_max: str
+    """kind != mainTool — materialized into sandbox_spec.sidecars as real additional
+    containers (doc §4.3/§20 checklist, Phase 5)."""
+    sidecar_credentials: dict[str, DbCredentials] = field(default_factory=dict)
+    """Sidecar component name -> the DbCredentials generated for it, keyed the same
+    way SandboxHandle.sidecar_refs is. SandboxService needs the SAME credentials
+    object after acquire() to hand to that sidecar's on_provision hook — regenerating
+    fresh ones there would create a role/password the hook creates but that doesn't
+    match what's already baked into main's DATABASE_URL-style env var."""
+    ttl_idle: str = ""
+    ttl_max: str = ""
 
 
 def _component_image_ref(component: Component) -> str | None:
@@ -45,6 +52,48 @@ def _component_image_ref(component: Component) -> str | None:
     if source.type != "image" or source.image is None:
         return None
     return f"{source.image.repository}:{source.image.tag}"
+
+
+def _build_dsn(protocol: str, credentials: DbCredentials, port: int) -> str:
+    # Redis addresses databases by numeric index (0-15), not by name — credentials.
+    # database ("sandbox") is a SQL-style logical db name that doesn't apply there.
+    path = "0" if protocol == "redis" else credentials.database
+    return f"{protocol}://{credentials.role}:{credentials.password}@localhost:{port}/{path}"
+
+
+def _build_sidecar_spec(component: Component, credentials: DbCredentials | None) -> SidecarSpec:
+    runtime = component.spec.runtime
+    access = component.spec.access
+    if runtime.uid is None:
+        raise KubeSandboxError(
+            f"sidecar component {component.key} (runtime.kind={runtime.kind!r}) declares "
+            "no runtime.uid — the OS uid/gid its image's own process runs as, needed for "
+            "tmpfs/emptyDir ownership and the Kubernetes per-container securityContext "
+            "(see SidecarSpec.uid's docstring)"
+        )
+    source = component.spec.source
+    if source.type != "image" or source.image is None:
+        raise KubeSandboxError(
+            f"sidecar component {component.key} uses source.type={source.type!r}; only "
+            "prebuilt images are runnable until BuildManager lands (roadmap Phase 6)"
+        )
+    image = f"{source.image.repository}:{source.image.tag}"
+
+    env = {var.name: var.value for var in runtime.env}
+    if credentials is not None and access.database is not None and access.database.adminPasswordEnv:
+        env[access.database.adminPasswordEnv] = credentials.admin_password
+
+    return SidecarSpec(
+        name=component.metadata.name,
+        image=image,
+        env=env,
+        resources=ResourceSpec(cpu=runtime.resources.limits.cpu, memory=runtime.resources.limits.memory),
+        ports=[SidecarPort(name=p.name, container_port=p.containerPort) for p in runtime.ports],
+        writable_paths=list(access.filesystem.writablePaths),
+        health_check=list(runtime.healthCheck.exec) if runtime.healthCheck else None,
+        uid=runtime.uid,
+        max_processes=access.limits.processes,
+    )
 
 
 def render_template(registry: Registry, template: SandboxTemplate) -> RenderedTemplateSpec:
@@ -76,7 +125,11 @@ def render_template(registry: Registry, template: SandboxTemplate) -> RenderedTe
     writable_paths: list[str] = []
     workdir: str | None = None
     read_only_root_filesystem = True
-    for component in all_components:
+    # Only main_components here, not all_components: a sidecar's own env (e.g. a DB
+    # image's bootstrap admin password) and writable paths (e.g. its data directory)
+    # belong on ITS OWN container, never leaked into main's — see _build_sidecar_spec
+    # below for where a sidecar's env/writable_paths actually get materialized.
+    for component in main_components:
         for var in component.spec.runtime.env:
             env[var.name] = var.value  # last component wins on key collision
         access = component.spec.access
@@ -85,8 +138,20 @@ def render_template(registry: Registry, template: SandboxTemplate) -> RenderedTe
                 writable_paths.append(path)
         if not access.filesystem.readOnlyRootFilesystem:
             read_only_root_filesystem = False
-        if workdir is None and component.spec.runtime.kind == "mainTool":
+        if workdir is None:
             workdir = access.filesystem.workdir
+
+    sidecar_specs: list[SidecarSpec] = []
+    sidecar_credentials: dict[str, DbCredentials] = {}
+    for component in sidecar_components:
+        credentials = None
+        if component.spec.access.database is not None:
+            credentials = generate_db_credentials(component)
+            sidecar_credentials[component.metadata.name] = credentials
+            service = component.spec.provides.service
+            if service is not None and service.dsnEnv:
+                env[service.dsnEnv] = _build_dsn(service.protocol, credentials, service.port)
+        sidecar_specs.append(_build_sidecar_spec(component, credentials))
 
     weight_class = (
         WeightClass(template.spec.weightClass)
@@ -117,6 +182,7 @@ def render_template(registry: Registry, template: SandboxTemplate) -> RenderedTe
             "io.kubesandbox.template": template.key,
             "io.kubesandbox.components": ",".join(c.key for c in all_components),
         },
+        sidecars=sidecar_specs,
     )
 
     return RenderedTemplateSpec(
@@ -124,6 +190,7 @@ def render_template(registry: Registry, template: SandboxTemplate) -> RenderedTe
         sandbox_spec=sandbox_spec,
         main_components=main_components,
         sidecar_components=sidecar_components,
+        sidecar_credentials=sidecar_credentials,
         ttl_idle=template.spec.ttl.idle,
         ttl_max=template.spec.ttl.max,
     )

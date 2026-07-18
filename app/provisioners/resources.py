@@ -25,3 +25,21 @@ def parse_memory_to_bytes(memory: str) -> int:
         if memory.endswith(suffix):
             return int(memory[: -len(suffix)]) * multiplier
     return int(memory)
+
+
+def format_nanocpus_to_cpu(nanocpus: int) -> str:
+    """Inverse of parse_cpu_to_nanocpus — needed once a sandbox can have sidecars
+    (Phase 5): summing/maxing several components' cpu strings has to happen in a
+    common unit (nanocpus), then be formatted back into a k8s quantity string for the
+    namespace's ResourceQuota/LimitRange."""
+    if nanocpus % 1_000_000_000 == 0:
+        return str(nanocpus // 1_000_000_000)
+    return f"{nanocpus // 1_000_000}m"
+
+
+def format_bytes_to_memory(num_bytes: int) -> str:
+    """Inverse of parse_memory_to_bytes, same reasoning as format_nanocpus_to_cpu."""
+    for suffix, multiplier in sorted(_MEMORY_SUFFIXES.items(), key=lambda kv: -kv[1]):
+        if num_bytes % multiplier == 0:
+            return f"{num_bytes // multiplier}{suffix}"
+    return str(num_bytes)

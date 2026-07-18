@@ -4,7 +4,7 @@ import pytest
 
 from app.core.errors import ComponentNotFoundError, KubeSandboxError
 from app.domain.execution import WeightClass
-from app.domain.manifests import EnvVar
+from app.domain.manifests import ContainerPort, DatabaseAccess, EnvVar, ServiceSpec
 from app.extensions.loader import Registry, load_registry
 from app.services.template_render import render_template
 from tests.unit.factories import make_component, make_template
@@ -63,7 +63,7 @@ def test_render_weight_class_defaults_to_max_across_components() -> None:
 
 def test_render_separates_sidecar_components() -> None:
     base = make_component("base", "1.0")
-    sidecar = make_component("db", "1.0", kind="sidecar", category="database")
+    sidecar = make_component("db", "1.0", kind="sidecar", category="database", uid=999)
     registry = Registry(components={"base@1.0": base, "db@1.0": sidecar}, templates={})
     template = make_template("t", "1.0", base_ref="base@1.0", component_refs=["db@1.0"])
 
@@ -71,6 +71,67 @@ def test_render_separates_sidecar_components() -> None:
 
     assert [c.key for c in rendered.main_components] == ["base@1.0"]
     assert [c.key for c in rendered.sidecar_components] == ["db@1.0"]
+
+
+def test_render_materializes_sidecar_into_sandbox_spec() -> None:
+    base = make_component("base", "1.0")
+    sidecar = make_component(
+        "postgresql", "16", kind="sidecar", category="database", uid=999,
+        writable_paths=["/var/lib/postgresql/data"],
+        ports=[ContainerPort(name="pg", containerPort=5432)],
+        health_check=["pg_isready", "-U", "postgres"],
+    )
+    registry = Registry(components={"base@1.0": base, "postgresql@16": sidecar}, templates={})
+    template = make_template("t", "1.0", base_ref="base@1.0", component_refs=["postgresql@16"])
+
+    rendered = render_template(registry, template)
+
+    assert len(rendered.sandbox_spec.sidecars) == 1
+    sidecar_spec = rendered.sandbox_spec.sidecars[0]
+    assert sidecar_spec.name == "postgresql"
+    assert sidecar_spec.uid == 999
+    assert sidecar_spec.writable_paths == ["/var/lib/postgresql/data"]
+    assert sidecar_spec.health_check == ["pg_isready", "-U", "postgres"]
+    assert sidecar_spec.ports[0].container_port == 5432
+    # A sidecar's own writable path must never leak onto main's spec.
+    assert "/var/lib/postgresql/data" not in rendered.sandbox_spec.writable_paths
+
+
+def test_render_missing_sidecar_uid_raises() -> None:
+    base = make_component("base", "1.0")
+    sidecar = make_component("db", "1.0", kind="sidecar", category="database")  # no uid
+    registry = Registry(components={"base@1.0": base, "db@1.0": sidecar}, templates={})
+    template = make_template("t", "1.0", base_ref="base@1.0", component_refs=["db@1.0"])
+
+    with pytest.raises(KubeSandboxError, match="runtime.uid"):
+        render_template(registry, template)
+
+
+def test_render_injects_dsn_into_main_env_and_admin_password_into_sidecar_env() -> None:
+    base = make_component("base", "1.0")
+    sidecar = make_component(
+        "postgresql", "16", kind="sidecar", category="database", uid=999,
+        writable_paths=["/var/lib/postgresql/data"],
+        service=ServiceSpec(protocol="postgres", port=5432, dsnEnv="DATABASE_URL"),
+        database=DatabaseAccess(role="sandbox_user", adminPasswordEnv="POSTGRES_PASSWORD"),
+    )
+    registry = Registry(components={"base@1.0": base, "postgresql@16": sidecar}, templates={})
+    template = make_template("t", "1.0", base_ref="base@1.0", component_refs=["postgresql@16"])
+
+    rendered = render_template(registry, template)
+
+    dsn = rendered.sandbox_spec.env["DATABASE_URL"]
+    assert dsn.startswith("postgres://sandbox_user:")
+    assert "@localhost:5432/sandbox" in dsn
+
+    sidecar_spec = rendered.sandbox_spec.sidecars[0]
+    credentials = rendered.sidecar_credentials["postgresql"]
+    assert sidecar_spec.env["POSTGRES_PASSWORD"] == credentials.admin_password
+    # Main's env must never see the sidecar's own bootstrap admin password.
+    assert "POSTGRES_PASSWORD" not in rendered.sandbox_spec.env
+    # The DSN's password must be the scoped role's, not the admin bootstrap one.
+    assert credentials.password in dsn
+    assert credentials.admin_password not in dsn
 
 
 def test_render_unresolvable_base_ref_raises() -> None:

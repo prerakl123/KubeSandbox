@@ -57,6 +57,22 @@ class Provisioner(Protocol):
         """Run one bundled batch command to completion (or timeout) and return the result."""
         ...
 
+    async def exec_in(
+        self,
+        handle: SandboxHandle,
+        target: str,
+        command: list[str],
+        *,
+        stdin: bytes = b"",
+        timeout_seconds: int = 30,
+        max_output_bytes: int = 1_000_000,
+    ) -> BatchRunResult:
+        """Admin-exec targeting `"main"` or a sidecar name (doc §3.5, §20 Phase 5) —
+        used by ComponentHooks (e.g. creating a scoped DB role) and healthcheck
+        polling, never by sandboxed user code (that's exec_batch's job, always run as
+        the sandbox's own restricted uid)."""
+        ...
+
     async def attach(self, handle: SandboxHandle) -> PTYStream:
         """Open an interactive PTY session. Phase 4."""
         ...

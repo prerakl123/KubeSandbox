@@ -13,14 +13,18 @@ from app.domain.manifests import (
     ComponentRuntime,
     ComponentSource,
     ComponentSpec,
+    ContainerPort,
+    DatabaseAccess,
     EnvVar,
     ExecutionLimitsSpec,
     FilesystemAccess,
+    HealthCheck,
     ImageSource,
     ResourceQuantities,
     ResourceRequirements,
     SandboxTemplate,
     SandboxTemplateSpec,
+    ServiceSpec,
     TemplateBase,
     TemplateComponentRef,
     TemplateMetadata,
@@ -42,6 +46,11 @@ def make_component(
     writable_paths: list[str] | None = None,
     read_only_root_filesystem: bool = True,
     default_run: str | None = None,
+    uid: int | None = None,
+    database: DatabaseAccess | None = None,
+    service: ServiceSpec | None = None,
+    health_check: list[str] | None = None,
+    ports: list[ContainerPort] | None = None,
 ) -> Component:
     return Component(
         apiVersion="kubesandbox.io/v1",
@@ -54,6 +63,7 @@ def make_component(
             provides=ComponentProvides(
                 fileExtensions=[".txt"] if default_run else [],
                 defaultRun=default_run,
+                service=service,
             ),
             runtime=ComponentRuntime(
                 kind=kind,
@@ -63,6 +73,9 @@ def make_component(
                     limits=ResourceQuantities(cpu="200m", memory="128Mi"),
                 ),
                 env=env or [],
+                ports=ports or [],
+                healthCheck=HealthCheck(exec=health_check) if health_check else None,
+                uid=uid,
             ),
             access=ComponentAccess(
                 filesystem=FilesystemAccess(
@@ -71,6 +84,7 @@ def make_component(
                     readOnlyRootFilesystem=read_only_root_filesystem,
                 ),
                 limits=ExecutionLimitsSpec(processes=16, outputBytes=100_000, wallClockSeconds=10),
+                database=database,
             ),
         ),
     )

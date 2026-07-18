@@ -37,6 +37,37 @@ class ResourceSpec(BaseModel):
     ephemeral_storage_mb: int | None = None
 
 
+class SidecarPort(BaseModel):
+    name: str
+    container_port: int
+
+
+class SidecarSpec(BaseModel):
+    """One additional container composed into a sandbox alongside `main` (doc §3.3,
+    §20 Phase 5) — e.g. a database. Reachable from `main` only over localhost (shared
+    pod network namespace / Docker `network_mode: container:`), never externally (doc
+    §3.3's `network.reachableFrom: same-pod-only`) — see the provisioners for how that
+    reachability is actually realized on each backend.
+    """
+
+    name: str
+    image: str
+    env: dict[str, str] = Field(default_factory=dict)
+    resources: ResourceSpec
+    ports: list[SidecarPort] = Field(default_factory=list)
+    writable_paths: list[str] = Field(default_factory=list)
+    health_check: list[str] | None = None
+    uid: int
+    """The OS uid (and gid) the sidecar image's own process actually runs as — not
+    necessarily _SANDBOX_UID (10001); a database image has its own expected user (e.g.
+    official Postgres/MySQL/Redis images conventionally run as uid 999) that
+    tmpfs/emptyDir ownership and the Kubernetes per-container securityContext must
+    match, or the process can't write its own data directory. Meant to be confirmed
+    per-image via a live `docker run --rm <image> id` probe (Phase 5's
+    live-verification loop), not guessed and left unchecked."""
+    max_processes: int = 256
+
+
 class SandboxSpec(BaseModel):
     """Fully-resolved spec a Provisioner can realize directly — produced by
     SandboxService from a SandboxTemplate or an ad-hoc single-component request."""
@@ -53,6 +84,7 @@ class SandboxSpec(BaseModel):
     max_output_bytes: int = 5_000_000
     max_processes: int = 128
     labels: dict[str, str] = Field(default_factory=dict)
+    sidecars: list[SidecarSpec] = Field(default_factory=list)
 
 
 class SandboxHandle(BaseModel):
@@ -62,6 +94,11 @@ class SandboxHandle(BaseModel):
     backend: str  # "docker" | "kubernetes"
     native_ref: str  # container id / pod name
     created_at: datetime
+    sidecar_refs: dict[str, str] = Field(default_factory=dict)
+    """Sidecar component name -> provisioner-native ref: a container id for Docker
+    (each sidecar is its own container sharing main's network namespace), or the same
+    name again for Kubernetes (sidecars are just other containers in the same Pod,
+    addressed by name)."""
 
 
 class SandboxStatus(BaseModel):

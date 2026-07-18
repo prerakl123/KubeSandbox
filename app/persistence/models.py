@@ -115,6 +115,13 @@ class Sandbox(Base):
     component_refs: Mapped[list] = mapped_column(JSON, default=list)
     backend: Mapped[str] = mapped_column(String(16))  # docker | kubernetes
     native_ref: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    sidecar_refs: Mapped[dict] = mapped_column(JSON, default=dict)
+    """Sidecar component name -> provisioner-native ref (doc §20 Phase 5) — must be
+    persisted, not just held on the in-memory SandboxHandle returned by acquire():
+    destroy_sandbox() runs in a separate request and needs this to reconstruct which
+    sidecar containers to tear down (Docker's sidecar container ids are opaque and
+    otherwise unrecoverable; Kubernetes' happen to equal the name, but the column
+    stays backend-agnostic either way)."""
     state: Mapped[str] = mapped_column(String(16), default="pending")
     weight_class: Mapped[str] = mapped_column(String(16), default="light")
     persistent: Mapped[bool] = mapped_column(Boolean, default=False)

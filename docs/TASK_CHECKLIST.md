@@ -6,12 +6,18 @@ of the roadmap table, not a re-statement of it — each phase's one-line "delive
 below is exploded into the actual concrete pieces of work it implies across the rest of
 the doc (§3–§19).
 
-**Summary: 64 / 103 items complete — Phase 0 (20/21), Phase 1 (21/21, fully
+**Summary: 70 / 103 items complete — Phase 0 (20/21), Phase 1 (21/21, fully
 live-verified), Phase 2 (10/10, fully live-verified), Phase 3 (6/6, fully
-live-verified against a real kind cluster), and Phase 4 (7/7, implemented,
+live-verified against a real kind cluster), Phase 4 (7/7, implemented,
 unit-tested — 100 unit tests passing — and live-verified against a real Docker
 daemon via a relayed hand-off loop, since this session has no direct Docker/kind
-access). Phases 5–9 and the cross-cutting section remain 0% started.**
+access), and Phase 5 (6/6, implemented, unit-tested — 137 unit tests passing — and
+fully live-verified against all three real database engines via the same relayed
+hand-off pattern as Phase 4: DSN injection, each scoped non-superuser role/ACL user,
+and a rejected privilege-escalation attempt confirmed against live
+`postgres:16-alpine`, `mysql:8.4`, and `redis:7-alpine` sidecars; four bugs found and
+fixed along the way, see Phase 5's "Bugs found and fixed during live verification").
+Phases 6–9 and the cross-cutting section remain 0% started.**
 Phase 1 is no longer just "built" — it has been driven end-to-end against real Docker,
 real Postgres, and the actual golden image, via `POST /v1/execute` returning correct
 `stdout`/`stderr`/`exit_code`/`variables` with no leaked containers afterward. See
@@ -571,19 +577,234 @@ against the real `python` golden image, rebuilt with `dtach`:
 
 ---
 
-## Phase 5 — Database add-ons (0/6)
+## Phase 5 — Database add-ons (6/6, implemented, unit-tested, and fully live-verified)
 
-- [ ] `components/databases/postgresql/component.yaml` — the directory exists but is
-      empty; doc §3.3 shows an example manifest, no file was ever actually written
-- [ ] `components/databases/mysql/` component
-- [ ] A `redis`-as-database-add-on component (distinct from Redis-as-control-plane-infra
-      in `docker-compose.yml`)
-- [ ] Multi-container (main + sidecar) composition in any provisioner —
-      `DockerProvisioner` currently runs exactly one container per sandbox
-- [ ] A concrete `ComponentHook` Python module (the `Protocol` is defined in doc §3.5;
-      no hook module exists anywhere in `components/`)
-- [ ] DB-scoped-role provisioning logic (non-superuser `sandbox_user`, limited grants,
-      `statement_timeout`, `maxConnections`, max DB size guard)
+- [x] `components/databases/postgresql/component.yaml` + `hooks.py` — `postgres:16-alpine`
+      sidecar; `on_provision` creates a non-superuser `sandbox_user` role and a
+      per-sandbox database via `psql` (run as the bootstrap `postgres` superuser over
+      the local unix socket, which the official image trusts without a password),
+      applies the manifest's declared `grants`/`statementTimeout`/`maxConnections`.
+- [x] `components/databases/mysql/component.yaml` + `hooks.py` — `mysql:8.4` sidecar;
+      same shape as Postgres but via the `mysql` CLI (root, authenticated with the
+      bootstrap `MYSQL_ROOT_PASSWORD` — MySQL, unlike Postgres, always requires a
+      password even over the local socket), no `FILE`/`SUPER`/`PROCESS`/`RELOAD`.
+- [x] `components/databases/redis/component.yaml` + `hooks.py` — `redis:7-alpine`
+      sidecar, distinct from the Redis instance in `docker-compose.yml` (that one is
+      control-plane infra — the session/attach-lock registry — not a sandbox add-on).
+      Redis has no SQL-style role/grant model, so `on_provision` applies the
+      "no superuser" principle via `ACL SETUSER` instead: creates the scoped user with
+      the manifest's declared ACL rule tokens, then disables the (until then
+      unauthenticated-by-default) `default` user.
+- [x] Multi-container (main + sidecar) composition in both provisioners —
+      `DockerProvisioner` creates each sidecar as its own container with
+      `network_mode: container:<main>` (shares main's already-`none` network
+      namespace, so main<->sidecar localhost reachability doesn't weaken the existing
+      no-external-connectivity guarantee) and per-sidecar tmpfs mounts owned by that
+      sidecar's own uid (not the sandbox's); `KubernetesProvisioner` adds one
+      `V1Container` per sidecar to the same Pod (same-pod containers already share a
+      network namespace, so no NetworkPolicy change was needed), with a
+      per-container `securityContext` overriding the pod-wide sandbox uid and a
+      `readinessProbe` built from the manifest's `healthCheck`. The namespace's
+      `ResourceQuota`/`LimitRange` were extended to account for sidecar resources on
+      top of main's (a namespace-total quota sized to main alone would reject pod
+      admission the moment a sidecar was attached).
+- [x] A concrete `ComponentHook` Python module — `app/extensions/hooks.py` defines the
+      `Protocol` (doc §3.5) and a `load_hook()` loader; `SandboxService` drives
+      `on_provision` for real right after `acquire()` succeeds, and `on_teardown`
+      (a documented no-op in all three DB hooks today — whole-sandbox teardown
+      already wipes everything they touch) right before `destroy()`.
+      `validate`/`mutate_pod_spec` are part of the Protocol but not wired to any
+      caller — see "Known scope boundaries" below.
+- [x] DB-scoped-role provisioning logic — non-superuser role/database (or ACL user,
+      for Redis) created by each hook, scoped grants pulled straight from the
+      manifest, `maxConnections` enforced on all three, `statementTimeout` enforced
+      for Postgres and approximated for MySQL (see "Known scope boundaries").
+
+### Prerequisites this phase needed but the checklist didn't spell out
+
+- `SidecarSpec` + `SandboxHandle.sidecar_refs` (`app/domain/execution.py`) and
+  `Provisioner.exec_in` (`app/provisioners/base.py`) — the Protocol had no way to
+  address "the sidecar, not main" at all before this phase.
+- A new `sandboxes.sidecar_refs` DB column (Alembic revision `abcaabfd20d0`) —
+  `destroy_sandbox()` runs in a separate request from `create_sandbox()`/`execute()`,
+  so Docker's opaque sidecar container ids have to be persisted somewhere or they're
+  unrecoverable at teardown time (Kubernetes' sidecar refs happen to just be the
+  container name, but the column stays backend-agnostic either way).
+- `app/services/credentials.py` (`generate_db_credentials`) — the scoped role's
+  password and the sidecar's own bootstrap admin password have to be generated
+  *before* `acquire()`: main's `DATABASE_URL` env var is baked into the container at
+  creation time, but the role it points at is only actually created afterward, by the
+  hook, so both sides need the exact same generated values threaded through.
+- `ComponentRuntime.uid` and `DatabaseAccess.adminPasswordEnv` — two new
+  component-manifest fields (`schemas/component.schema.json` +
+  `app/domain/manifests.py`) neither the architecture doc nor the original schema had
+  a place for: the OS uid/gid a sidecar's own image runs as (needed for tmpfs/emptyDir
+  ownership and the Kubernetes per-container `securityContext`), and which env var
+  name a sidecar's own bootstrap admin password is injected under (differs per DB
+  engine — `POSTGRES_PASSWORD` vs `MYSQL_ROOT_PASSWORD`; Redis has no such mechanism
+  at all).
+- Fixed a latent bug in `render_template`'s pre-existing env/writable-path merge loop:
+  it iterated *every* component (main + sidecar together), which would have leaked a
+  DB sidecar's own env (including its bootstrap admin password, once a sidecar
+  actually existed) and writable paths (e.g. its data directory) onto main's spec.
+  Never triggered before this phase — no template had ever composed a non-`mainTool`
+  component — but fixed as part of materializing sidecars for real.
+
+### Bugs found and fixed during live verification (relayed hand-off)
+
+Same relayed pattern as Phase 4 (this session has no direct Docker/kind daemon
+access): commands handed to the user, output pasted back, bug fixed, re-handed-off.
+
+1. **Dropping ALL capabilities on the sidecar container broke the official DB
+   images' own root-bootstrap-then-drop-privileges pattern.** The first `postgresql`
+   sidecar attempt failed with `sidecar 'postgresql' did not become healthy within
+   30s`, and the container's own logs showed `chown: /var/lib/postgresql/data:
+   Operation not permitted` / `chmod: ... Operation not permitted` — even though the
+   process is uid 0 (root). Official Postgres/MySQL/Redis images start as root PID 1,
+   `chown`/`chmod` their data directory to their own service user, then `gosu` (a
+   direct `setuid()`/`setgid()` call, not a setuid-bit executable, so unaffected by
+   `no-new-privileges`) to actually run the server as that non-root user — but Linux
+   capabilities gate root's OWN powers too, not just non-root users, so `CapDrop:
+   ["ALL"]` (this container's original, more-hardened-than-necessary posture, copied
+   from main's) left root unable to `chown`/`chmod`/`setuid` at all. The subsequent
+   `OCI runtime exec failed: ... procReady not received` health-check errors were a
+   downstream symptom, not a separate bug — the container's own PID 1 had already
+   crashed from the failed `chown`. **Fix:** `CapAdd: ["CHOWN", "FOWNER",
+   "DAC_OVERRIDE", "SETUID", "SETGID"]` alongside the existing `CapDrop: ["ALL"]` —
+   restores exactly the 5 capabilities this bootstrap pattern needs, nothing broader
+   (`app/provisioners/docker.py::_create_sidecar`). An attempt to confirm each
+   image's uid via `docker run --rm <image> id` (as originally planned) turned out to
+   be a red herring: overriding `CMD` with a bare `id` bypasses the entrypoint script's
+   user-switch logic entirely (it only triggers for its own recognized subcommands),
+   so it always reports root regardless of what uid the actual server process runs
+   as — this doesn't matter for correctness now anyway, since the entrypoint
+   `chown`s the (tmpfs-premounted) data directory to whatever uid it actually expects
+   once it has the capability to do so, independent of `SidecarSpec.uid`'s guessed
+   value.
+2. **A sidecar that starts but never becomes healthy leaked its container.**
+   `DockerProvisioner.acquire()`'s cleanup-on-failure path only removes containers
+   recorded in the `sidecar_refs` dict it builds while looping over `spec.sidecars`
+   — but the original code only wrote a sidecar's id into that dict *after*
+   `_create_sidecar()` returned successfully, and `_create_sidecar()` itself awaited
+   the health-check (and raised on timeout) before returning. So a sidecar that
+   crashed during bug #1 above never got its id recorded at all, and the except
+   block's `for sidecar_id in sidecar_refs.values(): ...` cleanup loop had nothing to
+   remove it with — confirmed live: two crashed `-postgresql` containers survived
+   two separate cleanup attempts and had to be removed by hand. **Fix:** moved the
+   health-check call out of `_create_sidecar()` (which now just creates the
+   container and returns it) and into `acquire()`'s loop, recording the container id
+   into `sidecar_refs` immediately after creation succeeds and *before* awaiting the
+   health check — so a container that exists but never turns healthy is still found
+   by the cleanup loop either way.
+3. **MySQL's healthcheck reported healthy before root's real password was active,
+   racing `on_provision`'s very first connection.** The official `mysql` image's own
+   entrypoint briefly runs a temporary, no-password bootstrap `mysqld` (over the same
+   local socket `"localhost"` resolves to) to apply `MYSQL_ROOT_PASSWORD`, before the
+   real, password-protected instance takes over. The original healthcheck,
+   `mysqladmin ping -h localhost` (run as OS root inside the exec, so implicitly
+   `-uroot` with no password), happily reported healthy against that *temporary*
+   instance — well before root's real password was actually active — so
+   `on_provision`'s first `mysql -uroot -p"$MYSQL_ROOT_PASSWORD"` connection failed
+   live with `ERROR 1045 (28000): Access denied for user 'root'@'localhost' (using
+   password: YES)`. **Fix:** changed the healthcheck itself to authenticate with the
+   real password (`mysql -uroot -p"$MYSQL_ROOT_PASSWORD" -e 'SELECT 1'`,
+   `components/databases/mysql/component.yaml`) — passing *that* check is the actual
+   precondition `on_provision` needs, not merely "mysqld responds to something".
+   Postgres's `pg_isready` healthcheck doesn't hit the analogous race: it checks
+   whether the postmaster is accepting connections at all, without needing to
+   authenticate as a specific password-protected role.
+4. **The 30s sidecar health-check timeout was routinely too tight for MySQL under a
+   constrained cpu limit.** After fixing bug #3, the mysql sidecar still failed with
+   `did not become healthy within 30s` — but with real diagnostic output this time
+   (`Can't connect to local MySQL server through socket ... (2)`), which turned out to
+   be "still starting," not crashed. Reproduced directly via `docker run` bypassing
+   the app entirely (bug #1/#2's proven debugging approach): with no resource limits,
+   `mysqld` was ready for connections in under 2 seconds; with the exact `--cpus 0.5
+   --memory 512m --pids-limit 128` this sidecar actually runs under, InnoDB
+   initialization alone took over 10 seconds and total startup ran to ~36 seconds —
+   past the 30s window. **Fix:** raised `_SIDECAR_HEALTH_TIMEOUT_SECONDS` from 30 to
+   90 (`app/provisioners/docker.py`) — matches, with margin, the ~60s Kubernetes'
+   own `readinessProbe` settings already allowed for the identical sidecars
+   (`initial_delay_seconds=1, period_seconds=2, failure_threshold=30`), which had
+   simply never been exercised long enough to notice Docker's shorter window was
+   inconsistent with it.
+
+### Live verification (Phase 5)
+
+Run via the same relayed hand-off loop as Phase 4 (this session has no direct Docker
+daemon access). Confirmed end to end against all three real sidecar images, each via
+its own single-DB companion template (`templates/python-{postgres,mysql,redis}-lab.yaml`):
+
+- `POST /v1/sandboxes` with each template → both containers (main + the DB sidecar)
+  came up together every time, the sidecar reaching a healthy state via the exec-based
+  health-check poll.
+- `POST .../runs` reading `os.environ["DATABASE_URL"]` from inside main returned a
+  correctly-formed, protocol-appropriate DSN each time — confirming the
+  credential-generation/DSN-injection path end to end for all three.
+- **Postgres**: connected directly to the sidecar as `sandbox_user` and confirmed
+  `select current_user, current_database()` → `sandbox_user`/`sandbox`, then
+  `CREATE ROLE escalated SUPERUSER` rejected with `permission denied to create role`.
+- **MySQL**: same shape — `SELECT CURRENT_USER(), DATABASE()` → `sandbox_user@%`/
+  `sandbox`, then `CREATE USER 'escalated'@'%' ...` rejected with
+  `Access denied; you need (at least one of) the CREATE USER privilege(s)`.
+- **Redis**: `PING`/`ACL WHOAMI`/`SET`+`GET` all worked as `sandbox_user`; `FLUSHALL`
+  rejected with `NOPERM User sandbox_user has no permissions to run the 'flushall'
+  command`; and — confirming `on_provision` actually disabled the default user, not
+  just created a scoped one — an unauthenticated `redis-cli PING` against the same
+  sidecar was rejected with `NOAUTH Authentication required`.
+- `DELETE /v1/sandboxes/{id}` cleanly removed both containers every time, for all
+  three templates.
+
+Four real bugs surfaced and were fixed along the way — see "Bugs found and fixed
+during live verification" above; none would have been visible to
+`FakeProvisioner`-backed unit tests, the same story as every prior phase's live pass.
+Notably, MySQL alone needed three follow-up fixes (a healthcheck race, an
+output-suppressing healthcheck command that hid the real error, and a too-tight
+timeout) before it passed — Postgres and Redis each passed on their first live
+attempt once the two provisioner-level bugs (capability restoration, cleanup
+ordering) were fixed.
+
+### Known scope boundaries (Phase 5)
+
+- **`SidecarSpec.uid`'s exact value (999 for all three images) remains formally
+  unconfirmed** against a live container (`docker run --rm <image> id` isn't a
+  reliable way to check this — see bug #1's entry) — but, per that bug's fix, this no
+  longer blocks correct behavior on Docker: the official images' own entrypoint
+  chowns the data directory to whatever uid it actually needs (now that the container
+  has the capability to do so), independent of what this field guessed. It's still
+  relevant for Kubernetes' per-container `securityContext.runAsUser`, which — unlike
+  Docker — forces the container to start AS that uid directly rather than as root, so
+  it's worth confirming precisely whenever the Kubernetes path is live-verified (kind
+  cluster currently torn down, see Phase 4's "Known scope boundaries" — non-urgent
+  until then).
+- **Kubernetes' sidecar security model hasn't been live-verified at all yet**, and
+  is architecturally different from Docker's fix above: it forces
+  `runAsUser: sidecar.uid` directly (skipping the root-bootstrap phase entirely) and
+  relies on the pod-wide `fsGroup` making the emptyDir volume group-writable for a
+  supplemental-group member, rather than the image's own `chown`+`gosu` pattern. This
+  is plausible (K8s' fsGroup mechanism exists for exactly this reason) but genuinely
+  untested — flagged here rather than assumed correct by analogy with the Docker fix.
+- **`maxDbSizeMB` is declared in the Postgres/MySQL manifests but not enforced** —
+  neither engine has a native per-database size cap; enforcing it needs an extension
+  (e.g. `pg_quota`) or an external reconciler polling actual size, out of scope here.
+- **MySQL's `statementTimeout` is approximated, not a true equivalent** —
+  `SET GLOBAL max_execution_time` is the closest MySQL analog to Postgres' per-role
+  `statement_timeout` (MySQL has no persistent per-user form), safe only because each
+  `mysql` sidecar is single-tenant — one instance per sandbox — so a `GLOBAL` setting
+  only ever affects that one sandbox.
+- **Redis's DSN path segment is `0`** (a numeric db index), not
+  `credentials.database`'s SQL-style logical name — Redis addresses databases by
+  index, not name; `template_render._build_dsn` special-cases this one protocol.
+- **`validate`/`mutate_pod_spec` on `ComponentHook` are unwired** — part of doc §3.5's
+  full Protocol, but nothing in this phase's actual requirements needs them; wiring
+  them speculatively would be exactly the kind of building-for-hypothetical-future-
+  requirements this project avoids elsewhere.
+- **No single template composes more than one DB sidecar** — each of the three
+  companion templates (`python-{postgres,mysql,redis}-lab.yaml`) composes exactly one
+  DB component alongside `python`; all three declare `dsnEnv: "DATABASE_URL"`, so
+  composing two DB sidecars into the same template would collide on that env var name
+  (a manifest-authoring conflict, not a code bug) — not attempted, since nothing
+  currently needs it.
 
 ---
 

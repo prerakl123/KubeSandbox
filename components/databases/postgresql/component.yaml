@@ -1,0 +1,69 @@
+apiVersion: kubesandbox.io/v1
+kind: Component
+metadata:
+  name: postgresql
+  version: "16.0"
+  category: database
+  displayName: "PostgreSQL 16"
+  description: >-
+    Postgres 16 database add-on (doc §3.3, §16). Composed into a SandboxTemplate as a
+    sidecar alongside a language mainTool — reachable from main over localhost only
+    (doc's `reachableFrom: same-pod-only`). A scoped, non-superuser role and a
+    per-sandbox database are created by this component's on_provision hook once the
+    sidecar is healthy; main never sees the bootstrap admin password, only its own
+    scoped DATABASE_URL.
+
+spec:
+  source:
+    type: image
+    image: { repository: postgres, tag: "16-alpine" }
+
+  provides:
+    commands: ["psql"]
+    service: { protocol: postgres, port: 5432, dsnEnv: "DATABASE_URL" }
+
+  runtime:
+    kind: sidecar
+    weightClass: standard
+    # The official postgres:16-alpine image creates its `postgres` user/group at
+    # uid/gid 999 (its own Dockerfile: `addgroup -g 999 postgres && adduser -u 999
+    # -G postgres ... postgres`) — not yet live-verified against a running container
+    # in this repo's environment (Phase 5's live-verification hand-off loop; see
+    # docs/TASK_CHECKLIST.md's Phase 5 section for the `docker run --rm <image> id`
+    # confirmation step).
+    uid: 999
+    resources:
+      requests: { cpu: "100m", memory: "128Mi" }
+      limits: { cpu: "500m", memory: "256Mi" }
+    ports:
+      - { name: pg, containerPort: 5432 }
+    healthCheck:
+      exec: ["pg_isready", "-U", "postgres"]
+
+  access:
+    network:
+      egress: denied
+      reachableFrom: same-pod-only
+    filesystem:
+      workdir: /var/lib/postgresql/data
+      writablePaths: ["/var/lib/postgresql/data", "/var/run/postgresql", "/tmp"]
+      readOnlyRootFilesystem: false
+    limits:
+      processes: 128
+      outputBytes: 2000000
+      wallClockSeconds: 30
+    database:
+      superuser: false
+      role: sandbox_user
+      grants: ["CONNECT", "CREATE", "TEMPORARY"]
+      forbidden: ["SUPERUSER", "CREATEROLE", "REPLICATION", "COPY ... TO/FROM PROGRAM"]
+      adminPasswordEnv: "POSTGRES_PASSWORD"
+      limits: { maxConnections: 10, statementTimeout: "30s", maxDbSizeMB: 512 }
+
+  requires: []
+
+  hooks:
+    module: components.databases.postgresql.hooks
+
+  compatibility:
+    environments: ["local", "aks-prod"]

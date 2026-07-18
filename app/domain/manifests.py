@@ -125,6 +125,11 @@ class ComponentRuntime(_Strict):
     volumeMounts: list[VolumeMount] = Field(default_factory=list)
     ports: list[ContainerPort] = Field(default_factory=list)
     healthCheck: HealthCheck | None = None
+    uid: int | None = None
+    """The OS uid (and gid) this component's own image runs its process as. Only
+    meaningful — and required by template_render at render time — for kind ==
+    "sidecar"; a mainTool component always runs as the fixed sandbox uid regardless of
+    this field (doc §6 Layer 1)."""
 
 
 class NetworkAccess(_Strict):
@@ -169,6 +174,10 @@ class DatabaseAccess(_Strict):
     role: str | None = None
     grants: list[str] = Field(default_factory=list)
     forbidden: list[str] = Field(default_factory=list)
+    adminPasswordEnv: str | None = None
+    """Env var name the sidecar's own bootstrap admin/superuser password is injected
+    under (e.g. "POSTGRES_PASSWORD"). Omitted for images with no such bootstrap
+    mechanism (e.g. Redis) — see DbCredentials/generate_db_credentials."""
     limits: DatabaseAccessLimits | None = None
 
 

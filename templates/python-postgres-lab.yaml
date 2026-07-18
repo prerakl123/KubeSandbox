@@ -1,0 +1,27 @@
+apiVersion: kubesandbox.io/v1
+kind: SandboxTemplate
+metadata:
+  name: python-postgres-lab
+  version: "1.0"
+  displayName: "Python + PostgreSQL lab"
+  description: >-
+    The first genuinely multi-container, live-testable SandboxTemplate (doc §3.3/§3.4,
+    roadmap Phase 5): python@3.12.4 is main (its own standalone golden image — unlike
+    base-dev-lab.yaml's base+bash+git, python does NOT share an image with the
+    `base` component, so `base.ref` here points straight at python itself rather than
+    at "base@1.0"; mixing the two as separate mainTool components would trip
+    render_template's "every mainTool-kind component must share one pre-baked image"
+    guard, since BuildManager-based image merging is Phase 6, not yet built).
+    postgresql@16.0 is composed in as a real additional sidecar container — reachable
+    from main over localhost only. Main's DATABASE_URL env var is a scoped,
+    non-superuser role's connection string; the postgres bootstrap superuser password
+    never reaches main at all (see components/databases/postgresql/hooks.py).
+
+spec:
+  base: { ref: "python@3.12.4" }
+  components:
+    - ref: "postgresql@16.0"
+  weightClass: standard
+  workspace: { persistent: false, sizeMB: 1024 }
+  resources: { cpu: "1", memory: "1Gi", ephemeralStorageMB: 1024 }
+  ttl: { idle: "15m", max: "2h" }

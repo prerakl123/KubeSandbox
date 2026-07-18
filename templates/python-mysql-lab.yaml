@@ -1,0 +1,21 @@
+apiVersion: kubesandbox.io/v1
+kind: SandboxTemplate
+metadata:
+  name: python-mysql-lab
+  version: "1.0"
+  displayName: "Python + MySQL lab"
+  description: >-
+    Live-verification companion to python-postgres-lab.yaml (doc §3.3/§3.4, roadmap
+    Phase 5) — same shape (python@3.12.4 as main, one DB sidecar composed in), with
+    mysql@8.4 as the sidecar instead of postgresql. Main's DATABASE_URL env var is a
+    scoped, non-FILE/SUPER/PROCESS user's connection string; the mysql bootstrap root
+    password never reaches main at all (see components/databases/mysql/hooks.py).
+
+spec:
+  base: { ref: "python@3.12.4" }
+  components:
+    - ref: "mysql@8.4"
+  weightClass: standard
+  workspace: { persistent: false, sizeMB: 1024 }
+  resources: { cpu: "1", memory: "1Gi", ephemeralStorageMB: 1024 }
+  ttl: { idle: "15m", max: "2h" }

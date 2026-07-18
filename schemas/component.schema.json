@@ -183,6 +183,11 @@
               "properties": {
                 "exec": { "type": "array", "items": { "type": "string" } }
               }
+            },
+            "uid": {
+              "type": "integer",
+              "minimum": 0,
+              "description": "The OS uid (and gid) this component's own image runs its process as. Only meaningful (and required by the loader) for runtime.kind == 'sidecar' — a mainTool component is always run as the fixed sandbox uid regardless of what's declared here."
             }
           }
         },
@@ -246,6 +251,10 @@
                 "role": { "type": "string" },
                 "grants": { "type": "array", "items": { "type": "string" } },
                 "forbidden": { "type": "array", "items": { "type": "string" } },
+                "adminPasswordEnv": {
+                  "type": "string",
+                  "description": "Env var name the sidecar's own bootstrap admin/superuser password is injected under (e.g. 'POSTGRES_PASSWORD', 'MYSQL_ROOT_PASSWORD') — omitted for images with no such bootstrap mechanism (e.g. Redis, whose scoped user is created entirely via the on_provision hook's ACL SETUSER)."
+                },
                 "limits": {
                   "type": "object",
                   "additionalProperties": false,

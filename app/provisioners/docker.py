@@ -22,6 +22,7 @@ import contextlib
 import json
 import time
 import uuid
+from dataclasses import dataclass
 from datetime import UTC, datetime
 
 import aiodocker
@@ -39,6 +40,7 @@ from app.domain.execution import (
     SandboxSpec,
     SandboxState,
     SandboxStatus,
+    SidecarSpec,
 )
 from app.provisioners.base import PTYEvent, PTYStream, parse_find_output
 from app.provisioners.resources import parse_cpu_to_nanocpus, parse_memory_to_bytes
@@ -70,6 +72,31 @@ _SANDBOX_EXEC_USER = f"{_SANDBOX_UID}:{_SANDBOX_UID}"
 # actually dropping. `-z`: pass Ctrl-Z straight through to the shell instead of dtach
 # swallowing it as a host-side suspend key (there's no real host job control here).
 _INTERACTIVE_SHELL_CMD = ["dtach", "-A", "/tmp/.kubesandbox-attach.sock", "-e", "none", "-z", "/bin/bash"]
+
+# Docker has no pod-readiness-probe equivalent for a bare container (doc §20 Phase 5) —
+# a sidecar's health_check is polled via exec instead, bounded by these. 90s (not 30s):
+# confirmed live that MySQL 8's InnoDB initialization alone can take 30s+ under a
+# constrained cpu limit (0.5 here) — under 2s unconstrained — so the original 30s
+# window was routinely too tight, timing out mid-legitimate-startup rather than
+# catching an actual failure. Matches (and exceeds, for margin) the ~60s Kubernetes'
+# own readinessProbe settings already allow for the same sidecars (see
+# KubernetesProvisioner._sidecar_container's initial_delay/period/failure_threshold).
+_SIDECAR_HEALTH_TIMEOUT_SECONDS = 90
+_SIDECAR_HEALTH_POLL_INTERVAL_SECONDS = 0.5
+
+
+@dataclass(frozen=True)
+class _RawExecResult:
+    """Same shape as BatchRunResult minus the fields only the caller knows (run_id)
+    and with stdout/stderr as raw bytes rather than lossily-decoded str — mirrors
+    kubernetes.py's dataclass of the same name/purpose."""
+
+    exit_code: int
+    stdout: bytes
+    stderr: bytes
+    duration_ms: int
+    truncated: bool
+    timed_out: bool
 
 
 def _half_close_stdin(stream: Stream) -> None:
@@ -145,11 +172,114 @@ class DockerProvisioner:
         except DockerError as exc:
             raise ProvisionerError(f"failed to create sandbox container: {exc}") from exc
 
+        sidecar_refs: dict[str, str] = {}
+        try:
+            for sidecar in spec.sidecars:
+                sidecar_container = await self._create_sidecar(sandbox_id, container.id, sidecar)
+                # Recorded BEFORE the health-check wait below: a sidecar that starts
+                # but never becomes healthy is a container that genuinely exists and
+                # must still be found and removed by the except block's cleanup loop
+                # — recording only on full (create-and-healthy) success previously
+                # left an unhealthy sidecar's id out of this dict entirely, leaking
+                # the container (confirmed live: two crashed `-postgresql` containers
+                # survived cleanup because of exactly this ordering bug).
+                sidecar_refs[sidecar.name] = sidecar_container.id
+                if sidecar.health_check:
+                    await self._wait_sidecar_healthy(sidecar_container, sidecar.name, sidecar.health_check)
+        except Exception as exc:
+            # A failed sidecar must not leak the sidecars that DID start, or main.
+            for sidecar_id in sidecar_refs.values():
+                await self._force_remove(sidecar_id)
+            await self._force_remove(container.id)
+            if isinstance(exc, ProvisionerError):
+                raise
+            raise ProvisionerError(
+                f"failed to provision sidecar for sandbox {sandbox_id}: {exc}"
+            ) from exc
+
         return SandboxHandle(
             sandbox_id=sandbox_id,
             backend="docker",
             native_ref=container.id,
             created_at=datetime.now(UTC),
+            sidecar_refs=sidecar_refs,
+        )
+
+    async def _create_sidecar(
+        self, sandbox_id: str, main_container_id: str, sidecar: SidecarSpec
+    ) -> aiodocker.docker.DockerContainer:
+        """One additional container sharing main's network namespace via
+        `network_mode: container:<id>` — the Docker analog of "same pod" (doc §3.3's
+        `reachableFrom: same-pod-only`). Main's own NetworkMode is already "none" (no
+        external connectivity, see the main HostConfig above), so this preserves that
+        guarantee while letting main reach the sidecar over localhost.
+
+        Deliberately less locked-down than main — no ReadonlyRootfs, no forced sandbox
+        uid: a sidecar is a vetted database image, not sandboxed user code, and images
+        like Postgres/MySQL/Redis need to write well beyond one declared data
+        directory (sockets, logs, temp files) just to start up.
+
+        CapAdd restores exactly the 5 capabilities these official images' own
+        entrypoint scripts need for their standard root-bootstrap-then-drop-privileges
+        pattern (start as PID 1 root, `chown`/`chmod` the data directory to their own
+        service uid, then `gosu <service-user>` to actually run the server) — CHOWN/
+        FOWNER/DAC_OVERRIDE for the chown+chmod, SETUID/SETGID for gosu's privilege
+        drop. Confirmed live: dropping ALL capabilities (this container's original,
+        more-hardened-than-necessary posture) breaks that bootstrap outright —
+        `chown: /var/lib/postgresql/data: Operation not permitted` even though the
+        process is uid 0, because capabilities gate root's own powers too, not just
+        non-root users. No broader loosening than these 5 specific capabilities.
+        """
+        config = {
+            "Image": sidecar.image,
+            "Env": [f"{k}={v}" for k, v in sidecar.env.items()],
+            "Labels": {
+                "io.kubesandbox.sandbox-id": sandbox_id,
+                "io.kubesandbox.sidecar": sidecar.name,
+            },
+            "HostConfig": {
+                "NetworkMode": f"container:{main_container_id}",
+                "NanoCpus": parse_cpu_to_nanocpus(sidecar.resources.cpu),
+                "Memory": parse_memory_to_bytes(sidecar.resources.memory),
+                "PidsLimit": sidecar.max_processes,
+                "Tmpfs": {
+                    path: f"rw,exec,nosuid,nodev,size=1g,uid={sidecar.uid},gid={sidecar.uid},mode=0755"
+                    for path in sidecar.writable_paths
+                },
+                "CapDrop": ["ALL"],
+                "CapAdd": ["CHOWN", "FOWNER", "DAC_OVERRIDE", "SETUID", "SETGID"],
+                "SecurityOpt": ["no-new-privileges"],
+            },
+        }
+        try:
+            sidecar_container = await self._docker.containers.run(
+                config, name=f"{_CONTAINER_NAME_PREFIX}{sandbox_id}-{sidecar.name}"
+            )
+        except DockerContainerError as exc:
+            await self._force_remove(exc.container_id)
+            raise ProvisionerError(f"sidecar {sidecar.name!r} failed to start: {exc}") from exc
+        except DockerError as exc:
+            raise ProvisionerError(f"failed to create sidecar {sidecar.name!r}: {exc}") from exc
+
+        return sidecar_container
+
+    async def _wait_sidecar_healthy(
+        self, container: aiodocker.docker.DockerContainer, name: str, health_check: list[str]
+    ) -> None:
+        """Polls `health_check` via exec until it exits 0 — stands in for what
+        KubernetesProvisioner's _wait_ready gets from a readinessProbe for free;
+        Docker has no bare-container equivalent of pod readiness."""
+        deadline = time.monotonic() + _SIDECAR_HEALTH_TIMEOUT_SECONDS
+        last_output = b""
+        while time.monotonic() < deadline:
+            with contextlib.suppress(DockerError):
+                exit_code, last_output = await self._exec_capture(container, health_check, user=None)
+                if exit_code == 0:
+                    return
+            await asyncio.sleep(_SIDECAR_HEALTH_POLL_INTERVAL_SECONDS)
+        raise ProvisionerError(
+            f"sidecar {name!r} did not become healthy within "
+            f"{_SIDECAR_HEALTH_TIMEOUT_SECONDS}s: {last_output.decode(errors='replace')!r}"
         )
 
     async def status(self, handle: SandboxHandle) -> SandboxStatus:
@@ -189,20 +319,35 @@ class DockerProvisioner:
     async def destroy(self, handle: SandboxHandle) -> None:
         """Graceful eradication: SIGTERM with a bounded grace period, then a forced
         remove regardless, so a slow/hung process can never leak a container. Safe to
-        call more than once — "already gone" is treated as success, not an error."""
-        container = self._docker.containers.container(handle.native_ref)
+        call more than once — "already gone" is treated as success, not an error.
+
+        Sidecars are torn down before main: a container using `network_mode:
+        container:<main>` can be left in a broken/orphaned state if main disappears
+        out from under it first, so removing them first avoids depending on that.
+        Sidecar teardown is best-effort (never blocks main's own destruction on a
+        misbehaving sidecar) — main teardown is not.
+        """
+        for sidecar_id in handle.sidecar_refs.values():
+            await self._destroy_one(sidecar_id, sandbox_id=handle.sandbox_id, best_effort=True)
+        await self._destroy_one(handle.native_ref, sandbox_id=handle.sandbox_id, best_effort=False)
+
+    async def _destroy_one(self, native_ref: str, *, sandbox_id: str, best_effort: bool) -> None:
+        container = self._docker.containers.container(native_ref)
         try:
             await container.stop(t=5)
         except DockerError as exc:
             if exc.status != 404:
-                logger.warning("sandbox_graceful_stop_failed", sandbox_id=handle.sandbox_id, error=str(exc))
+                logger.warning("sandbox_graceful_stop_failed", sandbox_id=sandbox_id, error=str(exc))
 
         try:
             await container.delete(force=True, v=True)
         except DockerError as exc:
             if exc.status == 404:
                 return
-            raise ProvisionerError(f"failed to destroy sandbox {handle.sandbox_id}: {exc}") from exc
+            if best_effort:
+                logger.warning("sandbox_sidecar_destroy_failed", sandbox_id=sandbox_id, error=str(exc))
+                return
+            raise ProvisionerError(f"failed to destroy sandbox {sandbox_id}: {exc}") from exc
 
     async def _force_remove(self, native_ref: str) -> None:
         container = self._docker.containers.container(native_ref)
@@ -265,26 +410,112 @@ class DockerProvisioner:
     # -- batch execution ----------------------------------------------------------------
 
     async def exec_batch(self, handle: SandboxHandle, command: BatchCommand) -> BatchRunResult:
-        run_id = str(uuid.uuid4())
         container = self._docker.containers.container(handle.native_ref)
 
         if command.files:
             await self.put_files(handle, command.files)
 
+        raw = await self._exec_with_stdin(
+            container,
+            command.command,
+            stdin=command.stdin.encode(),
+            timeout_seconds=command.timeout_seconds,
+            max_output_bytes=command.max_output_bytes,
+            user=_SANDBOX_EXEC_USER,
+            workdir="/workspace",
+            sandbox_id=handle.sandbox_id,
+        )
+
+        variables = await self._read_variable_dump(container) if command.capture_variables else None
+
+        return BatchRunResult(
+            run_id=str(uuid.uuid4()),
+            exit_code=raw.exit_code,
+            stdout=raw.stdout.decode(errors="replace"),
+            stderr=raw.stderr.decode(errors="replace"),
+            duration_ms=raw.duration_ms,
+            truncated=raw.truncated,
+            timed_out=raw.timed_out,
+            variables=variables,
+        )
+
+    async def exec_in(
+        self,
+        handle: SandboxHandle,
+        target: str,
+        command: list[str],
+        *,
+        stdin: bytes = b"",
+        timeout_seconds: int = 30,
+        max_output_bytes: int = 1_000_000,
+    ) -> BatchRunResult:
+        container = self._docker.containers.container(self._resolve_target(handle, target))
+        # Only "main" is forced into the sandbox's restricted uid — a sidecar is a
+        # vetted database image with its own expected user, not sandboxed user code
+        # (see _create_sidecar's docstring).
+        user = _SANDBOX_EXEC_USER if target == "main" else ""
+        workdir = "/workspace" if target == "main" else None
+
+        raw = await self._exec_with_stdin(
+            container,
+            command,
+            stdin=stdin,
+            timeout_seconds=timeout_seconds,
+            max_output_bytes=max_output_bytes,
+            user=user,
+            workdir=workdir,
+            sandbox_id=handle.sandbox_id,
+        )
+        return BatchRunResult(
+            run_id=str(uuid.uuid4()),
+            exit_code=raw.exit_code,
+            stdout=raw.stdout.decode(errors="replace"),
+            stderr=raw.stderr.decode(errors="replace"),
+            duration_ms=raw.duration_ms,
+            truncated=raw.truncated,
+            timed_out=raw.timed_out,
+        )
+
+    def _resolve_target(self, handle: SandboxHandle, target: str) -> str:
+        if target == "main":
+            return handle.native_ref
+        try:
+            return handle.sidecar_refs[target]
+        except KeyError:
+            raise ProvisionerError(f"sandbox {handle.sandbox_id} has no sidecar named {target!r}") from None
+
+    async def _exec_with_stdin(
+        self,
+        container: aiodocker.docker.DockerContainer,
+        cmd: list[str],
+        *,
+        stdin: bytes,
+        timeout_seconds: int,
+        max_output_bytes: int,
+        user: str,
+        workdir: str | None,
+        sandbox_id: str,
+    ) -> _RawExecResult:
+        """Runs `cmd` to completion (or wall-clock timeout), writing `stdin` up front
+        then signaling EOF (see module docstring's `_half_close_stdin` explanation).
+        Shared by exec_batch (always the sandbox's own restricted uid, against main)
+        and exec_in (any target/user the caller resolves) — the only difference
+        between the two call sites is which container/user/workdir gets exec'd into.
+        """
         try:
             exec_obj = await container.exec(
-                cmd=command.command,
+                cmd=cmd,
                 stdin=True,
                 stdout=True,
                 stderr=True,
                 tty=False,
-                workdir="/workspace",
-                user=_SANDBOX_EXEC_USER,
+                workdir=workdir,
+                user=user,
             )
         except DockerError as exc:
             if exc.status == 404:
-                raise SandboxNotFoundError(handle.sandbox_id) from exc
-            raise ProvisionerError(f"failed to start batch exec: {exc}") from exc
+                raise SandboxNotFoundError(sandbox_id) from exc
+            raise ProvisionerError(f"failed to start exec: {exc}") from exc
 
         stream = exec_obj.start(detach=False)
         stdout_buf = bytearray()
@@ -296,8 +527,8 @@ class DockerProvisioner:
         async def _pump() -> None:
             nonlocal truncated
             await stream._init()  # noqa: SLF001 — must run before write_in/half-close
-            if command.stdin:
-                await stream.write_in(command.stdin.encode())
+            if stdin:
+                await stream.write_in(stdin)
             _half_close_stdin(stream)  # signal stdin EOF without closing the read side
 
             while True:
@@ -305,13 +536,13 @@ class DockerProvisioner:
                 if msg is None:
                     return
                 buf = stderr_buf if msg.stream == 2 else stdout_buf
-                if len(buf) < command.max_output_bytes:
+                if len(buf) < max_output_bytes:
                     buf.extend(msg.data)
                 else:
                     truncated = True  # keep draining so we still learn the real exit code
 
         try:
-            await asyncio.wait_for(_pump(), timeout=command.timeout_seconds)
+            await asyncio.wait_for(_pump(), timeout=timeout_seconds)
         except TimeoutError:
             timed_out = True
         finally:
@@ -326,30 +557,32 @@ class DockerProvisioner:
                 info = await exec_obj.inspect()
                 exit_code = info.get("ExitCode") or 0
 
-        variables = await self._read_variable_dump(container) if command.capture_variables else None
-
-        return BatchRunResult(
-            run_id=run_id,
+        return _RawExecResult(
             exit_code=exit_code,
-            stdout=stdout_buf.decode(errors="replace"),
-            stderr=stderr_buf.decode(errors="replace"),
+            stdout=bytes(stdout_buf),
+            stderr=bytes(stderr_buf),
             duration_ms=duration_ms,
             truncated=truncated,
             timed_out=timed_out,
-            variables=variables,
         )
 
     async def _exec_capture(
-        self, container: aiodocker.docker.DockerContainer, cmd: list[str]
+        self,
+        container: aiodocker.docker.DockerContainer,
+        cmd: list[str],
+        *,
+        user: str | None = _SANDBOX_EXEC_USER,
     ) -> tuple[int, bytes]:
         """Run `cmd` via `exec` and capture its combined stdout+stderr as raw bytes —
-        shared by variable-dump reading, file download, and tree listing, all of which
-        read via `exec` (`cat`/`find`) rather than the archive/`docker cp` API:
+        shared by variable-dump reading, file download, tree listing (all default to
+        the sandbox's own restricted uid, reading from main's /workspace) and sidecar
+        healthcheck polling (`user=None` — a sidecar has no sandbox uid to run as).
+        Reads via `exec` (`cat`/`find`) rather than the archive/`docker cp` API:
         confirmed against a live daemon that `get_archive` can't find a file written
         into a tmpfs mount on a ReadonlyRootfs container (the same archive-endpoint
         limitation already worked around in `put_files`), even though the file
         demonstrably exists from the writer's own point of view."""
-        exec_obj = await container.exec(cmd=cmd, stdout=True, stderr=True, user=_SANDBOX_EXEC_USER)
+        exec_obj = await container.exec(cmd=cmd, stdout=True, stderr=True, user=user or "")
         output = bytearray()
         stream = exec_obj.start(detach=False)
         try:

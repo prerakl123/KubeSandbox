@@ -52,9 +52,11 @@ class FakeProvisioner:
         files: dict[str, bytes] | None = None,
         tree: list[FileEntry] | None = None,
         pty_events: list[PTYEvent] | None = None,
+        exec_in_result: BatchRunResult | None = None,
     ) -> None:
         self.acquired: list[SandboxSpec] = []
         self.exec_calls: list[BatchCommand] = []
+        self.exec_in_calls: list[tuple[str, list[str]]] = []
         self.destroyed: list[str] = []
         self.put_files_calls: list[dict[str, str]] = []
         self.attached: list[str] = []
@@ -63,6 +65,7 @@ class FakeProvisioner:
         self._files = files or {}
         self._tree = tree or []
         self._pty_events = pty_events or []
+        self._exec_in_result = exec_in_result
 
     async def acquire(self, spec: SandboxSpec) -> SandboxHandle:
         self.acquired.append(spec)
@@ -71,6 +74,7 @@ class FakeProvisioner:
             backend="fake",
             native_ref="fake-container",
             created_at=datetime.now(UTC),
+            sidecar_refs={s.name: f"fake-sidecar-{s.name}" for s in spec.sidecars},
         )
 
     async def exec_batch(self, handle: SandboxHandle, command: BatchCommand) -> BatchRunResult:
@@ -79,6 +83,23 @@ class FakeProvisioner:
             raise self._raise_on_exec
         return self._batch_result or BatchRunResult(
             run_id="fake-run", exit_code=0, stdout="", stderr="", duration_ms=1
+        )
+
+    async def exec_in(
+        self,
+        handle: SandboxHandle,
+        target: str,
+        command: list[str],
+        *,
+        stdin: bytes = b"",
+        timeout_seconds: int = 30,
+        max_output_bytes: int = 1_000_000,
+    ) -> BatchRunResult:
+        self.exec_in_calls.append((target, command))
+        if self._raise_on_exec is not None:
+            raise self._raise_on_exec
+        return self._exec_in_result or BatchRunResult(
+            run_id="fake-exec-in", exit_code=0, stdout="", stderr="", duration_ms=1
         )
 
     async def attach(self, handle: SandboxHandle) -> FakePTYStream:

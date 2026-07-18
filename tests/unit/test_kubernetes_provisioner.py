@@ -19,7 +19,14 @@ from kubernetes_asyncio import client
 from kubernetes_asyncio.client.exceptions import ApiException
 
 from app.core.errors import ProvisionerError, SandboxNotFoundError
-from app.domain.execution import BatchCommand, ResourceSpec, SandboxHandle, SandboxSpec, SandboxState
+from app.domain.execution import (
+    BatchCommand,
+    ResourceSpec,
+    SandboxHandle,
+    SandboxSpec,
+    SandboxState,
+    SidecarSpec,
+)
 from app.provisioners.kubernetes import KubernetesProvisioner
 
 
@@ -36,6 +43,20 @@ def make_spec(**overrides) -> SandboxSpec:
     )
     defaults.update(overrides)
     return SandboxSpec(**defaults)
+
+
+def make_sidecar(**overrides) -> SidecarSpec:
+    defaults = dict(
+        name="postgresql",
+        image="postgres:16-alpine",
+        env={"POSTGRES_PASSWORD": "bootstrap"},
+        resources=ResourceSpec(cpu="100m", memory="128Mi"),
+        writable_paths=["/var/lib/postgresql/data"],
+        health_check=["pg_isready", "-U", "postgres"],
+        uid=999,
+    )
+    defaults.update(overrides)
+    return SidecarSpec(**defaults)
 
 
 @pytest.fixture
@@ -135,6 +156,51 @@ async def test_acquire_creates_hardened_namespace_scoped_resources(provisioner):
     assert container.security_context.read_only_root_filesystem is True
     assert {vm.mount_path for vm in container.volume_mounts} == {"/workspace", "/tmp"}
     assert container.resources.requests == {"cpu": "500m", "memory": "256Mi"}
+
+
+async def test_acquire_composes_sidecar_container_with_own_uid_and_readiness_probe(provisioner):
+    provisioner._core_v1.read_namespaced_pod.return_value = _running_pod()
+
+    handle = await provisioner.acquire(make_spec(sidecars=[make_sidecar()]))
+
+    assert handle.sidecar_refs == {"postgresql": "postgresql"}
+
+    pod_call = provisioner._core_v1.create_namespaced_pod.call_args
+    pod_spec = pod_call.args[1].spec
+    assert [c.name for c in pod_spec.containers] == ["main", "postgresql"]
+
+    sidecar = pod_spec.containers[1]
+    assert sidecar.image == "postgres:16-alpine"
+    # Not forced into the pod-wide sandbox uid (10001) — a DB image runs as its own uid.
+    assert sidecar.security_context.run_as_user == 999
+    assert sidecar.security_context.run_as_group == 999
+    assert sidecar.security_context.read_only_root_filesystem is False
+    assert sidecar.readiness_probe._exec.command == ["pg_isready", "-U", "postgres"]
+    assert {vm.mount_path for vm in sidecar.volume_mounts} == {"/var/lib/postgresql/data"}
+
+    volume_names = {v.name for v in pod_spec.volumes}
+    sidecar_volume_names = {vm.name for vm in sidecar.volume_mounts}
+    # Sidecar's volume is present under its own namespaced name and doesn't collide
+    # with main's volume names.
+    assert sidecar_volume_names < volume_names
+    main_volume_names = {vm.name for vm in pod_spec.containers[0].volume_mounts}
+    assert not (sidecar_volume_names & main_volume_names)
+
+
+async def test_acquire_resource_quota_and_limit_range_account_for_sidecars(provisioner):
+    provisioner._core_v1.read_namespaced_pod.return_value = _running_pod()
+
+    await provisioner.acquire(make_spec(sidecars=[make_sidecar()]))
+
+    quota = provisioner._core_v1.create_namespaced_resource_quota.call_args.args[1].spec.hard
+    assert quota["requests.cpu"] == "600m"  # 500m main + 100m sidecar
+    assert quota["requests.memory"] == "384Mi"  # 256Mi main + 128Mi sidecar
+    assert quota["pods"] == "1"  # still one Pod, just more containers in it
+
+    limit_range = provisioner._core_v1.create_namespaced_limit_range.call_args.args[1].spec.limits[0]
+    # max must allow the LARGEST single container (main's 500m/256Mi here, since the
+    # sidecar asks for less) even though the namespace total above is higher.
+    assert limit_range.max == {"cpu": "500m", "memory": "256Mi"}
 
 
 async def test_acquire_wires_runtime_class_when_configured(provisioner):
@@ -289,6 +355,48 @@ async def test_exec_batch_raises_sandbox_not_found_on_404(provisioner):
 
     with pytest.raises(SandboxNotFoundError):
         await provisioner.exec_batch(_handle(), BatchCommand(command=["echo", "hi"]))
+
+
+# -- exec_in (Phase 5, doc §3.5's ComponentHook / healthcheck admin-exec) -------------------
+
+
+async def test_exec_in_targets_sidecar_container_by_name(provisioner):
+    conn = FakeWsConn(
+        [FakeWsMessage(WSMsgType.BINARY, bytes([3]) + b'{"metadata":{},"status":"Success"}')]
+    )
+    provisioner._exec_v1.connect_get_namespaced_pod_exec.return_value = FakeWsCtx(conn)
+
+    handle = SandboxHandle(
+        sandbox_id="s1", backend="kubernetes", native_ref="ns1",
+        created_at=datetime.now(UTC), sidecar_refs={"postgresql": "postgresql"},
+    )
+    await provisioner.exec_in(handle, "postgresql", ["pg_isready", "-U", "postgres"])
+
+    call = provisioner._exec_v1.connect_get_namespaced_pod_exec.call_args
+    assert call.kwargs["container"] == "postgresql"
+
+
+async def test_exec_in_targets_main_container(provisioner):
+    conn = FakeWsConn(
+        [FakeWsMessage(WSMsgType.BINARY, bytes([3]) + b'{"metadata":{},"status":"Success"}')]
+    )
+    provisioner._exec_v1.connect_get_namespaced_pod_exec.return_value = FakeWsCtx(conn)
+
+    await provisioner.exec_in(_handle(), "main", ["echo", "hi"])
+
+    call = provisioner._exec_v1.connect_get_namespaced_pod_exec.call_args
+    assert call.kwargs["container"] == "main"
+
+
+async def test_exec_in_raises_on_unknown_sidecar_target(provisioner):
+    handle = SandboxHandle(
+        sandbox_id="s1", backend="kubernetes", native_ref="ns1",
+        created_at=datetime.now(UTC), sidecar_refs={"postgresql": "postgresql"},
+    )
+    with pytest.raises(ProvisionerError, match="no sidecar named"):
+        await provisioner.exec_in(handle, "redis", ["redis-cli", "ping"])
+
+    provisioner._exec_v1.connect_get_namespaced_pod_exec.assert_not_called()
 
 
 # -- file APIs (Phase 4, doc §5.4) -----------------------------------------------------

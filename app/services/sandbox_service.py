@@ -16,6 +16,7 @@ into one runnable SandboxSpec.
 
 from __future__ import annotations
 
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -26,6 +27,7 @@ from app.core.errors import (
     SandboxNotFoundError,
     TemplateNotFoundError,
 )
+from app.core.logging import get_logger
 from app.domain.execution import (
     BatchCommand,
     BatchRunResult,
@@ -38,10 +40,26 @@ from app.domain.execution import (
     WeightClass,
 )
 from app.domain.manifests import Component
+from app.extensions.hooks import RenderContext, load_hook
 from app.extensions.loader import Registry
 from app.persistence.models import Run, Sandbox
 from app.provisioners.base import Provisioner, PTYStream
+from app.services.credentials import DbCredentials
 from app.services.template_render import RenderedTemplateSpec, render_template
+
+logger = get_logger(__name__)
+
+
+@dataclass
+class _ResolvedSpec:
+    spec: SandboxSpec
+    template_ref: str | None
+    component_refs: list[str]
+    component: Component
+    """The single component execute()/create_sandbox() should actually run code
+    against — the main-tool component matching the requested language."""
+    sidecar_components: list[Component] = field(default_factory=list)
+    sidecar_credentials: dict[str, DbCredentials] = field(default_factory=dict)
 
 
 class SandboxService:
@@ -137,20 +155,70 @@ class SandboxService:
 
     def _resolve_spec(
         self, *, language: str, version: str | None, template: str | None
-    ) -> tuple[SandboxSpec, str | None, list[str], Component]:
+    ) -> _ResolvedSpec:
         """Shared by execute() and create_sandbox(): resolve a language/template
-        request into (spec, template_ref, component_refs, the component to run)."""
+        request into everything needed to acquire() a sandbox and, if it composes any
+        DB sidecars, provision them afterward. An ad-hoc single-component request
+        (no template) never has sidecars — those only ever come from a
+        SandboxTemplate's composed components (doc §3.4)."""
         if template:
             rendered = self._resolve_template(template)
             component = self._pick_template_component(rendered, language)
-            return (
-                rendered.sandbox_spec,
-                rendered.template_key,
-                [c.key for c in rendered.main_components],
-                component,
+            return _ResolvedSpec(
+                spec=rendered.sandbox_spec,
+                template_ref=rendered.template_key,
+                component_refs=[c.key for c in rendered.main_components],
+                component=component,
+                sidecar_components=rendered.sidecar_components,
+                sidecar_credentials=rendered.sidecar_credentials,
             )
         component = self._resolve_component(language, version)
-        return self._build_spec(component), None, [component.key], component
+        return _ResolvedSpec(
+            spec=self._build_spec(component),
+            template_ref=None,
+            component_refs=[component.key],
+            component=component,
+        )
+
+    async def _provision_sidecars(
+        self,
+        handle: SandboxHandle,
+        sidecar_components: list[Component],
+        sidecar_credentials: dict[str, DbCredentials],
+    ) -> None:
+        """Runs each composed DB sidecar's on_provision hook (doc §3.5, Phase 5) right
+        after acquire() succeeds — e.g. creating the scoped Postgres role main's
+        DATABASE_URL env var already promised. Only sidecars that declare both a hook
+        module AND access.database get here; template_render only populates
+        sidecar_credentials for those, so the two collections stay in lockstep."""
+        for component in sidecar_components:
+            if component.spec.hooks is None:
+                continue
+            credentials = sidecar_credentials.get(component.metadata.name)
+            if credentials is None:
+                continue
+            hook = load_hook(component.spec.hooks.module)
+            ctx = RenderContext(component=component, credentials=credentials, provisioner=self._provisioner)
+            await hook.on_provision(handle, ctx)
+
+    async def _teardown_sidecars(self, handle: SandboxHandle, sidecar_components: list[Component]) -> None:
+        """Runs each composed DB sidecar's on_teardown hook before the sandbox itself
+        is destroyed. Best-effort: a hook failure must never block the sandbox's own
+        destruction (every current hook's on_teardown is a documented no-op anyway —
+        see components/databases/*/hooks.py — so this is defensive, not load-bearing)."""
+        for component in sidecar_components:
+            if component.spec.hooks is None:
+                continue
+            try:
+                hook = load_hook(component.spec.hooks.module)
+                await hook.on_teardown(handle)
+            except Exception as exc:  # noqa: BLE001 — teardown must never block destroy()
+                logger.warning(
+                    "sidecar_teardown_hook_failed",
+                    sandbox_id=handle.sandbox_id,
+                    component=component.key,
+                    error=str(exc),
+                )
 
     @staticmethod
     def _handle_from_row(row: Sandbox) -> SandboxHandle:
@@ -159,7 +227,18 @@ class SandboxService:
             backend=row.backend,
             native_ref=row.native_ref,
             created_at=row.created_at,
+            sidecar_refs=row.sidecar_refs,
         )
+
+    def _sidecar_components_for_row(self, row: Sandbox) -> list[Component]:
+        """Re-derives a persisted sandbox's sidecar Components from its template_ref
+        (destroy_sandbox() runs in a separate request from create_sandbox()/execute(),
+        so nothing in-memory survives to reuse — the row's template_ref is the only
+        thing that does). An ad-hoc, non-template sandbox never has sidecars."""
+        if not row.template_ref:
+            return []
+        rendered = self._resolve_template(row.template_ref)
+        return rendered.sidecar_components
 
     def _resolve_component_for_run(self, row: Sandbox, language: str | None) -> Component:
         """Which component a POST .../runs call should execute against — the same
@@ -192,33 +271,35 @@ class SandboxService:
         user_id: str | None,
         session: AsyncSession,
     ) -> BatchRunResult:
-        spec, template_ref, component_refs, component = self._resolve_spec(
-            language=language, version=version, template=template
-        )
-        batch_command = self._build_batch_command(component, code, stdin)
+        resolved = self._resolve_spec(language=language, version=version, template=template)
+        batch_command = self._build_batch_command(resolved.component, code, stdin)
 
-        handle = await self._provisioner.acquire(spec)
+        handle = await self._provisioner.acquire(resolved.spec)
 
         sandbox_row = Sandbox(
             id=handle.sandbox_id,
             tenant_id=tenant_id,
             user_id=user_id,
-            template_ref=template_ref,
-            component_refs=component_refs,
+            template_ref=resolved.template_ref,
+            component_refs=resolved.component_refs,
             backend=handle.backend,
             native_ref=handle.native_ref,
+            sidecar_refs=handle.sidecar_refs,
             state="active",
-            weight_class=spec.weight_class.value,
+            weight_class=resolved.spec.weight_class.value,
             persistent=False,
         )
         session.add(sandbox_row)
         await session.flush()
 
         try:
+            await self._provision_sidecars(handle, resolved.sidecar_components, resolved.sidecar_credentials)
             result = await self._provisioner.exec_batch(handle, batch_command)
         finally:
             # Graceful eradication (doc §4.1): always tear down the ephemeral sandbox,
-            # whether the run succeeded, failed, or timed out.
+            # whether sidecar provisioning or the run itself succeeded, failed, or
+            # timed out.
+            await self._teardown_sidecars(handle, resolved.sidecar_components)
             await self._provisioner.destroy(handle)
 
         session.add(
@@ -255,21 +336,29 @@ class SandboxService:
         user_id: str | None,
         session: AsyncSession,
     ) -> Sandbox:
-        spec, template_ref, component_refs, _component = self._resolve_spec(
-            language=language, version=version, template=template
-        )
-        handle = await self._provisioner.acquire(spec)
+        resolved = self._resolve_spec(language=language, version=version, template=template)
+        handle = await self._provisioner.acquire(resolved.spec)
+
+        try:
+            await self._provision_sidecars(handle, resolved.sidecar_components, resolved.sidecar_credentials)
+        except Exception:
+            # Nothing's been persisted yet at this point — the caller has no id to
+            # destroy this by later, so a provisioning failure must clean up here or
+            # the sandbox (and its sidecar) leaks with no way to reach it again.
+            await self._provisioner.destroy(handle)
+            raise
 
         sandbox_row = Sandbox(
             id=handle.sandbox_id,
             tenant_id=tenant_id,
             user_id=user_id,
-            template_ref=template_ref,
-            component_refs=component_refs,
+            template_ref=resolved.template_ref,
+            component_refs=resolved.component_refs,
             backend=handle.backend,
             native_ref=handle.native_ref,
+            sidecar_refs=handle.sidecar_refs,
             state="active",
-            weight_class=spec.weight_class.value,
+            weight_class=resolved.spec.weight_class.value,
             persistent=False,
         )
         session.add(sandbox_row)
@@ -307,7 +396,9 @@ class SandboxService:
         row = await self.get_sandbox(sandbox_id, tenant_id, session)
         if row.state == "terminated":
             return  # idempotent, mirrors Provisioner.destroy()'s own idempotency
-        await self._provisioner.destroy(self._handle_from_row(row))
+        handle = self._handle_from_row(row)
+        await self._teardown_sidecars(handle, self._sidecar_components_for_row(row))
+        await self._provisioner.destroy(handle)
         row.state = "terminated"
         row.terminated_at = datetime.now(UTC)
         await session.commit()

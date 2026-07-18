@@ -1,0 +1,22 @@
+apiVersion: kubesandbox.io/v1
+kind: SandboxTemplate
+metadata:
+  name: python-redis-lab
+  version: "1.0"
+  displayName: "Python + Redis lab"
+  description: >-
+    Live-verification companion to python-postgres-lab.yaml (doc §3.3/§3.4, roadmap
+    Phase 5) — same shape (python@3.12.4 as main, one DB sidecar composed in), with
+    redis@7.0 as the sidecar instead of postgresql. Main's DATABASE_URL env var
+    authenticates as a scoped ACL user (see components/databases/redis/hooks.py) —
+    the default, initially-unauthenticated Redis user is disabled once that scoped
+    user is confirmed working.
+
+spec:
+  base: { ref: "python@3.12.4" }
+  components:
+    - ref: "redis@7.0"
+  weightClass: standard
+  workspace: { persistent: false, sizeMB: 1024 }
+  resources: { cpu: "1", memory: "1Gi", ephemeralStorageMB: 1024 }
+  ttl: { idle: "15m", max: "2h" }

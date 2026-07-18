@@ -1,0 +1,94 @@
+apiVersion: kubesandbox.io/v1
+kind: Component
+metadata:
+  name: mysql
+  version: "8.4"
+  category: database
+  displayName: "MySQL 8.4"
+  description: >-
+    MySQL 8.4 database add-on (doc §3.3, §16) — the MySQL/MariaDB analog of the
+    postgresql component: scoped user, no FILE/SUPER/PROCESS/RELOAD privileges,
+    per-sandbox database. Composed into a SandboxTemplate as a sidecar, reachable
+    from main over localhost only.
+
+spec:
+  source:
+    type: image
+    image: { repository: mysql, tag: "8.4" }
+
+  provides:
+    commands: ["mysql"]
+    service: { protocol: mysql, port: 3306, dsnEnv: "DATABASE_URL" }
+
+  runtime:
+    kind: sidecar
+    weightClass: standard
+    # The official mysql image creates its `mysql` user/group at uid/gid 999 (its own
+    # Dockerfile: `groupadd -r --gid=999 mysql && useradd -r -g mysql --uid=999
+    # mysql`) — not yet live-verified against a running container in this repo's
+    # environment (Phase 5's live-verification hand-off loop; see
+    # docs/TASK_CHECKLIST.md's Phase 5 section).
+    uid: 999
+    resources:
+      requests: { cpu: "150m", memory: "256Mi" }
+      limits: { cpu: "500m", memory: "512Mi" }
+    ports:
+      - { name: mysql, containerPort: 3306 }
+    # Deliberately NOT `mysqladmin ping` (no -u/-p): the official mysql image's own
+    # entrypoint briefly runs a temporary, no-password-required bootstrap instance
+    # (over the same local socket "localhost" resolves to) to apply MYSQL_ROOT_PASSWORD
+    # before the real, password-protected instance takes over — confirmed live,
+    # `mysqladmin ping` (running as OS root, so implicitly `-uroot` with no password)
+    # happily reports healthy against that temporary instance, well before root's real
+    # password is actually active, so on_provision's very next connection attempt got
+    # "Access denied for user 'root'@'localhost' (using password: YES)". Authenticating
+    # with the real password here is what on_provision actually needs to succeed, so
+    # passing THIS check is the correct readiness signal, not merely "mysqld responds".
+    healthCheck:
+      exec: ["sh", "-c", "mysql -uroot -p\"$MYSQL_ROOT_PASSWORD\" -e 'SELECT 1'"]
+
+  access:
+    network:
+      egress: denied
+      reachableFrom: same-pod-only
+    filesystem:
+      workdir: /var/lib/mysql
+      writablePaths: ["/var/lib/mysql", "/var/run/mysqld", "/tmp"]
+      readOnlyRootFilesystem: false
+    limits:
+      processes: 128
+      outputBytes: 2000000
+      wallClockSeconds: 30
+    database:
+      superuser: false
+      role: sandbox_user
+      grants:
+        - "SELECT"
+        - "INSERT"
+        - "UPDATE"
+        - "DELETE"
+        - "CREATE"
+        - "DROP"
+        - "ALTER"
+        - "INDEX"
+        - "REFERENCES"
+        - "CREATE TEMPORARY TABLES"
+        - "LOCK TABLES"
+        - "EXECUTE"
+        - "CREATE VIEW"
+        - "SHOW VIEW"
+        - "CREATE ROUTINE"
+        - "ALTER ROUTINE"
+        - "EVENT"
+        - "TRIGGER"
+      forbidden: ["FILE", "SUPER", "PROCESS", "RELOAD", "SHUTDOWN", "REPLICATION CLIENT", "REPLICATION SLAVE"]
+      adminPasswordEnv: "MYSQL_ROOT_PASSWORD"
+      limits: { maxConnections: 10, statementTimeout: "30s", maxDbSizeMB: 512 }
+
+  requires: []
+
+  hooks:
+    module: components.databases.mysql.hooks
+
+  compatibility:
+    environments: ["local", "aks-prod"]
