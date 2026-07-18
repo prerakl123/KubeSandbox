@@ -1,0 +1,63 @@
+apiVersion: kubesandbox.io/v1
+kind: Component
+metadata:
+  name: python
+  version: "3.12.4"
+  category: language
+  displayName: "Python 3.12"
+  description: "CPython interpreter with pip, plus a batch runner supporting variable-dump capture"
+spec:
+  source:
+    type: image
+    image:
+      repository: kubesandbox/python
+      tag: "3.12.4-slim"
+
+  provides:
+    languageId: python
+    commands: ["python", "python3", "pip"]
+    fileExtensions: [".py"]
+    versionCommand: "python --version"
+    defaultRun: "python {file}"
+    batchRunner:
+      entrypoint: "/opt/kubesandbox/runners/python_runner.py"
+      supportsVariableDump: true
+      stdinMode: upfront
+
+  runtime:
+    kind: mainTool
+    weightClass: light
+    resources:
+      requests: { cpu: "100m", memory: "128Mi" }
+      limits: { cpu: "1", memory: "512Mi" }
+    env: []
+    volumeMounts:
+      - { name: workspace, mountPath: /workspace }
+
+  access:
+    network:
+      egress: intent-only
+      reason: "pip install via internal mirror, only when packages.install.enabled is turned on"
+    packages:
+      manager: pip
+      install:
+        enabled: false
+        source: mirror
+        mirror: "https://pypi.internal/simple"
+        denylist: []
+        allowlist: []
+    filesystem:
+      workdir: /workspace
+      writablePaths: ["/workspace", "/tmp"]
+      readOnlyRootFilesystem: true
+    limits:
+      processes: 128
+      outputBytes: 5000000
+      wallClockSeconds: 60
+
+  requires: []
+
+  compatibility:
+    environments: ["local", "aks-prod"]
+    runtimeClass:
+      aks-prod: gvisor

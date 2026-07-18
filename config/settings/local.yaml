@@ -1,0 +1,53 @@
+# Local development profile — Docker provisioner, self-hosted infra, no cloud dependency.
+# See docs/ARCHITECTURE_AND_PLAN.md §7 for the local/aks-prod comparison table.
+
+app_env: local
+debug: true
+
+database:
+  dsn: "postgresql+asyncpg://kubesandbox:kubesandbox@localhost:5432/kubesandbox"
+
+redis:
+  url: "redis://localhost:6379/0"
+
+object_storage:
+  provider: minio
+  endpoint: "http://localhost:9000"
+  access_key: "kubesandbox"
+  secret_key: "kubesandbox-secret"
+  bucket: "kubesandbox"
+
+image_registry:
+  provider: local
+  endpoint: "localhost:5000"
+
+secrets:
+  provider: dotenv
+
+provisioner:
+  backend: docker
+  runtime_class: null
+  namespace_prefix: "kubesandbox-sb-"
+
+pool:
+  enabled: false
+  light_pool_size: 0
+  standard_pool_size: 0
+  heavy_pool_size: 0
+
+workspace:
+  persistence_enabled: false
+
+limits:
+  default_wall_clock_seconds: 60
+  max_output_bytes: 5000000
+  max_processes: 128
+
+billing:
+  default_mode: credit
+
+auth:
+  # Convenience only: lets /execute be exercised without an IdP during local dev.
+  # app/core/config.py refuses this outside app_env=local.
+  disabled: true
+  oidc_issuer: null

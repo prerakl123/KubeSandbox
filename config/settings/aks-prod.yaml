@@ -1,0 +1,52 @@
+# AKS production profile — Kubernetes provisioner, Azure-backed infra.
+# Dev and prod are the same cluster/config family per management directive
+# (docs/ARCHITECTURE_AND_PLAN.md §7) — this is the only non-local profile.
+
+app_env: aks-prod
+debug: false
+
+database:
+  # Real DSN is injected via env var / Key Vault at deploy time, not committed here.
+  dsn: "postgresql+asyncpg://kubesandbox@REPLACE_ME:5432/kubesandbox"
+
+redis:
+  url: "redis://REPLACE_ME:6379/0"
+
+object_storage:
+  provider: azure_blob
+  endpoint: "https://kubesandboxprod.blob.core.windows.net"
+  bucket: "kubesandbox"
+
+image_registry:
+  provider: acr
+  endpoint: "kubesandboxprod.azurecr.io"
+
+secrets:
+  provider: azure_keyvault
+  vault_url: "https://kubesandbox-prod.vault.azure.net/"
+
+provisioner:
+  backend: kubernetes
+  runtime_class: gvisor
+  namespace_prefix: "kubesandbox-sb-"
+
+pool:
+  enabled: true
+  light_pool_size: 10
+  standard_pool_size: 5
+  heavy_pool_size: 2
+
+workspace:
+  persistence_enabled: true
+
+limits:
+  default_wall_clock_seconds: 60
+  max_output_bytes: 5000000
+  max_processes: 128
+
+billing:
+  default_mode: credit
+
+auth:
+  disabled: false
+  oidc_issuer: "https://login.microsoftonline.com/REPLACE_ME/v2.0"

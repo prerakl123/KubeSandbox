@@ -1,0 +1,16 @@
+apiVersion: kubesandbox.io/v1
+kind: Component
+metadata:
+  name: broken
+  version: "1.0"
+  category: tool
+spec:
+  source:
+    type: image
+    image: { repository: kubesandbox/broken, tag: "1.0" }
+  runtime:
+    kind: mainTool
+    resources:
+      requests: { cpu: "50m", memory: "64Mi" }
+      limits: { cpu: "200m", memory: "128Mi" }
+  # `access` is deliberately missing — required by spec (component.schema.json)

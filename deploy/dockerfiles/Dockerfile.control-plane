@@ -1,0 +1,33 @@
+# syntax=docker/dockerfile:1
+#
+# Control-plane image (doc §15, §18). NOT used by docker-compose.yml for local dev —
+# see that file's header comment for why (needs the host's Docker socket, simplest to
+# run natively there). This image exists for aks-prod-parity testing (e.g. via kind)
+# and the real aks-prod deploy, where the control plane talks to the Kubernetes API via
+# an in-cluster service account (doc §11) rather than a mounted Docker socket, so
+# running as non-root here carries no such caveat.
+
+FROM python:3.14-slim AS base
+
+RUN groupadd --gid 10001 kubesandbox \
+    && useradd --uid 10001 --gid 10001 --create-home --shell /usr/sbin/nologin kubesandbox
+
+RUN pip install --no-cache-dir uv
+
+WORKDIR /app
+COPY pyproject.toml uv.lock ./
+RUN uv sync --frozen --no-dev
+
+COPY app ./app
+COPY alembic ./alembic
+COPY alembic.ini ./
+COPY components ./components
+COPY templates ./templates
+COPY schemas ./schemas
+COPY config ./config
+
+RUN chown -R 10001:10001 /app
+USER 10001:10001
+
+EXPOSE 8000
+CMD ["uv", "run", "uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
