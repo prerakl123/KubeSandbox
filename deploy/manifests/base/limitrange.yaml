@@ -1,0 +1,17 @@
+# Per-container defaults for the control plane's OWN namespace — analogous to (but
+# distinct from) the per-sandbox LimitRange KubernetesProvisioner creates dynamically
+# per sandbox namespace (app/provisioners/kubernetes.py `_create_limit_range`).
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: kubesandbox-system-limits
+  namespace: kubesandbox-system
+spec:
+  limits:
+    - type: Container
+      default:
+        cpu: "500m"
+        memory: 512Mi
+      defaultRequest:
+        cpu: "100m"
+        memory: 256Mi

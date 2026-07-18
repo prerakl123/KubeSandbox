@@ -1,0 +1,37 @@
+# Egress this overlay grants on top of base's default-deny (doc §12). Kubernetes
+# NetworkPolicy only matches on podSelector/namespaceSelector/ipBlock — never on
+# hostname — so Key Vault/ACR/managed Postgres/Redis can only be expressed here as the
+# CIDR of their private-endpoint IPs inside the AKS VNet. Filled in at deploy time from
+# the actual VNet/subnet plan, matching the REPLACE_ME convention already used in
+# config/settings/aks-prod.yaml for the same reason (this repo has no real Azure
+# tenancy to read the addresses from).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-egress
+  namespace: kubesandbox-system
+spec:
+  podSelector: {}
+  policyTypes: ["Egress"]
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    - to:
+        # Private-endpoint IPs for Key Vault, ACR, Postgres Flexible Server, Redis —
+        # REPLACE_ME with the real VNet subnet CIDR(s) at deploy time.
+        - ipBlock:
+            cidr: 10.0.0.0/8
+      ports:
+        - protocol: TCP
+          port: 443
+        - protocol: TCP
+          port: 5432
+        - protocol: TCP
+          port: 6380

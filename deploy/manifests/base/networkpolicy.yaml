@@ -1,0 +1,16 @@
+# Default-deny for the control plane's OWN namespace (doc §6 Layer 3, §12). Per-sandbox
+# NetworkPolicies are a separate concern: KubernetesProvisioner creates one dynamically
+# in every sandbox namespace it provisions (app/provisioners/kubernetes.py
+# `_create_network_policy`) — this manifest never touches those.
+#
+# The exact allow-rules the control plane itself needs (DB/Redis egress, K8s API,
+# DNS, and in aks-prod, Azure endpoints) are an overlay concern (doc §12) — see
+# deploy/overlays/{local,aks-prod}/networkpolicy-allow.yaml.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny
+  namespace: kubesandbox-system
+spec:
+  podSelector: {}
+  policyTypes: ["Ingress", "Egress"]

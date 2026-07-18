@@ -1,0 +1,14 @@
+# `local` overlay — kind-cluster-testable K8s-spec parity for the sandbox primitives
+# (doc §15: "Kustomize base+overlays" governs primitives; the control-plane Deployment
+# itself is a Helm concern, roadmap Phase 9, and isn't part of this Kustomize tree).
+#
+# No RuntimeClass override here: KubernetesProvisioner reads `provisioner.runtime_class`
+# from config/settings/local.yaml (null), so local sandbox pods never set
+# `runtimeClassName` even though the `gvisor` RuntimeClass object from the base still
+# gets created — it's simply inert (see manifests/base/runtimeclass.yaml).
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - ../../manifests/base
+  - networkpolicy-allow.yaml

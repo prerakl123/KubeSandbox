@@ -1,0 +1,11 @@
+# The control plane's OWN namespace — distinct from the per-sandbox namespaces that
+# KubernetesProvisioner.acquire() creates dynamically at runtime (app/provisioners/
+# kubernetes.py). Nothing here is sandbox-scoped; this is where the FastAPI/worker/
+# reconciler deployments themselves would live (Helm chart, roadmap Phase 9).
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: kubesandbox-system
+  labels:
+    app.kubernetes.io/name: kubesandbox
+    app.kubernetes.io/component: control-plane

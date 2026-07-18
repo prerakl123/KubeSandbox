@@ -1,0 +1,48 @@
+# Least-privilege RBAC for the control plane's own ServiceAccount (doc §6 Layer 6,
+# §11) — only what SandboxService/KubernetesProvisioner actually needs to manage
+# per-sandbox namespaces and exec into sandbox pods. Cluster-scoped because creating/
+# deleting a Namespace is itself a cluster-scoped operation (doc §4.1 "Namespace-per-
+# sandbox"); everything this role can touch is still confined to sandbox-owned
+# namespaces and the sandbox-facing subset of pod verbs.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: kubesandbox-controller
+  namespace: kubesandbox-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: kubesandbox-controller
+rules:
+  - apiGroups: [""]
+    resources: ["namespaces"]
+    verbs: ["get", "list", "watch", "create", "delete"]
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch", "create", "delete"]
+  - apiGroups: [""]
+    resources: ["pods/exec"]
+    verbs: ["create"]
+  - apiGroups: [""]
+    resources: ["pods/log"]
+    verbs: ["get"]
+  - apiGroups: [""]
+    resources: ["resourcequotas", "limitranges"]
+    verbs: ["get", "list", "create", "delete"]
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["networkpolicies"]
+    verbs: ["get", "list", "create", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: kubesandbox-controller
+subjects:
+  - kind: ServiceAccount
+    name: kubesandbox-controller
+    namespace: kubesandbox-system
+roleRef:
+  kind: ClusterRole
+  name: kubesandbox-controller
+  apiGroup: rbac.authorization.k8s.io

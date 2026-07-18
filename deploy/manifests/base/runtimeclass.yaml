@@ -1,0 +1,16 @@
+# Cluster-scoped prerequisite for gVisor kernel isolation (doc §6 Layer 2). A sandbox
+# Pod only actually runs under gVisor if BOTH of these are true: (1) this RuntimeClass
+# object exists, naming a containerd handler the node actually has installed, and (2)
+# KubernetesProvisioner sets `runtimeClassName: gvisor` on the pod spec, which it does
+# whenever `provisioner.runtime_class` is configured (aks-prod.yaml sets it; local.yaml
+# leaves it null, so local pods never reference this object even though it exists).
+#
+# Requires an AKS node pool provisioned with the gVisor/Kata containerd shim — that
+# node-pool provisioning is cluster/infra-level and out of this repo's code (roadmap
+# Phase 9). A plain kind cluster has no such node, so this object is inert there by
+# design — nothing in `local` ever sets runtimeClassName, so it's simply never referenced.
+apiVersion: node.k8s.io/v1
+kind: RuntimeClass
+metadata:
+  name: gvisor
+handler: runsc

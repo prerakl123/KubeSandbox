@@ -1,0 +1,14 @@
+# Prod-scale bump over base's generic default (doc §21: exact sizing is an
+# implementation-level unknown to surface per-environment, not a blocking design gap).
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: kubesandbox-system-quota
+  namespace: kubesandbox-system
+spec:
+  hard:
+    pods: "60"
+    requests.cpu: "24"
+    requests.memory: 48Gi
+    limits.cpu: "48"
+    limits.memory: 96Gi

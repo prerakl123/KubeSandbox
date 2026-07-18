@@ -1,0 +1,27 @@
+# Egress this overlay grants on top of base's default-deny (doc §12: the allowlist is
+# entirely a deployment-overlay concern, never decided by the control plane at runtime).
+#
+# DNS is the only rule today: per README.md, the control-plane process runs natively on
+# the host in `local` (`uv run uvicorn ...`), not as an in-cluster Deployment, so
+# Postgres/Redis/MinIO/the local registry are host-level docker-compose services this
+# namespace doesn't talk to yet. This becomes load-bearing once a `local` Helm/Kustomize
+# deployment of the control plane itself exists (roadmap Phase 9) — add those egress
+# rules here at that point, not before.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-dns-egress
+  namespace: kubesandbox-system
+spec:
+  podSelector: {}
+  policyTypes: ["Egress"]
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53

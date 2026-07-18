@@ -20,22 +20,26 @@ from app.core.errors import (
     SandboxNotFoundError,
     TemplateNotFoundError,
 )
+from app.core.config import Settings
 from app.core.logging import configure_logging, get_logger
 from app.extensions.loader import load_registry
 from app.provisioners.docker import DockerProvisioner
+from app.provisioners.kubernetes import KubernetesProvisioner
 
 logger = get_logger(__name__)
 
 _NOT_FOUND = (ComponentNotFoundError, TemplateNotFoundError, SandboxNotFoundError)
 
 
-def _build_provisioner(backend: str):
+async def _build_provisioner(settings: Settings):
+    backend = settings.provisioner.backend
     if backend == "docker":
         return DockerProvisioner()
     if backend == "kubernetes":
-        raise NotImplementedError(
-            "KubernetesProvisioner is roadmap Phase 3 — set provisioner.backend=docker "
-            "(app_env=local) until then."
+        return await KubernetesProvisioner.create(
+            kubeconfig_path=settings.provisioner.kubeconfig_path,
+            namespace_prefix=settings.provisioner.namespace_prefix,
+            runtime_class=settings.provisioner.runtime_class,
         )
     raise ValueError(f"unknown provisioner backend: {backend!r}")
 
@@ -47,7 +51,7 @@ async def lifespan(app: FastAPI):
     logger.info("startup", app_env=settings.app_env, provisioner=settings.provisioner.backend)
 
     app.state.registry = load_registry()
-    app.state.provisioner = _build_provisioner(settings.provisioner.backend)
+    app.state.provisioner = await _build_provisioner(settings)
 
     yield
 

@@ -6,9 +6,10 @@ of the roadmap table, not a re-statement of it — each phase's one-line "delive
 below is exploded into the actual concrete pieces of work it implies across the rest of
 the doc (§3–§19).
 
-**Summary: 51 / 103 items complete — Phase 0 (20/21), Phase 1 (21/21, fully
-live-verified), and Phase 2 (10/10, fully live-verified). Phases 3–9 and the
-cross-cutting section are 0% started.**
+**Summary: 57 / 103 items complete — Phase 0 (20/21), Phase 1 (21/21, fully
+live-verified), Phase 2 (10/10, fully live-verified), and Phase 3 (6/6, fully
+live-verified against a real kind cluster). Phases 4–9 and the cross-cutting section
+are 0% started.**
 Phase 1 is no longer just "built" — it has been driven end-to-end against real Docker,
 real Postgres, and the actual golden image, via `POST /v1/execute` returning correct
 `stdout`/`stderr`/`exit_code`/`variables` with no leaked containers afterward. See
@@ -289,20 +290,128 @@ exactly the kind of thing a `FakeProvisioner`-backed unit test structurally cann
 
 ---
 
-## Phase 3 — Kubernetes + hardening (0/6)
+## Phase 3 — Kubernetes + hardening (6/6 — fully live-verified)
 
-- [ ] `KubernetesProvisioner` — currently `app/main.py`'s `_build_provisioner` raises
-      `NotImplementedError` for `provisioner.backend == "kubernetes"`
-- [ ] Pod security context rendering as real Kubernetes PodSpec fields (non-root,
-      dropped capabilities, seccomp, `readOnlyRootFilesystem` — all exist as *Docker*
-      HostConfig fields in `DockerProvisioner` today, nothing K8s-specific yet)
-- [ ] `deploy/manifests/base/` — NetworkPolicy, RBAC, ResourceQuota, LimitRange,
-      RuntimeClass manifests (directory exists, empty)
-- [ ] `deploy/overlays/local/` and `deploy/overlays/aks-prod/` Kustomize overlays
-      (directories exist, empty)
-- [ ] gVisor/Kata `RuntimeClass` wiring (the `provisioner.runtime_class` config field
-      exists and defaults to `gvisor` in `aks-prod.yaml`, but nothing consumes it yet)
-- [ ] `kind`-cluster-based Kubernetes-spec parity testing setup
+- [x] `KubernetesProvisioner` (`app/provisioners/kubernetes.py`) — full `Provisioner`
+      protocol via `kubernetes_asyncio`. Same "one already-running container, exec
+      batch commands into it" shape as `DockerProvisioner`, but isolation is expressed
+      as **namespace-per-sandbox**: `acquire()` creates a fresh Namespace holding a
+      default-deny NetworkPolicy, a ResourceQuota, a LimitRange, and the sandbox Pod;
+      `destroy()` deletes the whole namespace so nothing sandbox-scoped can leak.
+      `app/main.py`'s `_build_provisioner` is now `async` and constructs it for
+      `provisioner.backend == "kubernetes"` via `KubernetesProvisioner.create()`
+      (kubeconfig file, in-cluster service-account token, or default kubeconfig
+      discovery, in that priority order).
+- [x] Pod security context rendering as real Kubernetes PodSpec fields —
+      `runAsNonRoot`/`runAsUser`/`runAsGroup: 10001`, `fsGroup: 10001` (grants the
+      sandbox uid write access to root-owned `emptyDir` volumes — the K8s-native
+      equivalent of `DockerProvisioner`'s explicit tmpfs `uid`/`gid`/`mode`),
+      `seccompProfile: RuntimeDefault`, `allowPrivilegeEscalation: false`,
+      `capabilities.drop: ["ALL"]`, `readOnlyRootFilesystem`, `automountServiceAccountToken:
+      false`, disk-backed (not `medium: Memory`) `emptyDir` for `/workspace`/`/tmp` —
+      deliberately side-stepping the tmpfs-`noexec` class of bug Docker hit in Phase
+      1/2 rather than reproducing it (see "Live verification" below for the
+      Go-compiled-binary proof).
+- [x] `deploy/manifests/base/` — `namespace.yaml` (the control plane's own
+      `kubesandbox-system`, distinct from the per-sandbox namespaces
+      `KubernetesProvisioner` creates dynamically), `rbac.yaml` (least-privilege
+      `ServiceAccount`/`ClusterRole`/`ClusterRoleBinding` — namespaces/pods/pods-exec/
+      networkpolicies/resourcequotas/limitranges, nothing broader), `networkpolicy.yaml`
+      (default-deny for `kubesandbox-system`), `resourcequota.yaml`, `limitrange.yaml`,
+      `runtimeclass.yaml` (`gvisor` / `runsc` handler) — all wired into one
+      `kustomization.yaml`.
+- [x] `deploy/overlays/local/` and `deploy/overlays/aks-prod/` Kustomize overlays —
+      each layers environment-specific NetworkPolicy egress-allow rules on top of
+      base's default-deny (doc §12: the allowlist is an overlay concern, never decided
+      by the control plane at runtime); `aks-prod` additionally patches the
+      `ResourceQuota` to prod scale. Both build cleanly with `kubectl kustomize` and
+      were `kubectl apply -k`'d against a real cluster with zero errors.
+- [x] gVisor/Kata `RuntimeClass` wiring — `KubernetesProvisioner` reads
+      `provisioner.runtime_class` and sets `runtimeClassName` on every sandbox pod when
+      configured (`aks-prod.yaml`: `gvisor`; `local.yaml`: `null`, so local pods never
+      reference it even though the `RuntimeClass` object itself is always created by
+      the base manifests — inert until a real gVisor-enabled node pool exists, which is
+      cluster/infra-level and out of this repo's code, roadmap Phase 9).
+- [x] `kind`-cluster-based Kubernetes-spec parity testing setup —
+      `deploy/kind/kind-config.yaml` (pinned `kindest/node:v1.32.2`);
+      `tests/integration/test_execute_kubernetes.py` mirrors
+      `test_execute_docker.py`'s self-skip-if-unavailable pattern, checking the golden
+      image is loaded into the kind node's containerd store (`crictl inspecti`, not
+      just the host Docker daemon — kind nodes don't share the host's image cache).
+
+### The stdin-EOF-over-K8s-exec discovery
+
+Unlike `DockerProvisioner`'s raw hijacked TCP stream (a real half-close cleanly signals
+"no more input" while the read side stays open), the Kubernetes exec API multiplexes
+stdin/stdout/stderr/exit-status as byte-prefixed frames over **one** WebSocket
+connection. Empirically confirmed against a live kind cluster (not guessed): with only
+the default `v4.channel.k8s.io` subprotocol negotiated, a process blocked on stdin
+(`cat`, or a batch runner's `input()`) never sees EOF — the exec session hangs until the
+wall-clock timeout reaps it. Fix, also confirmed live: offer `v5.channel.k8s.io`
+alongside v4 in the WebSocket handshake and send a control frame — byte `255`
+(close-channel index) followed by the target channel index (`0` = stdin) — which closes
+just that stream and delivers real EOF while stdout/stderr/exit-status keep flowing on
+the same connection. Degrades safely on a server that only supports v4 (the frame is
+silently ignored, same wall-clock-timeout fallback philosophy as Docker's
+`_half_close_stdin`). Full reasoning and the empirical probe sequence that found this
+are documented in `app/provisioners/kubernetes.py`'s module docstring.
+
+### Bug found and fixed during live verification
+
+**Kubernetes label *values* are far more restrictive than Docker's.** The first live run
+of `POST /v1/execute` against a real kind cluster failed with a `422` from the API
+server: `component_ref` labels like `"python@3.12.4"` (fine as an arbitrary Docker
+label) fail Kubernetes' label-value regex (no `@`, no `/`). Fixed by moving
+`spec.labels` to **annotations** (no charset restriction) on both the Namespace and the
+Pod, keeping only the sandbox-id UUID as an actual label — exactly the kind of bug this
+codebase's live-verification practice exists to catch, since a mocked API client would
+never enforce the real server's validation rules.
+
+### Live verification (Phase 3)
+
+All against a real kind cluster (`kubesandbox-dev`, `kindest/node:v1.32.2`), not
+mocks — golden images loaded via `kind load docker-image`:
+
+- `POST /v1/execute` driven over real HTTP against the full FastAPI app (`APP_ENV=local`
+  with `KUBESANDBOX_PROVISIONER__BACKEND=kubernetes` overriding just the provisioner)
+  for `python`, including the stdin round-trip and variable dump.
+- Direct `SandboxService` + `KubernetesProvisioner` runs for `node` (variable dump),
+  `go` (compiled binary execve'd out of `/tmp` — the exact class of bug that broke
+  `go run` under Docker's tmpfs in Phase 1/2, confirmed *not* to reproduce under K8s's
+  disk-backed `emptyDir`), and the composed `base-dev-lab@1.0` template (`bash`/`git`).
+- A held-open sandbox pod was inspected directly: `kubectl get pod ... -o jsonpath`
+  confirmed the security context was accepted by the API server exactly as sent
+  (`runAsNonRoot`, uid/gid 10001, `seccompProfile: RuntimeDefault`,
+  `allowPrivilegeEscalation: false`, `capabilities.drop: ["ALL"]`,
+  `readOnlyRootFilesystem: true`); `kubectl exec ... id` confirmed the process actually
+  runs as uid 10001, not root; `touch /etc/...` failed (read-only rootfs) while
+  `touch /workspace/...` succeeded (writable via `fsGroup`); and — the actual
+  containment claim, not just accepted YAML — the default-deny NetworkPolicy was
+  confirmed to really block egress from inside that live pod, both to an external IP
+  and to the Kubernetes API server itself.
+- Namespace teardown confirmed idempotent and leak-free across every run
+  (`kubectl get namespaces` polled to empty after each test), with graceful-GC-lag
+  handled by polling rather than asserting instantly — Kubernetes namespace deletion is
+  asynchronous and its exact timing varies with API server/etcd load, confirmed live
+  when a short fixed timeout flaked under a full-suite test run's create/delete churn.
+
+### Known scope boundaries (Phase 3)
+
+- **No real gVisor/Kata execution.** The `RuntimeClass` object and the provisioner's
+  `runtimeClassName` wiring are real and live-tested for *absence* (local pods never
+  set it), but there is no gVisor-enabled node anywhere this can run against — that
+  requires real AKS infrastructure (cluster/infra-level, roadmap Phase 9), so the
+  actual kernel-isolation behavior itself is untested, honestly flagged rather than
+  assumed.
+- **NetworkPolicy enforcement depends on the cluster's CNI**, not on anything this repo
+  controls — confirmed live that kind's default CNI on this node image *does* enforce
+  it, but that's a property of the cluster, not a guarantee `KubernetesProvisioner`
+  itself can make. `aks-prod`'s actual CNI/network-policy engine choice is a deploy-time
+  decision outside this repo's code.
+- **Interactive attach is still Phase 4** — `KubernetesProvisioner.attach()` raises
+  `NotImplementedError`, same placeholder shape as `DockerProvisioner.attach()`.
+- **Execution-time entitlement enforcement gap from Phase 2 is unchanged** — still
+  flagged there, not re-litigated here.
 
 ---
 

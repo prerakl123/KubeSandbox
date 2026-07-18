@@ -1,0 +1,16 @@
+# Bounds the control plane's OWN namespace (API/worker/reconciler deployments, roadmap
+# Phase 9's Helm chart) — not the per-sandbox quotas, which KubernetesProvisioner
+# creates dynamically per sandbox namespace (app/provisioners/kubernetes.py
+# `_create_resource_quota`). Sized generously; tune per environment via an overlay patch.
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: kubesandbox-system-quota
+  namespace: kubesandbox-system
+spec:
+  hard:
+    pods: "20"
+    requests.cpu: "8"
+    requests.memory: 16Gi
+    limits.cpu: "16"
+    limits.memory: 32Gi

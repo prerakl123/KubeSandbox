@@ -1,0 +1,16 @@
+# kind cluster for K8s-spec parity testing (doc §15, roadmap Phase 3) — the closest
+# thing to `aks-prod` this repo can stand up without a real Azure subscription: a real
+# Kubernetes API server, real scheduler, real kubelet enforcing pod security context
+# fields, and (confirmed empirically against this exact image) a CNI that actually
+# enforces NetworkPolicy, unlike some older kind defaults.
+#
+# What this does NOT give you: gVisor/Kata isolation (no such containerd shim on a kind
+# node — the `gvisor` RuntimeClass from deploy/manifests/base is inert here on purpose,
+# see runtimeclass.yaml) or Azure-specific integrations (Key Vault, ACR, managed
+# Postgres/Redis) — those stay stubbed/REPLACE_ME until a real aks-prod cluster exists.
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+name: kubesandbox-dev
+nodes:
+  - role: control-plane
+    image: kindest/node:v1.32.2

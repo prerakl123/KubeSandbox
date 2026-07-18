@@ -8,6 +8,7 @@ dependencies = [
     "asyncpg>=0.31.0",
     "fastapi>=0.139.2",
     "jsonschema>=4.26.0",
+    "kubernetes-asyncio>=32.0.0",
     "pydantic>=2",
     "pydantic-settings>=2.14.2",
     "pyjwt>=2.13.0",
