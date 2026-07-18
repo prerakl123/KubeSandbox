@@ -1,0 +1,47 @@
+apiVersion: kubesandbox.io/v1
+kind: Component
+metadata:
+  name: base
+  version: "1.0"
+  category: base
+  displayName: "KubeSandbox base image"
+  description: >-
+    Minimal non-root Debian-slim base (bash/coreutils/git) — the shared foundation
+    a SandboxTemplate.spec.base.ref points to (doc §3.4).
+
+spec:
+  source:
+    type: image
+    image: { repository: kubesandbox/base, tag: "1.0" }
+
+  provides:
+    commands: ["bash", "sh", "git"]
+
+  runtime:
+    kind: mainTool
+    weightClass: light
+    resources:
+      requests: { cpu: "50m", memory: "64Mi" }
+      limits: { cpu: "500m", memory: "256Mi" }
+    env: []
+    volumeMounts:
+      - { name: workspace, mountPath: /workspace }
+
+  access:
+    network:
+      egress: denied
+    filesystem:
+      workdir: /workspace
+      writablePaths: ["/workspace", "/tmp"]
+      readOnlyRootFilesystem: true
+    limits:
+      processes: 64
+      outputBytes: 2000000
+      wallClockSeconds: 30
+
+  requires: []
+
+  compatibility:
+    environments: ["local", "aks-prod"]
+    runtimeClass:
+      aks-prod: gvisor

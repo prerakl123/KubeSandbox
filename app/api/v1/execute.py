@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from fastapi import APIRouter, Depends
-from pydantic import BaseModel
+from pydantic import BaseModel, model_validator
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import Principal, get_current_principal, get_sandbox_service
@@ -15,8 +15,20 @@ router = APIRouter(prefix="/v1", tags=["execute"])
 class ExecuteRequest(BaseModel):
     language: str
     version: str | None = None
+    template: str | None = None
+    """SandboxTemplate ref ('name@version') to compose the sandbox from (doc §3.4,
+    roadmap Phase 2) — when set, `language` picks which of the template's mainTool
+    components to run rather than resolving an ad-hoc single component."""
     code: str
     stdin: str = ""
+
+    @model_validator(mode="after")
+    def _version_only_without_template(self) -> "ExecuteRequest":
+        if self.template and self.version:
+            raise ValueError("'version' pins an ad-hoc component version; it has no "
+                              "meaning alongside 'template' — pin the component's "
+                              "version inside the template's own component refs instead")
+        return self
 
 
 @router.post("/execute", response_model=BatchRunResult)
@@ -31,6 +43,7 @@ async def execute(
     return await service.execute(
         language=body.language,
         version=body.version,
+        template=body.template,
         code=body.code,
         stdin=body.stdin,
         tenant_id=principal.tenant_id,

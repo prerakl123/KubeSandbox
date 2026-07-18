@@ -1,0 +1,65 @@
+apiVersion: kubesandbox.io/v1
+kind: Component
+metadata:
+  name: node
+  version: "20.15.0"
+  category: language
+  displayName: "Node.js 20"
+  description: >-
+    Node.js runtime with npm, plus a batch runner supporting variable-dump capture
+    (top-level `var`/implicit-global bindings only — see runner.js for why `let`/`const`
+    can't be captured the way Python's exec()-namespace dump can, doc §5.3).
+
+spec:
+  source:
+    type: image
+    image: { repository: kubesandbox/node, tag: "20.15.0-slim" }
+
+  provides:
+    languageId: node
+    commands: ["node", "npm", "npx"]
+    fileExtensions: [".js"]
+    versionCommand: "node --version"
+    defaultRun: "node {file}"
+    batchRunner:
+      entrypoint: "/opt/kubesandbox/runners/node_runner.js"
+      supportsVariableDump: true
+      stdinMode: upfront
+
+  runtime:
+    kind: mainTool
+    weightClass: light
+    resources:
+      requests: { cpu: "100m", memory: "128Mi" }
+      limits: { cpu: "1", memory: "512Mi" }
+    env: []
+    volumeMounts:
+      - { name: workspace, mountPath: /workspace }
+
+  access:
+    network:
+      egress: intent-only
+      reason: "npm install via internal mirror, only when packages.install.enabled is turned on"
+    packages:
+      manager: npm
+      install:
+        enabled: false
+        source: mirror
+        mirror: "https://npm.internal/"
+        denylist: []
+        allowlist: []
+    filesystem:
+      workdir: /workspace
+      writablePaths: ["/workspace", "/tmp"]
+      readOnlyRootFilesystem: true
+    limits:
+      processes: 128
+      outputBytes: 5000000
+      wallClockSeconds: 60
+
+  requires: []
+
+  compatibility:
+    environments: ["local", "aks-prod"]
+    runtimeClass:
+      aks-prod: gvisor

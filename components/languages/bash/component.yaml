@@ -1,0 +1,47 @@
+apiVersion: kubesandbox.io/v1
+kind: Component
+metadata:
+  name: bash
+  version: "1.0"
+  category: language
+  displayName: "Bash"
+  description: >-
+    Bash scripting, baked into the shared base image (kubesandbox/base:1.0) — no
+    variable-dump support (that's opt-in per component, doc §5.3; Bash has no natural
+    notion of a serializable "final scope").
+
+spec:
+  source:
+    type: image
+    image: { repository: kubesandbox/base, tag: "1.0" }
+
+  provides:
+    languageId: bash
+    commands: ["bash", "sh"]
+    fileExtensions: [".sh"]
+    versionCommand: "bash --version"
+    defaultRun: "bash {file}"
+
+  runtime:
+    kind: mainTool
+    weightClass: light
+    resources:
+      requests: { cpu: "50m", memory: "64Mi" }
+      limits: { cpu: "500m", memory: "256Mi" }
+
+  access:
+    network:
+      egress: denied
+    filesystem:
+      workdir: /workspace
+      writablePaths: ["/workspace", "/tmp"]
+      readOnlyRootFilesystem: true
+    limits:
+      processes: 64
+      outputBytes: 2000000
+      wallClockSeconds: 30
+
+  requires: []
+
+  compatibility:
+    environments: ["local", "aks-prod"]

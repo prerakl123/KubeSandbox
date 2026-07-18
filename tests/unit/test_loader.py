@@ -17,8 +17,14 @@ def test_real_registry_loads_and_validates() -> None:
     assert python.spec.provides.batchRunner.supportsVariableDump is True
 
 
+_EMPTY_TEMPLATES_DIR = FIXTURES_DIR / "registry_good" / "templates"  # doesn't exist on disk
+
+
 def test_latest_and_ref_resolution_across_versions() -> None:
-    registry = load_registry(components_dir=FIXTURES_DIR / "registry_good" / "components")
+    registry = load_registry(
+        components_dir=FIXTURES_DIR / "registry_good" / "components",
+        templates_dir=_EMPTY_TEMPLATES_DIR,
+    )
     latest = registry.latest_component("widget")
     assert latest.metadata.version == "2.0"
     assert registry.resolve_component_ref("widget@latest").metadata.version == "2.0"
@@ -26,7 +32,10 @@ def test_latest_and_ref_resolution_across_versions() -> None:
 
 
 def test_unknown_component_raises() -> None:
-    registry = load_registry(components_dir=FIXTURES_DIR / "registry_good" / "components")
+    registry = load_registry(
+        components_dir=FIXTURES_DIR / "registry_good" / "components",
+        templates_dir=_EMPTY_TEMPLATES_DIR,
+    )
     with pytest.raises(ComponentNotFoundError):
         registry.get_component("widget", "9.9")
 

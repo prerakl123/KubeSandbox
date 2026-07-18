@@ -37,7 +37,12 @@
             "type": "object",
             "required": ["ref"],
             "additionalProperties": false,
-            "properties": { "ref": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]*@.+$" } }
+            "properties": {
+              "ref": {
+                "type": "string",
+                "pattern": "^(tenant/[a-z0-9-]+/)?[a-z0-9][a-z0-9-]*@.+$"
+              }
+            }
           }
         },
         "weightClass": { "type": "string", "enum": ["light", "standard", "heavy"] },

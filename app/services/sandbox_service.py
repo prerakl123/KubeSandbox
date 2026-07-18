@@ -1,20 +1,23 @@
 """Resolves a language/template request into a SandboxSpec + BatchCommand, drives an
 ephemeral sandbox through acquire -> exec_batch -> destroy, and persists the run.
 
-Phase 1 scope only: single ad-hoc language component (no SandboxTemplate composition
-yet — that's Phase 2), always ephemeral (no pooling/recycling — Phase 7).
+Always ephemeral (no pooling/recycling — Phase 7). Two ways to resolve the spec:
+a single ad-hoc language component (Phase 1), or a SandboxTemplate composed from
+base + multiple components (Phase 2, doc §3.4) — see template_render.render_template
+for how the latter merges component specs into one runnable SandboxSpec.
 """
 
 from __future__ import annotations
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.errors import ComponentNotFoundError, KubeSandboxError
+from app.core.errors import ComponentNotFoundError, KubeSandboxError, TemplateNotFoundError
 from app.domain.execution import BatchCommand, BatchRunResult, ResourceSpec, SandboxSpec, WeightClass
 from app.domain.manifests import Component
 from app.extensions.loader import Registry
 from app.persistence.models import Run, Sandbox
 from app.provisioners.base import Provisioner
+from app.services.template_render import RenderedTemplateSpec, render_template
 
 
 class SandboxService:
@@ -31,6 +34,26 @@ class SandboxService:
             raise ComponentNotFoundError(
                 f"no such language component: {language}@{version or 'latest'}"
             ) from exc
+
+    def _resolve_template(self, template_ref: str) -> RenderedTemplateSpec:
+        try:
+            template = self._registry.resolve_template_ref(template_ref)
+        except TemplateNotFoundError as exc:
+            raise TemplateNotFoundError(f"no such template: {template_ref}") from exc
+        return render_template(self._registry, template)
+
+    @staticmethod
+    def _pick_template_component(rendered: RenderedTemplateSpec, language: str) -> Component:
+        for component in rendered.main_components:
+            if component.spec.provides.languageId == language or component.metadata.name == language:
+                return component
+        available = sorted(
+            {c.spec.provides.languageId or c.metadata.name for c in rendered.main_components}
+        )
+        raise ComponentNotFoundError(
+            f"template {rendered.template_key} has no runnable component matching "
+            f"language {language!r}; available: {available}"
+        )
 
     @staticmethod
     def _resolve_image_ref(component: Component) -> str:
@@ -95,12 +118,23 @@ class SandboxService:
         code: str,
         version: str | None = None,
         stdin: str = "",
+        template: str | None = None,
         tenant_id: str,
         user_id: str | None,
         session: AsyncSession,
     ) -> BatchRunResult:
-        component = self._resolve_component(language, version)
-        spec = self._build_spec(component)
+        template_ref: str | None = None
+        if template:
+            rendered = self._resolve_template(template)
+            component = self._pick_template_component(rendered, language)
+            spec = rendered.sandbox_spec
+            template_ref = rendered.template_key
+            component_refs = [c.key for c in rendered.main_components]
+        else:
+            component = self._resolve_component(language, version)
+            spec = self._build_spec(component)
+            component_refs = [component.key]
+
         batch_command = self._build_batch_command(component, code, stdin)
 
         handle = await self._provisioner.acquire(spec)
@@ -109,7 +143,8 @@ class SandboxService:
             id=handle.sandbox_id,
             tenant_id=tenant_id,
             user_id=user_id,
-            component_refs=[component.key],
+            template_ref=template_ref,
+            component_refs=component_refs,
             backend=handle.backend,
             native_ref=handle.native_ref,
             state="active",

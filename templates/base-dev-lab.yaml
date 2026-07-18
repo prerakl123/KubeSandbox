@@ -1,0 +1,24 @@
+apiVersion: kubesandbox.io/v1
+kind: SandboxTemplate
+metadata:
+  name: base-dev-lab
+  version: "1.0"
+  displayName: "Base dev lab (bash + git)"
+  description: >-
+    Demonstrates real multi-component SandboxTemplate composition (doc §3.4, roadmap
+    Phase 2): base + bash + git all share one pre-baked golden image today
+    (kubesandbox/base:1.0), so this template is genuinely runnable end-to-end, not just
+    schema-valid. Per-component *separate*-image merging (e.g. a template mixing
+    components whose golden images actually differ) needs BuildManager (Phase 6) —
+    TemplateService.render() rejects that case today with a clear error instead of
+    silently picking one image.
+
+spec:
+  base: { ref: "base@1.0" }
+  components:
+    - ref: "bash@1.0"
+    - ref: "git@1.0"
+  weightClass: light
+  workspace: { persistent: false, sizeMB: 512 }
+  resources: { cpu: "500m", memory: "256Mi", ephemeralStorageMB: 512 }
+  ttl: { idle: "15m", max: "2h" }

@@ -35,6 +35,11 @@ def _load_schema(filename: str) -> dict:
 _COMPONENT_SCHEMA = _load_schema("component.schema.json")
 _TEMPLATE_SCHEMA = _load_schema("template.schema.json")
 
+# Public aliases: the API layer serves these back verbatim (GET /v1/components/{name})
+# so manifest authors can validate client-side against the same schema the loader uses.
+COMPONENT_SCHEMA = _COMPONENT_SCHEMA
+TEMPLATE_SCHEMA = _TEMPLATE_SCHEMA
+
 
 def _validate_against_schema(document: dict, schema: dict, *, source: Path) -> None:
     validator_cls = jsonschema.validators.validator_for(schema)
@@ -48,14 +53,25 @@ def _validate_against_schema(document: dict, schema: dict, *, source: Path) -> N
         raise ManifestValidationError(f"{source}: {details}")
 
 
-def _version_sort_key(version: str) -> tuple[int, ...]:
+def version_sort_key(version: str) -> tuple[int, ...]:
+    """Public so callers outside the loader (e.g. RegistryService) can sort a list of
+    version strings the same semantically-correct way as latest_component() does —
+    plain string sort puts "9.0" ahead of "10.0"."""
     core = version.split("+")[0].split("-")[0]
     return tuple(int(part) for part in core.split(".") if part.isdigit())
 
 
 @dataclass
 class Registry:
-    components: dict[str, Component] = field(default_factory=dict)  # key: "name@version"
+    """`components`/`templates` are keyed by a *registry key*, not always the bare
+    manifest name: public entries key on `metadata.name@version` as before, but
+    tenant-private entries (loaded from a `tenant/<tenant_id>/...` subtree, doc §3.6)
+    key on `tenant/<tenant_id>/<name>@version` instead — see `_registry_key_for`. This
+    keeps private components/templates from colliding with (or being reachable via a
+    bare lookup that could leak their existence across) another tenant's catalog.
+    """
+
+    components: dict[str, Component] = field(default_factory=dict)
     templates: dict[str, SandboxTemplate] = field(default_factory=dict)
 
     def get_component(self, name: str, version: str) -> Component:
@@ -66,14 +82,23 @@ class Registry:
             raise ComponentNotFoundError(key) from None
 
     def latest_component(self, name: str) -> Component:
-        candidates = [c for c in self.components.values() if c.metadata.name == name]
+        # Matched against the registry-key's name portion, not metadata.name: a
+        # tenant-private component's metadata.name is an unqualified bare name (e.g.
+        # "mytool", schema-valid), so matching on metadata.name here would let a bare
+        # lookup for "mytool" resolve to (and thus leak the existence of) another
+        # tenant's private component of the same name. Matching on the qualified key
+        # means a bare lookup only ever considers public entries.
+        candidates = [
+            c for key, c in self.components.items() if key.rsplit("@", 1)[0] == name
+        ]
         if not candidates:
             raise ComponentNotFoundError(name)
-        return max(candidates, key=lambda c: _version_sort_key(c.metadata.version))
+        return max(candidates, key=lambda c: version_sort_key(c.metadata.version))
 
     def resolve_component_ref(self, ref: str) -> Component:
-        """ref is 'name@version' or 'name@latest'."""
-        name, sep, version = ref.partition("@")
+        """ref is 'name@version' or 'name@latest' — name may be a bare public name or
+        a qualified 'tenant/<id>/<name>' private one; both are just registry keys."""
+        name, sep, version = ref.rpartition("@")
         if not sep or not version:
             raise ComponentNotFoundError(ref)
         if version == "latest":
@@ -87,11 +112,57 @@ class Registry:
         except KeyError:
             raise TemplateNotFoundError(key) from None
 
+    def latest_template(self, name: str) -> SandboxTemplate:
+        candidates = [
+            t for key, t in self.templates.items() if key.rsplit("@", 1)[0] == name
+        ]
+        if not candidates:
+            raise TemplateNotFoundError(name)
+        return max(candidates, key=lambda t: version_sort_key(t.metadata.version))
+
+    def resolve_template_ref(self, ref: str) -> SandboxTemplate:
+        """ref is 'name@version' or 'name@latest', mirroring resolve_component_ref."""
+        name, sep, version = ref.rpartition("@")
+        if not sep or not version:
+            raise TemplateNotFoundError(ref)
+        if version == "latest":
+            return self.latest_template(name)
+        return self.get_template(name, version)
+
     def list_components(self) -> list[Component]:
         return list(self.components.values())
 
     def list_templates(self) -> list[SandboxTemplate]:
         return list(self.templates.values())
+
+
+def registry_key_for(path: Path, bare_key: str, root: Path) -> str:
+    """Public components/templates key on their bare 'name@version'. Anything found
+    under a '<root>/tenant/<tenant_id>/...' subtree (doc §3.6) is scope-owned and keys
+    on 'tenant/<tenant_id>/name@version' instead, so it can never collide with — or be
+    reached by a bare lookup for — another tenant's (or the public catalog's) entry."""
+    try:
+        rel_parts = path.relative_to(root).parts
+    except ValueError:
+        return bare_key
+    if len(rel_parts) >= 2 and rel_parts[0] == "tenant":
+        return f"tenant/{rel_parts[1]}/{bare_key}"
+    return bare_key
+
+
+def validate_component_manifest(raw: dict, *, source: Path) -> Component:
+    """Validate a raw Component manifest dict against the JSON Schema, then parse it
+    into the typed model. Public so services (e.g. RegistryService) can validate a
+    manifest submitted through the API the same way the disk loader does, before
+    persisting it."""
+    _validate_against_schema(raw, _COMPONENT_SCHEMA, source=source)
+    return Component.model_validate(raw)
+
+
+def validate_template_manifest(raw: dict, *, source: Path) -> SandboxTemplate:
+    """Template-manifest counterpart to validate_component_manifest."""
+    _validate_against_schema(raw, _TEMPLATE_SCHEMA, source=source)
+    return SandboxTemplate.model_validate(raw)
 
 
 def load_components(directory: Path = COMPONENTS_DIR) -> dict[str, Component]:
@@ -100,11 +171,11 @@ def load_components(directory: Path = COMPONENTS_DIR) -> dict[str, Component]:
         return components
     for path in sorted(directory.rglob("component.yaml")):
         raw = yaml.safe_load(path.read_text())
-        _validate_against_schema(raw, _COMPONENT_SCHEMA, source=path)
-        component = Component.model_validate(raw)
-        if component.key in components:
-            raise ManifestValidationError(f"duplicate component {component.key!r} at {path}")
-        components[component.key] = component
+        component = validate_component_manifest(raw, source=path)
+        key = registry_key_for(path, component.key, directory)
+        if key in components:
+            raise ManifestValidationError(f"duplicate component {key!r} at {path}")
+        components[key] = component
     return components
 
 
@@ -114,11 +185,11 @@ def load_templates(directory: Path = TEMPLATES_DIR) -> dict[str, SandboxTemplate
         return templates
     for path in sorted(directory.rglob("*.yaml")):
         raw = yaml.safe_load(path.read_text())
-        _validate_against_schema(raw, _TEMPLATE_SCHEMA, source=path)
-        template = SandboxTemplate.model_validate(raw)
-        if template.key in templates:
-            raise ManifestValidationError(f"duplicate template {template.key!r} at {path}")
-        templates[template.key] = template
+        template = validate_template_manifest(raw, source=path)
+        key = registry_key_for(path, template.key, directory)
+        if key in templates:
+            raise ManifestValidationError(f"duplicate template {key!r} at {path}")
+        templates[key] = template
     return templates
 
 

@@ -93,8 +93,16 @@ class DockerProvisioner:
                 # uid/gid/mode: an unqualified tmpfs mount defaults to root-owned,
                 # which the sandbox's non-root uid then can't write into (confirmed
                 # against a live daemon — "Permission denied" writing into /workspace).
+                # Explicit "exec": confirmed against a live daemon that Docker silently
+                # mounts an unqualified tmpfs `noexec` — harmless for interpreted
+                # languages (they never execve anything out of /workspace or /tmp) but
+                # it breaks every compiled-language component (Go's `go run` compiles a
+                # fresh binary into $GOTMPDIR/$GOCACHE, both under /tmp, then execve's
+                # it — "permission denied" with no other symptom). Doesn't weaken
+                # containment: the sandboxed non-root user can already run arbitrary
+                # code via the language interpreter/compiler itself.
                 "Tmpfs": {
-                    path: f"rw,nosuid,nodev,size=1g,uid={_SANDBOX_UID},gid={_SANDBOX_UID},mode=0755"
+                    path: f"rw,exec,nosuid,nodev,size=1g,uid={_SANDBOX_UID},gid={_SANDBOX_UID},mode=0755"
                     for path in spec.writable_paths
                 },
                 "CapDrop": ["ALL"],

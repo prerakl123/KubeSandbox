@@ -5,8 +5,11 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
+from app.api.v1.admin import router as admin_router
+from app.api.v1.components import router as components_router
 from app.api.v1.execute import router as execute_router
 from app.api.v1.health import router as health_router
+from app.api.v1.templates import router as templates_router
 from app.core.config import get_settings
 from app.core.errors import (
     ComponentNotFoundError,
@@ -91,6 +94,9 @@ def create_app() -> FastAPI:
     _register_exception_handlers(app)
     app.include_router(health_router)
     app.include_router(execute_router)
+    app.include_router(components_router)
+    app.include_router(templates_router)
+    app.include_router(admin_router)
     return app
 
 

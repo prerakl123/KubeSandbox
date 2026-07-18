@@ -1,0 +1,43 @@
+apiVersion: kubesandbox.io/v1
+kind: Component
+metadata:
+  name: git
+  version: "1.0"
+  category: tool
+  displayName: "git"
+  description: >-
+    git CLI, baked into the shared base image (kubesandbox/base:1.0) — composes into a
+    SandboxTemplate alongside a language component with no separate container needed.
+
+spec:
+  source:
+    type: image
+    image: { repository: kubesandbox/base, tag: "1.0" }
+
+  provides:
+    commands: ["git"]
+
+  runtime:
+    kind: mainTool
+    weightClass: light
+    resources:
+      requests: { cpu: "20m", memory: "32Mi" }
+      limits: { cpu: "200m", memory: "128Mi" }
+
+  access:
+    network:
+      egress: intent-only
+      reason: "git clone/fetch against remote repositories, when the deploy overlay allows it"
+    filesystem:
+      workdir: /workspace
+      writablePaths: ["/workspace", "/tmp"]
+      readOnlyRootFilesystem: true
+    limits:
+      processes: 32
+      outputBytes: 2000000
+      wallClockSeconds: 30
+
+  requires: []
+
+  compatibility:
+    environments: ["local", "aks-prod"]

@@ -1,0 +1,63 @@
+apiVersion: kubesandbox.io/v1
+kind: Component
+metadata:
+  name: go
+  version: "1.22.5"
+  category: language
+  displayName: "Go 1.22"
+  description: >-
+    Go toolchain (`go run`); no variable-dump support — Go is compiled and has no
+    serializable notion of a "final top-level scope" after the process exits, unlike
+    Python/Node (doc §5.3's variable dump is opt-in per component, not assumed).
+
+spec:
+  source:
+    type: image
+    image: { repository: kubesandbox/go, tag: "1.22.5-slim" }
+
+  provides:
+    languageId: go
+    commands: ["go"]
+    fileExtensions: [".go"]
+    versionCommand: "go version"
+    defaultRun: "go run {file}"
+
+  runtime:
+    kind: mainTool
+    weightClass: standard
+    resources:
+      requests: { cpu: "200m", memory: "256Mi" }
+      limits: { cpu: "2", memory: "1Gi" }
+    env:
+      - { name: GOCACHE, value: /tmp/go-cache }
+      - { name: GOPATH, value: /tmp/go-path }
+    volumeMounts:
+      - { name: workspace, mountPath: /workspace }
+
+  access:
+    network:
+      egress: intent-only
+      reason: "module downloads via internal mirror (GOPROXY), only when packages.install.enabled is turned on"
+    packages:
+      manager: go
+      install:
+        enabled: false
+        source: mirror
+        mirror: "https://goproxy.internal"
+        denylist: []
+        allowlist: []
+    filesystem:
+      workdir: /workspace
+      writablePaths: ["/workspace", "/tmp"]
+      readOnlyRootFilesystem: true
+    limits:
+      processes: 128
+      outputBytes: 5000000
+      wallClockSeconds: 90
+
+  requires: []
+
+  compatibility:
+    environments: ["local", "aks-prod"]
+    runtimeClass:
+      aks-prod: gvisor

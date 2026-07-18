@@ -6,8 +6,9 @@ of the roadmap table, not a re-statement of it — each phase's one-line "delive
 below is exploded into the actual concrete pieces of work it implies across the rest of
 the doc (§3–§19).
 
-**Summary: 40 / 103 items complete — all of it inside Phase 0 (19/21) and Phase 1
-(21/21, fully live-verified). Phases 2–9 and the cross-cutting section are 0% started.**
+**Summary: 51 / 103 items complete — Phase 0 (20/21), Phase 1 (21/21, fully
+live-verified), and Phase 2 (10/10, fully live-verified). Phases 3–9 and the
+cross-cutting section are 0% started.**
 Phase 1 is no longer just "built" — it has been driven end-to-end against real Docker,
 real Postgres, and the actual golden image, via `POST /v1/execute` returning correct
 `stdout`/`stderr`/`exit_code`/`variables` with no leaked containers afterward. See
@@ -15,9 +16,22 @@ real Postgres, and the actual golden image, via `POST /v1/execute` returning cor
 these were catchable by the unit tests alone, precisely because they needed a real
 Docker daemon to surface.
 
+Phase 2 was implemented and unit-tested (44 new unit tests, all passing) in a
+session without live Docker daemon access, then live-verified end-to-end in a
+follow-up pass once the user had Docker access again: all three new golden images
+(`base`, `node`, `go`) were built, and `POST /v1/execute` was driven repeatedly against
+the real stack for every language (`python`, `node`, `go`, `bash`) plus the composed
+`base-dev-lab@1.0` template (base + bash + git sharing one image), each returning a
+correct bundled result. `GET /v1/components` and `GET /v1/templates` were also hit live
+and returned the full unfiltered catalog as the local-dev admin principal, as expected.
+See "Known scope boundaries" below for what Phase 2 deliberately does *not* cover, and
+the "5th bug" entry under Phase 1's live-verification bugs for a real `DockerProvisioner`
+fix this live pass surfaced (broke `go run` specifically, but was a latent bug in every
+prior phase — see below).
+
 ---
 
-## Phase 0 — Foundations (19/21)
+## Phase 0 — Foundations (20/21)
 
 - [x] Repo scaffold matching the intended layout (doc §18)
 - [x] `pyproject.toml` + `uv`-managed dependencies (fastapi, uvicorn, pydantic(-settings),
@@ -48,9 +62,11 @@ Docker daemon to surface.
       (against a throwaway SQLite DB — no live Postgres was available to generate
       against; a SQLite-specific `DEFAULT` rendering was caught and fixed before it
       could reach Postgres)
-- [ ] A generic non-root **base image/component** (`category: base`) that a
-      `SandboxTemplate.spec.base.ref` could point to — never created; no
-      `SandboxTemplate` YAML file exists anywhere in the repo either
+- [x] A generic non-root **base image/component** (`category: base`) that a
+      `SandboxTemplate.spec.base.ref` could point to — `components/base/component.yaml`
+      + `Dockerfile` (Debian-slim, uid 10001, bash/coreutils/git), plus the first real
+      `SandboxTemplate` YAML (`templates/base-dev-lab.yaml`), added alongside Phase 2's
+      template-composition work since a template needs *some* base to point at
 - [ ] OIDC/JWT session auth for standalone human users (doc §11) — `pyjwt` is an
       installed dependency but there is no JWT-issuing or JWT-validating code anywhere;
       only the hashed-API-key path (service accounts) is implemented
@@ -134,25 +150,142 @@ containers — this codebase never uses them again for sandbox I/O, only `exec`.
 keeping in mind if Phase 3's `KubernetesProvisioner` ever considers an analogous
 copy-based API instead of `exec`.
 
+**5th bug, found later during Phase 2 live verification (same file, same root cause
+class):** Tmpfs mounts had no explicit `exec`, and Docker silently mounts an
+unqualified tmpfs `noexec` — invisible for every Phase 1 component (interpreted
+languages never execve anything out of `/workspace`/`/tmp`), but it surfaced the
+moment Phase 2's `go` component was exercised live (`go run` compiles a fresh binary
+into `$GOTMPDIR`/`$GOCACHE`, both under `/tmp`, then execve's it — "permission
+denied", no other symptom). Confirmed live:
+`docker run --rm --tmpfs /tmp:rw,nosuid,nodev,size=1g,uid=10001,gid=10001,mode=0755
+debian:12-slim mount | grep ' /tmp '` shows `noexec` present even though it was never
+requested. Fixed by adding `exec` explicitly to the Tmpfs mount-options string in
+`app/provisioners/docker.py`. Doesn't weaken containment — the sandboxed non-root user
+can already run arbitrary code via the language interpreter/compiler itself — but it
+would have silently broken every future compiled-language component (Rust, Java/JDK,
+.NET, …), not just Go, so this is a load-bearing fix, not a Go-specific one.
+
 ---
 
-## Phase 2 — Registry, templates & entitlements (0/10)
+## Phase 2 — Registry, templates & entitlements (10/10)
 
-- [ ] `SandboxTemplate` composition/rendering into a multi-component spec —
-      `SandboxService` currently only resolves a single ad-hoc language component; the
-      template loader/schema exist (Phase 0) but nothing consumes a template end-to-end
-- [ ] Additional language components beyond `python` — Node.js, Deno, Bun, Go, Rust,
-      Java/JDK, .NET, Ruby, PHP, Bash/POSIX, Lua, R, Julia, TypeScript (doc §3.1)
-- [ ] `GET /v1/components` (list/query registry, entitlement-filtered)
-- [ ] `GET /v1/components/{name}` (versions & schema)
-- [ ] `POST /v1/components` (admin: register a manifest)
-- [ ] `GET/POST /v1/templates` (list / create blueprints)
-- [ ] `EntitlementService` — filtering registry/template listings by tenant/user
-      entitlements (the `component_entitlements`/`publish_grants` tables exist from
-      Phase 0 but nothing reads or writes them)
-- [ ] `GET/PATCH /v1/admin/entitlements`
-- [ ] `GET/PATCH /v1/admin/publish-grants`
-- [ ] Private, tenant-namespaced component publishing (`tenant/<id>/<name>`)
+- [x] `SandboxTemplate` composition/rendering into a multi-component spec —
+      `app/services/template_render.py`'s `render_template()` merges a template's
+      base + declared components (env vars, writable paths, weight class, resources)
+      into one `SandboxSpec`; wired end-to-end into `SandboxService.execute()` and
+      `POST /v1/execute` via a new optional `template` field (`language` then picks
+      which of the template's `mainTool` components to run). Real cross-image
+      merging (a template mixing components whose golden images genuinely differ)
+      needs BuildManager (Phase 6) — `render_template()` detects that case and raises
+      a clear error instead of silently picking one image; see "Known scope
+      boundaries" below for the one case that *is* genuinely runnable today.
+- [x] Additional language components beyond `python` — **Node.js** (with a variable-dump
+      batch runner mirroring Python's contract, doc §5.3, though it can only capture
+      top-level `var`/implicit-global bindings, not `let`/`const` — a real V8/vm-module
+      constraint, documented in `runner.js`), **Go** (`go run`, no variable dump —
+      compiled, no serializable final scope), and **Bash** (`bash {file}`, baked into
+      the shared `base` image). Doc §3.1 lists 13 languages total; Deno, Bun, Rust,
+      Java/JDK, .NET, Ruby, PHP, Lua, R, Julia, TypeScript remain unimplemented —
+      scoped down deliberately rather than shipping 13 shallow, untested stubs.
+- [x] `GET /v1/components` (list/query registry, entitlement-filtered, optional
+      `category` query param) — `app/api/v1/components.py`
+- [x] `GET /v1/components/{name}` (all versions visible to the caller + the Component
+      JSON Schema itself, so a manifest author can validate client-side before POSTing)
+- [x] `POST /v1/components` (admin → public catalog under
+      `components/<category-plural>/<name>/`; non-admin with a matching
+      `publish_grant` → tenant-private catalog instead, see below — never the other
+      way around)
+- [x] `GET/POST /v1/templates` (list is entitlement-filtered by deriving visibility
+      from every component the template references — there's no separate
+      `template_entitlements` table in doc §3.6, only one for components; create
+      follows the same admin-public/grant-gated-private split as components, using a
+      synthetic `publish_grants.category = "template"`)
+- [x] `EntitlementService` (`app/services/entitlement_service.py`) — reads/writes
+      `component_entitlements`/`publish_grants` for real now; admin bypasses all of it;
+      a private component/template's ownership is derived *structurally* from its
+      registry key (`tenant/<tenant_id>/<name>@<version>`) rather than a new DB column,
+      so there's nothing to keep in sync. `version_range` matching is deliberately
+      simple (`"*"` or an exact version string) — the doc doesn't specify a full
+      semver-range grammar.
+- [x] `GET/PATCH /v1/admin/entitlements` — `app/api/v1/admin.py`
+- [x] `GET/PATCH /v1/admin/publish-grants` — `app/api/v1/admin.py`
+- [x] Private, tenant-namespaced component publishing (`tenant/<id>/<name>`) —
+      lands on disk at `components/tenant/<tenant_id>/<name>/component.yaml`
+      (templates: `templates/tenant/<tenant_id>/<name>.yaml`), loaded by the same
+      `rglob` the public registry uses. This required fixing a latent bug in
+      `Registry.latest_component`/`resolve_component_ref` (`app/extensions/loader.py`):
+      they matched on `metadata.name`, which is *unqualified* even for a private
+      component (schema-valid bare names only) — a bare lookup for a common name could
+      have resolved to (and thus leaked the existence of) another tenant's private
+      component of the same name. Fixed to match on the registry-key's name portion
+      instead, which is qualified for private entries.
+
+### Bugs found and fixed during adversarial review
+
+An independent review pass over the diff (before commit) caught four real issues, none
+of which the first round of unit tests exercised:
+
+1. **Registering a new version of an existing component/template clobbered the
+   previous version's file on disk.** `RegistryService`/`TemplateService` wrote to
+   `<name>/component.yaml` / `<name>.yaml` — no version in the path — even though the
+   registry fully supports multiple coexisting versions. Fixed by versioning the path
+   itself (`<name>/<version>/component.yaml`, `<name>/<version>.yaml`); a restart would
+   otherwise have silently lost the older version.
+2. **`get_component_versions` sorted lexically, not semantically** (`"10.0"` sorted
+   before `"9.0"`), unlike `Registry.latest_component`'s correct numeric-tuple sort.
+   Fixed by exposing and reusing the same `version_sort_key` everywhere.
+3. **The `ref` pattern in both JSON Schemas never actually permitted a
+   tenant-qualified ref** (`tenant/<id>/<name>@<version>`) — `requires` and a
+   template's `components[].ref` both used `^[a-z0-9][a-z0-9-]*@.+$`, which rejects
+   any "/" before the "@". A component or template could never actually declare a
+   dependency on a private, tenant-namespaced entry, silently undermining part of the
+   private-publishing feature. Fixed by widening both patterns to
+   `^(tenant/[a-z0-9-]+/)?[a-z0-9][a-z0-9-]*@.+$`.
+4. **Publishing a component/template didn't check that the caller could actually see
+   what it referenced.** `requires` (components) and `base`/`components` refs
+   (templates) were only checked for *existence*, not *visibility* — a non-admin
+   publisher could reference another tenant's private component by guessing its exact
+   qualified ref. Fixed via a new `EntitlementService.is_ref_visible()`, enforced in
+   both `RegistryService.register_component` and `TemplateService.create_template`
+   for non-admin callers.
+
+### Live verification (Phase 2)
+
+Unlike the paragraph above might suggest from the implementation session alone, Phase 2
+*was* subsequently live-verified end-to-end (same session, once Docker access was
+available): all three new golden images were built —
+
+```bash
+docker build -t kubesandbox/node:20.15.0-slim components/languages/node
+docker build -t kubesandbox/go:1.22.5-slim components/languages/go
+docker build -t kubesandbox/base:1.0 components/base
+```
+
+— then `docker compose up -d`, `uv run alembic upgrade head`, and repeated
+`POST /v1/execute` calls against the real stack for `python`, `node`, `go`, and `bash`
+(ad-hoc) plus `template=base-dev-lab@1.0` (composed base+bash+git), all returning
+correct bundled results. `GET /v1/components` and `GET /v1/templates` were hit live too.
+This pass is what surfaced the tmpfs-`noexec` bug (see the "5th bug" entry above) —
+exactly the kind of thing a `FakeProvisioner`-backed unit test structurally cannot catch.
+
+### Known scope boundaries (Phase 2)
+
+- **True multi-golden-image template composition is still Phase 6's job.**
+  `render_template()` only succeeds when every `mainTool`-kind component in a template
+  (base included) resolves to the *same* pre-baked image. The one genuinely
+  runnable-today example, `templates/base-dev-lab.yaml` (base + bash + git), works
+  because all three were deliberately baked into one shared image
+  (`kubesandbox/base:1.0`) by hand — the same manual-build pattern Phase 1 used for
+  `python`. A template mixing e.g. `python` and `node` (different images) is schema-valid
+  and loads fine, but `render_template()` rejects *running* it with a clear error
+  pointing at BuildManager, rather than silently dropping half the template.
+- **Execution-time entitlement enforcement was not added.** `EntitlementService` gates
+  the catalog *listing* and *publish* endpoints (the literal Phase 2 checklist wording)
+  — it does not gate `POST /v1/execute`'s ad-hoc `language=`/`template=` resolution,
+  which still goes straight through the `Registry` unfiltered, same as Phase 1. A tenant
+  could execute against any public component regardless of whether they're entitled to
+  *see* it in a catalog listing. Flagged here rather than silently left as a surprise;
+  worth closing in a later hardening pass (Phase 9?) if that gap matters before prod.
 
 ---
 
