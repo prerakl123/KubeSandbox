@@ -13,12 +13,15 @@ from fastapi import Depends, Header, HTTPException, Request, WebSocket, status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.cloud.registry import ImageRegistryProvider
+from app.cloud.storage import ObjectStorageProvider
 from app.core.config import get_settings
 from app.domain.auth import Principal
 from app.extensions.loader import Registry
-from app.persistence.db import get_session
+from app.persistence.db import get_session, get_session_factory
 from app.persistence.models import ApiKey, Tenant, User
 from app.provisioners.base import Provisioner
+from app.services.build_manager import BuildManager
 from app.services.entitlement_service import EntitlementService
 from app.services.registry_service import RegistryService
 from app.services.sandbox_service import SandboxService
@@ -151,3 +154,23 @@ def get_template_service(
     entitlements: EntitlementService = Depends(get_entitlement_service),
 ) -> TemplateService:
     return TemplateService(registry, session, entitlements)
+
+
+def get_image_registry_provider(request: Request) -> ImageRegistryProvider:
+    return request.app.state.image_registry_provider
+
+
+def get_object_storage_provider(request: Request) -> ObjectStorageProvider | None:
+    return request.app.state.object_storage_provider
+
+
+def get_build_manager(
+    registry: Registry = Depends(get_registry),
+    entitlements: EntitlementService = Depends(get_entitlement_service),
+    image_registry: ImageRegistryProvider = Depends(get_image_registry_provider),
+    object_storage: ObjectStorageProvider | None = Depends(get_object_storage_provider),
+) -> BuildManager:
+    # run_build() executes as a FastAPI BackgroundTask after the triggering request
+    # has already returned, so it needs its own session — get_session_factory() (not
+    # get_session, which is request-scoped) is exactly what BuildManager uses for that.
+    return BuildManager(registry, entitlements, image_registry, object_storage, get_session_factory())

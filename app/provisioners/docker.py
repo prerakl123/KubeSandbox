@@ -172,6 +172,12 @@ class DockerProvisioner:
         except DockerError as exc:
             raise ProvisionerError(f"failed to create sandbox container: {exc}") from exc
 
+        try:
+            await self._wait_container_running(container)
+        except ProvisionerError:
+            await self._force_remove(container.id)
+            raise
+
         sidecar_refs: dict[str, str] = {}
         try:
             for sidecar in spec.sidecars:
@@ -204,6 +210,31 @@ class DockerProvisioner:
             created_at=datetime.now(UTC),
             sidecar_refs=sidecar_refs,
         )
+
+    async def _wait_container_running(
+        self, container: aiodocker.docker.DockerContainer, *, timeout_seconds: float = 10.0
+    ) -> None:
+        """`containers.run()` (create+start) can return before the container has
+        actually settled into Docker's "running" state — invisible for every
+        already-built, previously-run golden image (python/node/go/base — the Docker
+        daemon already has every layer extracted and snapshotted from prior runs), but
+        confirmed live to be a real race the *very first* time a container is created
+        from a freshly built image (Phase 6's `jq`/`ripgrep`, built moments earlier via
+        BuildManager): the immediately-following `put_files` exec hit a genuine `409
+        container ... is not running`, not a flaky one-off. Bounded poll, not a fixed
+        sleep — the daemon is usually fast, this only pays the cost when it isn't."""
+        loop = asyncio.get_event_loop()
+        deadline = loop.time() + timeout_seconds
+        while True:
+            info = await container.show()
+            if info.get("State", {}).get("Running"):
+                return
+            if loop.time() >= deadline:
+                raise ProvisionerError(
+                    f"sandbox container {container.id} did not reach 'running' state "
+                    f"within {timeout_seconds}s (state: {info.get('State')})"
+                )
+            await asyncio.sleep(0.05)
 
     async def _create_sidecar(
         self, sandbox_id: str, main_container_id: str, sidecar: SidecarSpec

@@ -1,0 +1,8 @@
+# Consumed by ComposeBuildStrategy (app/build/strategies/compose.py), not `docker
+# compose` directly — the strategy parses this file itself and builds/tags the
+# `ripgrep` service's image the same way DockerfileBuildStrategy would.
+services:
+  ripgrep:
+    build:
+      context: .
+      dockerfile: Dockerfile

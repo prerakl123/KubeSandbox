@@ -33,6 +33,42 @@ from app.domain.manifests import (
 )
 
 
+def make_build_component(
+    name: str,
+    version: str,
+    *,
+    source: ComponentSource,
+    category: str = "tool",
+    default_run: str | None = None,
+) -> Component:
+    """Like make_component, but for a non-"image" source.type (dockerfile/compose/
+    pipeline/helm) — BuildManager/build-strategy tests need this instead."""
+    return Component(
+        apiVersion="kubesandbox.io/v1",
+        kind="Component",
+        metadata=ComponentMetadata(name=name, version=version, category=category),
+        spec=ComponentSpec(
+            source=source,
+            provides=ComponentProvides(
+                fileExtensions=[".txt"] if default_run else [],
+                defaultRun=default_run,
+            ),
+            runtime=ComponentRuntime(
+                kind="mainTool",
+                weightClass="light",
+                resources=ResourceRequirements(
+                    requests=ResourceQuantities(cpu="50m", memory="64Mi"),
+                    limits=ResourceQuantities(cpu="200m", memory="128Mi"),
+                ),
+            ),
+            access=ComponentAccess(
+                filesystem=FilesystemAccess(workdir="/workspace", writablePaths=["/workspace"]),
+                limits=ExecutionLimitsSpec(processes=16, outputBytes=100_000, wallClockSeconds=10),
+            ),
+        ),
+    )
+
+
 def make_component(
     name: str,
     version: str,

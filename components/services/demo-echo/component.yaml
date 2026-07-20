@@ -1,0 +1,51 @@
+apiVersion: kubesandbox.io/v1
+kind: Component
+metadata:
+  name: demo-echo
+  version: "1.0"
+  category: service
+  displayName: "Demo echo service (helm-rendered)"
+  description: >-
+    Minimal helm-templated service manifest — demonstrates BuildManager's
+    HelmChartStrategy end to end (doc §8, Phase 6): `helm template` renders the chart
+    under chart/, and the rendered manifest is stored as an object-storage artifact via
+    the new MinIOStorageProvider. Known scope boundary: this renders and stores the
+    manifest — it is NOT wired into a running sandbox pod (no existing doc section
+    describes composing a helm-rendered service into a SidecarSpec; Phase 5's sidecars
+    are all source.type: image). POST /v1/components/demo-echo/build to render it.
+
+spec:
+  source:
+    type: helm
+    helm:
+      chart: chart
+
+  provides: {}
+
+  runtime:
+    kind: sidecar
+    weightClass: light
+    uid: 10001
+    resources:
+      requests: { cpu: "20m", memory: "32Mi" }
+      limits: { cpu: "100m", memory: "64Mi" }
+    ports:
+      - { name: http, containerPort: 8080 }
+
+  access:
+    network:
+      egress: denied
+      reason: "never actually composed into a running sandbox — see description"
+    filesystem:
+      workdir: /workspace
+      writablePaths: ["/workspace"]
+      readOnlyRootFilesystem: true
+    limits:
+      processes: 16
+      outputBytes: 500000
+      wallClockSeconds: 10
+
+  requires: []
+
+  compatibility:
+    environments: ["local", "aks-prod"]

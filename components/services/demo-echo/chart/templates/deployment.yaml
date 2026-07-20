@@ -1,0 +1,22 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Release.Name }}-demo-echo
+  labels:
+    app: demo-echo
+spec:
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels:
+      app: demo-echo
+  template:
+    metadata:
+      labels:
+        app: demo-echo
+    spec:
+      containers:
+        - name: demo-echo
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          args: ["-text=hello from kubesandbox demo-echo"]
+          ports:
+            - containerPort: {{ .Values.service.port }}

@@ -1,0 +1,7 @@
+apiVersion: v2
+name: demo-echo
+description: >-
+  Minimal echo service chart — demonstrates HelmChartStrategy (doc §8, Phase 6).
+  Rendered only; never deployed by this codebase.
+version: 1.0.0
+appVersion: "1.0"

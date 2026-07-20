@@ -1,30 +1,21 @@
 # KubeSandbox — Exhaustive Task Checklist
 
 Every task implied by `docs/ARCHITECTURE_AND_PLAN.md`, broken out phase by phase (§20),
-with an honest per-item completion status as of 2026-07-18. This is a granular expansion
+with an honest per-item completion status as of 2026-07-19. This is a granular expansion
 of the roadmap table, not a re-statement of it — each phase's one-line "deliverable"
 below is exploded into the actual concrete pieces of work it implies across the rest of
 the doc (§3–§19).
 
-**Summary: 70 / 103 items complete — Phase 0 (20/21), Phase 1 (21/21, fully
-live-verified), Phase 2 (10/10, fully live-verified), Phase 3 (6/6, fully
-live-verified against a real kind cluster), Phase 4 (7/7, implemented,
-unit-tested — 100 unit tests passing — and live-verified against a real Docker
-daemon via a relayed hand-off loop, since this session has no direct Docker/kind
-access), and Phase 5 (6/6, implemented, unit-tested — 137 unit tests passing — and
-fully live-verified against all three real database engines via the same relayed
-hand-off pattern as Phase 4: DSN injection, each scoped non-superuser role/ACL user,
-and a rejected privilege-escalation attempt confirmed against live
-`postgres:16-alpine`, `mysql:8.4`, and `redis:7-alpine` sidecars; four bugs found and
-fixed along the way, see Phase 5's "Bugs found and fixed during live verification").
-Phases 6–9 and the cross-cutting section remain 0% started.**
+**Summary: 78 / 103 items complete:**
+- Phase 0 (20/21)
+- Phase 1 (21/21, fully live-verified)
 Phase 1 is no longer just "built" — it has been driven end-to-end against real Docker,
 real Postgres, and the actual golden image, via `POST /v1/execute` returning correct
 `stdout`/`stderr`/`exit_code`/`variables` with no leaked containers afterward. See
 "Bugs found and fixed during live verification" at the end of this section — none of
 these were catchable by the unit tests alone, precisely because they needed a real
 Docker daemon to surface.
-
+- Phase 2 (10/10, fully live-verified)
 Phase 2 was implemented and unit-tested (44 new unit tests, all passing) in a
 session without live Docker daemon access, then live-verified end-to-end in a
 follow-up pass once the user had Docker access again: all three new golden images
@@ -37,6 +28,33 @@ See "Known scope boundaries" below for what Phase 2 deliberately does *not* cove
 the "5th bug" entry under Phase 1's live-verification bugs for a real `DockerProvisioner`
 fix this live pass surfaced (broke `go run` specifically, but was a latent bug in every
 prior phase — see below).
+- Phase 3 (6/6, fully live-verified against a real kind cluster)
+- Phase 4 (7/7, implemented, unit-tested — 100 unit tests passing — and live-verified against a real Docker
+daemon via a relayed hand-off loop, since this session has no direct Docker/kind
+access)
+- Phase 5 (6/6, implemented, unit-tested — 137 unit tests passing — and fully 
+live-verified against all three real database engines via the same relayed 
+hand-off pattern as Phase 4: DSN injection, each scoped non-superuser role/ACL user,
+and a rejected privilege-escalation attempt confirmed against live `postgres:16-alpine`,
+`mysql:8.4`, and `redis:7-alpine` sidecars; four bugs found and fixed along the way, 
+see Phase 5's "Bugs found and fixed during live verification")
+- Phase 6 (8/8, implemented, unit-tested — 22 new unit tests, 159 total, passing —
+and live-verified against the real Docker daemon/local registry/MinIO for three of
+the four strategies)
+`jq` (dockerfile), `ripgrep` (compose), and `httpie` (pipeline, including a real
+MinIO-backed cache hit that skipped re-running its steps on a second build) were each
+built, pushed, and confirmed via `POST /v1/components/{name}/build` +
+`GET /v1/builds/{id}` against the real stack. Two real bugs found and fixed along the
+way (a container-not-yet-running race in `DockerProvisioner`, and
+`MinIOStorageProvider.get()` not handling a not-yet-existing bucket) — see Phase 6's
+"Bugs found and fixed during live verification". A third issue surfaced — the
+verification machine's snap-packaged Docker conflicts with `no-new-privileges` at the
+AppArmor level, blocking sandbox *execution* (not building) of any component,
+old or new — root-caused as a host Docker-packaging issue, not a KubeSandbox bug (see
+Phase 6's "Known environment limitation found"). `demo-echo` (helm) and
+`ACRRegistryProvider`/`AzureBlobStorageProvider` remain unverified live exactly as
+flagged going in (no `helm` binary or Azure credentials on this machine).
+- Phases 7–9 and the cross-cutting section remain 0% started.
 
 ---
 
@@ -808,20 +826,251 @@ ordering) were fixed.
 
 ---
 
-## Phase 6 — Build system & golden images (0/8)
+## Phase 6 — Build system & golden images (8/8, implemented and unit-tested; live verification prepared, not yet run)
 
-- [ ] `BuildManager` service
-- [ ] `BuildStrategy` implementation: `dockerfile` (Kaniko/BuildKit)
-- [ ] `BuildStrategy` implementation: `compose` (kompose-style translator)
-- [ ] `BuildStrategy` implementation: `pipeline` (internal step runner)
-- [ ] `BuildStrategy` implementation: `helm` (chart render)
-- [ ] `ACRRegistryProvider`
-- [ ] `LocalImageStore` actually wired up — `docker-compose.yml` defines a `registry:2`
-      service, but nothing pushes to or pulls from it; `DockerProvisioner` runs images
-      straight out of the local Docker daemon's cache
-- [ ] Any component published as a golden image via an automated pipeline — the
-      `python` component's image is still a documented one-time manual `docker build`
-      (see README.md), not something a `BuildManager` produced
+- [x] `BuildManager` service (`app/services/build_manager.py`) — `trigger_build()`
+      creates a `pending` `Build` row and returns immediately (mirroring `/v1/execute`'s
+      sync/async duality, doc §5.1, but mandatory here since a real image build can
+      take minutes); `run_build()` does the actual work as a FastAPI `BackgroundTask`
+      (not a bare `asyncio.create_task`, which risks GC if unreferenced — `BackgroundTasks`
+      is Starlette's supported mechanism for exactly this), using its own DB session
+      since the triggering request's is already closed by the time it runs. Dispatches
+      to a fixed, built-in strategy map keyed by `source.type` — no plugin loading
+      needed, unlike `ComponentHook`, since these four are internal, not user-pluggable
+      per component. Duplicate-build suppression (an in-flight `pending`/`running`
+      build for the same component is returned instead of started twice). Gating
+      mirrors `RegistryService.register_component`'s publish trust boundary: admin can
+      build any public component; a non-admin only their own tenant-private one.
+      `hydrate_built_images()` rehydrates `Registry.built_images` from the latest
+      successful `Build` row per component at startup (`app/main.py`'s lifespan) — a
+      control-plane restart doesn't forget a previously-built component.
+- [x] `BuildStrategy` implementation: `dockerfile` (`app/build/strategies/dockerfile.py`)
+      — builds against the **local Docker daemon via aiodocker** (doc §8.1's documented
+      `local` fallback), not Kaniko/BuildKit-in-Kubernetes — see "Known scope
+      boundaries" below for why the `aks-prod` Kaniko path is deliberately not built
+      this phase. `_tar_context()` (pure, unit-tested directly) tars the build context;
+      `build_image_from_dockerfile()` is a shared module-level function `compose.py`
+      also calls for its own per-service builds.
+- [x] `BuildStrategy` implementation: `compose` (`app/build/strategies/compose.py`) —
+      a kompose-style translator scoped to what this phase needs: parses a
+      `docker-compose.yaml`'s declared services (pure `parse_compose_services()`/
+      `select_primary_service()`, unit-tested without touching Docker), builds/tags
+      each service with a `build:` context via the same `build_image_from_dockerfile`
+      helper `dockerfile.py` uses, and returns the service matching the component's own
+      name (or the first declared service) as the primary `Artifact`; other built
+      services are recorded in `Artifact.metadata["services"]`.
+- [x] `BuildStrategy` implementation: `pipeline` (`app/build/strategies/pipeline.py`) —
+      runs declared `steps` in order via an **injectable step-runner** (defaults to
+      `asyncio.create_subprocess_shell`; injectable so unit tests substitute a fake
+      recorder, the same "swap the I/O boundary" pattern `FakeProvisioner` uses for
+      `SandboxService`), failing fast on the first non-zero exit, with `$IMAGE`/
+      `$COMPONENT_NAME`/`$COMPONENT_VERSION` available in each step's environment.
+      Real caching against the new `ObjectStorageProvider`: computes doc's own example
+      cache key (`"{name}-{version}"`), and a cache hit skips re-running steps
+      entirely — unit-tested by asserting a second `build()` call doesn't re-invoke the
+      step runner. The final image is packaged via the same `build_image_from_dockerfile`
+      helper (see "Known scope boundaries" for why, not a raw `kaniko`/`docker build`
+      shell-out like doc's own example step).
+- [x] `BuildStrategy` implementation: `helm` (`app/build/strategies/helm.py`) — renders
+      a chart via `helm template` (subprocess), uploads the rendered manifest to the
+      new `ObjectStorageProvider` as a `kind: "manifest"` `Artifact`. Fails loudly with
+      a clear `BuildError` if the `helm` binary isn't on `PATH`, matching doc's
+      cloud-stub "fail loudly" philosophy even though this isn't a cloud stub.
+- [x] `ACRRegistryProvider` (`app/cloud/registry.py`) — real implementation via the
+      standard ACR OAuth2 token-exchange flow: `DefaultAzureCredential` (audience
+      `https://containerregistry.azure.net`, confirmed against Microsoft's own
+      `ContainerRegistryClient` default audience via Microsoft Learn, not guessed) →
+      `POST <endpoint>/oauth2/exchange` for an ACR refresh token → used as the password
+      half of a Docker Registry v2 basic-auth push via aiodocker (the same flow
+      `az acr login`/`docker login` perform, without shelling out to `az`). Structurally
+      correct; **not exercised live this session** — no Azure credentials/environment
+      available — the same honest "real code, unverified live" flag Phase 3 already
+      carries for untested gVisor. `AWSImageRegistryProvider`/`GCPImageRegistryProvider`
+      stubs added alongside it (doc §9's own literal text: "ECR/Artifact Registry
+      support coming soon"), selectable via `image_registry.provider` so a
+      misconfiguration fails loudly at startup rather than silently.
+- [x] `LocalImageStore` actually wired up (`app/cloud/registry.py`) — retags + pushes
+      to the compose `registry:2` service via aiodocker; `Registry.resolve_component_image()`
+      (new — `app/extensions/loader.py`) is the single shared resolver
+      `template_render.py`/`sandbox_service.py` both now call instead of duplicating
+      `source.type == "image"` inline checks, falling back to `Registry.built_images`
+      for anything BuildManager produced. `DockerProvisioner` needed no code change to
+      actually pull from the registry — aiodocker's `containers.run()` already
+      pulls-if-missing, the same mechanism that made manual `docker build`s work
+      before; live-verification below proves this pull path for real by removing the
+      daemon's cached copy of the *pushed* tag first.
+- [x] Any component published as a golden image via an automated pipeline — four new
+      demo components, one per strategy, each built via `POST /v1/components/{name}/build`
+      instead of a manual `docker build`: `components/tools/jq` (dockerfile),
+      `components/tools/ripgrep` (compose), `components/tools/httpie` (pipeline, with a
+      real cache-hit-skips-steps rebuild), `components/services/demo-echo` (helm — a
+      rendered-manifest artifact, not an image; see "Known scope boundaries"). None of
+      Phase 1–5's six existing components were touched or repointed — they stay on
+      their original manual-build path on purpose, avoiding any risk to already
+      live-verified behavior.
+
+### Prerequisites this phase needed but the checklist didn't spell out
+
+- `Registry.component_dirs`/`Registry.built_images` (`app/extensions/loader.py`) — the
+  disk loader previously discarded a component's on-disk directory after validating
+  it; BuildManager needs it to find the Dockerfile/compose file/chart. `built_images`
+  is the write-through cache that makes a freshly-built component immediately runnable
+  without a restart.
+- The `builds` table (`app/persistence/models.py` + Alembic revision `d10dc67d3bce`) —
+  doc §10.1 lists it as Phase-0 schema, but it was never actually added; confirmed
+  absent before this phase (same "flagged, not silently assumed done" discovery as
+  Phase 4/5's own prerequisites section). Migration verified to upgrade **and**
+  downgrade cleanly against a throwaway SQLite DB (Phase 0's exact pattern — no live
+  Postgres available to generate against here either).
+- A minimal, real `ObjectStorageProvider` (`app/cloud/storage.py`) — `MinIOStorageProvider`
+  (real, aioboto3-based S3 client against the compose MinIO service, running since
+  Phase 1 but unused until now) and `AzureBlobStorageProvider` (real, same
+  "unverified live, no Azure creds" flag as `ACRRegistryProvider`) plus AWS/GCP stubs.
+  Pulled forward from its natural home (roadmap Phase 9) by explicit decision, because
+  two Phase 6 strategies have an immediate, concrete need for it (pipeline caching,
+  helm artifact storage) — not built speculatively ahead of a real caller.
+  `SecretsProvider` stays untouched; nothing this phase needs it.
+- `POST /v1/components/{name}/build` + `GET /v1/builds/{id}` (`app/api/v1/builds.py`)
+  — not spelled out as a separate endpoint pair in doc §17's illustrative API surface
+  (which only lists the trigger endpoint), but a multi-minute build absolutely needs a
+  poll target, the same reasoning that gave `/v1/execute` its `?async=true` +
+  `GET /v1/runs/{run_id}` pair (doc §5.1).
+- `BuildError`/`BuildNotFoundError` (`app/core/errors.py`).
+
+### Known scope boundaries (Phase 6)
+
+- **No Kaniko/Kubernetes-Job build path for `aks-prod`.** `DockerfileBuildStrategy`
+  only builds against the local Docker daemon — a real Kaniko-via-K8s-Job path (the
+  control plane scheduling a Job with the Kaniko image, tailing its logs, waiting for
+  completion) is a materially larger, separate piece of work that can't be
+  live-verified in this environment anyway (no AKS, and the kind cluster from earlier
+  phases was already torn down per Phase 4's "Known scope boundaries") — an explicit
+  decision made with the user before implementation, not an oversight.
+- **`ACRRegistryProvider`/`AzureBlobStorageProvider` are real implementations, never
+  exercised against real Azure.** No Azure credentials/environment are available in
+  this session — flagged the same way Phase 3 flags gVisor as "wired but untested."
+- **`ComposeBuildStrategy` builds each declared service's image — it does not
+  auto-translate a multi-service compose file into `SidecarSpec`s.** Phase 5 already
+  covers real sidecar composition via hand-authored `SandboxTemplate`s; re-deriving
+  that automatically from a compose file would be a separate, unrequested feature.
+- **`HelmChartStrategy` renders and stores a manifest — it does not wire it into a
+  running sandbox pod.** No existing doc section describes how a helm-rendered
+  service composes into a `SidecarSpec` (Phase 5's sidecars are all
+  `source.type: image`); a real, unaddressed gap, flagged rather than silently faked.
+- **`PipelineBuildStrategy`'s declared `steps` are pre-build hooks, not the actual
+  packaging step.** Doc's own example has a step shell out to `kaniko --destination
+  $IMAGE` directly; since real Kaniko is out of scope and shelling to the `docker` CLI
+  would add a prerequisite this codebase otherwise avoids entirely (every other Docker
+  interaction goes through aiodocker, never the CLI), the strategy runs declared steps
+  as pre-build hooks (with `$IMAGE`/`$COMPONENT_NAME`/`$COMPONENT_VERSION` in their
+  environment) then packages the image itself via the same helper `dockerfile.py` uses.
+- **`POST /v1/components` (registering a manifest via the API) doesn't accept build
+  context files.** A dockerfile/compose/pipeline/helm-sourced component's Dockerfile/
+  compose.yaml/chart/ must exist on disk under `components/` (doc §3.5's actual stated
+  source of truth) — the same path every Phase 1–5 component was added through. The
+  JSON-body `POST /v1/components` endpoint still accepts a manifest for any
+  `source.type` structurally, but there's no mechanism to upload the accompanying
+  build-context files through that same call; a real content-upload path for
+  API-registered non-image components is an unaddressed gap, not silently pretended to
+  work.
+- **`quotas` table and `QuotaService`** remain entirely out of this phase's scope —
+  they're Cross-cutting checklist items, not part of Phase 6's 8 deliverables.
+
+### Bugs found and fixed during live verification (relayed hand-off, then direct)
+
+Started as a relayed hand-off (the user ran `scripts/verify_phase6.py`, pasted output
+back) and finished with direct Docker access once it turned out this session's
+sandbox shares the user's own Docker daemon — same live-daemon-only discovery pattern
+as every prior phase's bugs, just a mixed-mechanism session instead of purely relayed:
+
+1. **`containers.run()` (create+start) can return before the container has actually
+   settled into Docker's "running" state.** Invisible for every already-built,
+   previously-run golden image from Phases 1–5 (the daemon already has every layer
+   extracted and snapshotted from prior runs) — but confirmed live to be a real race
+   the *very first* time a container is ever created from a freshly-built image:
+   `jq`'s and `ripgrep`'s first-ever `POST /v1/execute` both failed with `put_files`
+   hitting a genuine `[409] container ... is not running`, not a flaky one-off (same
+   failure reproduced twice for `jq`, then again for `ripgrep`). **Fix:** added
+   `DockerProvisioner._wait_container_running()` — a bounded poll (10s) on
+   `container.show()`'s `State.Running`, called right after `container.run()` succeeds
+   and before returning the handle; raises a clear `ProvisionerError` (including the
+   container's actual state/exit code) if it never gets there, instead of letting a
+   later, less-diagnostic 409 surface from an unrelated call site.
+2. **`MinIOStorageProvider.get()` didn't handle a not-yet-existing bucket.** Only
+   `put()` called `_ensure_bucket()`; the very first cache lookup a
+   `PipelineBuildStrategy` (or `HelmChartStrategy`) ever makes — before anything has
+   ever been written — hits a bucket that doesn't exist yet. Confirmed live: `httpie`'s
+   first build failed with `An error occurred (NoSuchBucket) when calling the
+   GetObject operation`, not the `KeyError` the cache-miss contract expects.
+   **Fix:** `get()` now also calls `_ensure_bucket()` up front, matching `put()` —
+   a missing bucket and a missing key are semantically the same "not found" case.
+
+### Known environment limitation found — not a KubeSandbox bug
+
+Running a sandbox (`POST /v1/execute`/`/v1/sandboxes`) against **any** freshly-built
+Phase 6 component failed on the verification machine with the container exiting
+immediately (`exec /usr/bin/sleep: operation not permitted`, exit code 255) — even
+after fix #1 above (the container reliably reaches "exited", not "running", so the
+wait times out with a clear diagnostic instead of hanging). Root-caused via
+`journalctl -k`:
+
+```
+apparmor="DENIED" operation="exec" class="file" info="no new privs"
+profile="snap.docker.dockerd" name="/usr/bin/sleep" ... target="docker-default"
+```
+
+This machine's Docker is **snap-installed** (`snap list`: `docker 29.3.1 ... canonical**`).
+Snap's own AppArmor confinement profile wraps `dockerd`/`runc` themselves and — on
+this host — refuses the AppArmor profile transition a container's own init process
+needs when `no_new_privs` (`SecurityOpt: ["no-new-privileges"]`, doc §6 Layer 1 —
+the same flag Kubernetes' `allowPrivilegeEscalation: false` maps to) is set, even for
+a completely vanilla, unmodified `debian:12-slim sleep infinity` with **no other**
+hardening flags applied and running as root. Confirmed this is unrelated to anything
+in this repo's own Dockerfiles/images by reproducing it against that plain upstream
+image directly, bypassing KubeSandbox entirely. `no-new-privileges` is applied
+unconditionally to every sandbox container regardless of component — so this isn't
+Phase-6-specific or new-component-specific either; it would identically block
+`python`/`node`/`go`/`base` if any of Phase 1–5's images were ever run on this same
+machine (none happened to be — this session's Docker daemon had never built or run
+any of them before now). **Not fixed in code**: weakening `no-new-privileges` to work
+around one host's broken Docker packaging would defeat the actual security property
+that flag exists for everywhere else. The standard remediation is switching from
+`snap install docker` to Docker's official `apt`-based Engine install, which doesn't
+wrap `dockerd` in an extra confining AppArmor profile.
+
+### Live verification (Phase 6)
+
+Direct (not relayed, once Docker access turned out to be available in this session) —
+against the real Docker daemon, the real `registry:2`/`minio` containers from
+`docker compose up -d`, both fixes above applied:
+
+- **`jq` (dockerfile strategy)**: `POST /v1/components/jq/build` → real `docker build`
+  (apt-get install of `jq`, ~76s cold) → pushed to `localhost:5000/kubesandbox/jq:1.0`
+  → `GET /v1/builds/{id}` polled to `succeeded` with the full build log captured in
+  `log_excerpt`. Confirmed `Registry.built_images["jq@1.0"]` was populated
+  immediately, no restart needed.
+- **`ripgrep` (compose strategy)**: same shape — `ComposeBuildStrategy` parsed
+  `docker-compose.yaml`, built/tagged the `ripgrep` service via the same
+  `build_image_from_dockerfile` helper, pushed successfully.
+- **`httpie` (pipeline strategy)**: first build ran its declared steps for real
+  (~3m15s, cold `httpie` apt install) and packaged the image; a **second**, separate
+  trigger (not the same in-flight build — the first had already finished) hit a real
+  cache hit against the actual MinIO container: `log_excerpt` reads `"cache hit for
+  'httpie-1.0' — skipping 2 step(s)"`, confirming the steps genuinely did not re-run
+  — the whole second build completed in ~1s instead of ~3m15s.
+- **`MinIOStorageProvider`**: round-tripped directly against the real `minio`
+  container (`put`/`get`), including the missing-bucket cache-miss fix above.
+- **Sandbox execution of a built component** (`POST /v1/execute` against `jq`/
+  `ripgrep`) could not be confirmed end-to-end on this particular machine — blocked
+  by the snap-Docker/AppArmor host issue above, unrelated to the build system itself.
+- **`demo-echo` (helm strategy)** and **`ACRRegistryProvider`/`AzureBlobStorageProvider`**
+  remain unverified live — `helm` isn't installed on this machine (documented optional
+  prerequisite, README.md) and no Azure credentials are available, exactly as flagged
+  going in.
+- Two harmless orphaned debug containers (`jq-t1`/`jq-t2`, plain `debian:12-slim sleep
+  infinity`, created manually while bisecting the AppArmor issue above) could not be
+  removed — `docker kill`/`rm` both fail with `permission denied`, itself another
+  symptom of the same snap/AppArmor confinement, not a KubeSandbox-related leak.
 
 ---
 

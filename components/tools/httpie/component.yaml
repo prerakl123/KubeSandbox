@@ -1,0 +1,59 @@
+apiVersion: kubesandbox.io/v1
+kind: Component
+metadata:
+  name: httpie
+  version: "1.0"
+  category: tool
+  displayName: "HTTPie"
+  description: >-
+    HTTPie CLI — built via an ordered pipeline through BuildManager's
+    PipelineBuildStrategy (doc §8, Phase 6): runs declared pre-build steps, then
+    packages the image the same way DockerfileBuildStrategy does (see
+    app/build/strategies/pipeline.py's module docstring for why — real Kaniko is out
+    of scope this phase, and shelling out to a `docker` CLI would add a prerequisite
+    this codebase otherwise avoids). Declares a build cache (doc's own `{name}-{version}`
+    key convention) backed by the new MinIOStorageProvider — rebuilding without a
+    manifest change skips the steps entirely. POST /v1/components/httpie/build.
+
+spec:
+  source:
+    type: pipeline
+    pipeline:
+      steps:
+        - name: prepare
+          run: "test -f Dockerfile"
+        - name: lint
+          run: "echo building $COMPONENT_NAME version $COMPONENT_VERSION as $IMAGE"
+      cache:
+        key: "{name}-{version}"
+        store: object
+
+  provides:
+    commands: ["http"]
+    fileExtensions: [".txt"]
+    defaultRun: "http --version"
+
+  runtime:
+    kind: mainTool
+    weightClass: light
+    resources:
+      requests: { cpu: "20m", memory: "32Mi" }
+      limits: { cpu: "200m", memory: "128Mi" }
+
+  access:
+    network:
+      egress: intent-only
+      reason: "HTTPie is an HTTP client — its actual purpose needs egress, allowed/denied entirely by the deploy overlay (doc §12)"
+    filesystem:
+      workdir: /workspace
+      writablePaths: ["/workspace", "/tmp"]
+      readOnlyRootFilesystem: true
+    limits:
+      processes: 32
+      outputBytes: 2000000
+      wallClockSeconds: 30
+
+  requires: []
+
+  compatibility:
+    environments: ["local", "aks-prod"]

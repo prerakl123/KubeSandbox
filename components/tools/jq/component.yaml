@@ -1,0 +1,45 @@
+apiVersion: kubesandbox.io/v1
+kind: Component
+metadata:
+  name: jq
+  version: "1.0"
+  category: tool
+  displayName: "jq"
+  description: >-
+    jq CLI (JSON processor) — built via a Dockerfile through BuildManager's
+    DockerfileBuildStrategy (doc §8, Phase 6), not a manual `docker build` like
+    Phase 1-5's components. POST /v1/components/jq/build to produce the golden image.
+
+spec:
+  source:
+    type: dockerfile
+    dockerfile: {}
+
+  provides:
+    commands: ["jq"]
+    fileExtensions: [".json"]
+    defaultRun: "jq . {file}"
+
+  runtime:
+    kind: mainTool
+    weightClass: light
+    resources:
+      requests: { cpu: "20m", memory: "32Mi" }
+      limits: { cpu: "200m", memory: "128Mi" }
+
+  access:
+    network:
+      egress: denied
+    filesystem:
+      workdir: /workspace
+      writablePaths: ["/workspace", "/tmp"]
+      readOnlyRootFilesystem: true
+    limits:
+      processes: 32
+      outputBytes: 2000000
+      wallClockSeconds: 30
+
+  requires: []
+
+  compatibility:
+    environments: ["local", "aks-prod"]

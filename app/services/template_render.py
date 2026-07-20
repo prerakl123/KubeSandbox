@@ -47,11 +47,17 @@ class RenderedTemplateSpec:
     ttl_max: str = ""
 
 
-def _component_image_ref(component: Component) -> str | None:
-    source = component.spec.source
-    if source.type != "image" or source.image is None:
+def _component_image_ref(component: Component, registry: Registry) -> str | None:
+    """None means "not runnable yet" (source.type != "image" and no successful build
+    on record) — callers collect these into a set and decide what to do with an empty
+    result, rather than this raising directly (doc §8, Phase 6:
+    Registry.resolve_component_image is the shared resolver; a component whose build
+    hasn't run yet is a legitimate "not yet" here, not necessarily a hard error until
+    the caller actually needs to run it)."""
+    try:
+        return registry.resolve_component_image(component)
+    except KubeSandboxError:
         return None
-    return f"{source.image.repository}:{source.image.tag}"
 
 
 def _build_dsn(protocol: str, credentials: DbCredentials, port: int) -> str:
@@ -61,7 +67,9 @@ def _build_dsn(protocol: str, credentials: DbCredentials, port: int) -> str:
     return f"{protocol}://{credentials.role}:{credentials.password}@localhost:{port}/{path}"
 
 
-def _build_sidecar_spec(component: Component, credentials: DbCredentials | None) -> SidecarSpec:
+def _build_sidecar_spec(
+    component: Component, credentials: DbCredentials | None, registry: Registry
+) -> SidecarSpec:
     runtime = component.spec.runtime
     access = component.spec.access
     if runtime.uid is None:
@@ -71,13 +79,7 @@ def _build_sidecar_spec(component: Component, credentials: DbCredentials | None)
             "tmpfs/emptyDir ownership and the Kubernetes per-container securityContext "
             "(see SidecarSpec.uid's docstring)"
         )
-    source = component.spec.source
-    if source.type != "image" or source.image is None:
-        raise KubeSandboxError(
-            f"sidecar component {component.key} uses source.type={source.type!r}; only "
-            "prebuilt images are runnable until BuildManager lands (roadmap Phase 6)"
-        )
-    image = f"{source.image.repository}:{source.image.tag}"
+    image = registry.resolve_component_image(component)
 
     env = {var.name: var.value for var in runtime.env}
     if credentials is not None and access.database is not None and access.database.adminPasswordEnv:
@@ -104,12 +106,14 @@ def render_template(registry: Registry, template: SandboxTemplate) -> RenderedTe
     main_components = [c for c in all_components if c.spec.runtime.kind == "mainTool"]
     sidecar_components = [c for c in all_components if c.spec.runtime.kind != "mainTool"]
 
-    image_refs = {ref for c in main_components if (ref := _component_image_ref(c)) is not None}
+    image_refs = {
+        ref for c in main_components if (ref := _component_image_ref(c, registry)) is not None
+    }
     if not image_refs:
         raise KubeSandboxError(
             f"template {template.key} has no mainTool-kind component with a runnable "
-            "image source (source.type == 'image'); other build strategies aren't "
-            "runnable until BuildManager lands (roadmap Phase 6)"
+            "image — source.type == 'image', or a component with a successful build "
+            "(POST /v1/components/{name}/build, doc §8)"
         )
     if len(image_refs) > 1:
         raise KubeSandboxError(
@@ -151,7 +155,7 @@ def render_template(registry: Registry, template: SandboxTemplate) -> RenderedTe
             service = component.spec.provides.service
             if service is not None and service.dsnEnv:
                 env[service.dsnEnv] = _build_dsn(service.protocol, credentials, service.port)
-        sidecar_specs.append(_build_sidecar_spec(component, credentials))
+        sidecar_specs.append(_build_sidecar_spec(component, credentials, registry))
 
     weight_class = (
         WeightClass(template.spec.weightClass)

@@ -1,0 +1,46 @@
+apiVersion: kubesandbox.io/v1
+kind: Component
+metadata:
+  name: ripgrep
+  version: "1.0"
+  category: tool
+  displayName: "ripgrep"
+  description: >-
+    ripgrep CLI — built via a docker-compose.yaml service through BuildManager's
+    ComposeBuildStrategy (doc §8, Phase 6): a kompose-style translator that builds/tags
+    each declared service's image, reusing the same underlying Dockerfile-build path
+    DockerfileBuildStrategy uses. POST /v1/components/ripgrep/build to produce it.
+
+spec:
+  source:
+    type: compose
+    compose: {}
+
+  provides:
+    commands: ["rg"]
+    fileExtensions: [".txt"]
+    defaultRun: "rg . {file}"
+
+  runtime:
+    kind: mainTool
+    weightClass: light
+    resources:
+      requests: { cpu: "20m", memory: "32Mi" }
+      limits: { cpu: "200m", memory: "128Mi" }
+
+  access:
+    network:
+      egress: denied
+    filesystem:
+      workdir: /workspace
+      writablePaths: ["/workspace", "/tmp"]
+      readOnlyRootFilesystem: true
+    limits:
+      processes: 32
+      outputBytes: 2000000
+      wallClockSeconds: 30
+
+  requires: []
+
+  compatibility:
+    environments: ["local", "aks-prod"]

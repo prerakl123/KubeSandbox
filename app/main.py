@@ -6,13 +6,29 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
 from app.api.v1.admin import router as admin_router
+from app.api.v1.builds import router as builds_router
 from app.api.v1.components import router as components_router
 from app.api.v1.execute import router as execute_router
 from app.api.v1.health import router as health_router
 from app.api.v1.sandboxes import router as sandboxes_router
 from app.api.v1.templates import router as templates_router
+from app.cloud.registry import (
+    ACRRegistryProvider,
+    AWSImageRegistryProvider,
+    GCPImageRegistryProvider,
+    ImageRegistryProvider,
+    LocalImageStore,
+)
+from app.cloud.storage import (
+    AWSObjectStorageProvider,
+    AzureBlobStorageProvider,
+    GCPObjectStorageProvider,
+    MinIOStorageProvider,
+    ObjectStorageProvider,
+)
 from app.core.config import get_settings
 from app.core.errors import (
+    BuildNotFoundError,
     ComponentNotFoundError,
     EntitlementError,
     KubeSandboxError,
@@ -24,14 +40,17 @@ from app.core.errors import (
 from app.core.config import Settings
 from app.core.logging import configure_logging, get_logger
 from app.extensions.loader import load_registry
+from app.persistence.db import get_session_factory
 from app.persistence.redis import build_redis_client
 from app.provisioners.docker import DockerProvisioner
 from app.provisioners.kubernetes import KubernetesProvisioner
+from app.services.build_manager import BuildManager
+from app.services.entitlement_service import EntitlementService
 from app.streaming.ws_gateway import router as ws_router
 
 logger = get_logger(__name__)
 
-_NOT_FOUND = (ComponentNotFoundError, TemplateNotFoundError, SandboxNotFoundError)
+_NOT_FOUND = (ComponentNotFoundError, TemplateNotFoundError, SandboxNotFoundError, BuildNotFoundError)
 
 _API_DESCRIPTION = """
 A configurable, plug-and-play control plane that provisions isolated, per-request
@@ -94,6 +113,14 @@ _TAGS_METADATA = [
             "(doc §3.6). Admin-role only."
         ),
     },
+    {
+        "name": "Builds",
+        "description": (
+            "The build system (doc §8) — turns a component's declared build strategy "
+            "(dockerfile/compose/pipeline/helm) into a real, pushed golden image via "
+            "BuildManager. Runs in the background; poll GET /v1/builds/{id}."
+        ),
+    },
 ]
 
 
@@ -110,6 +137,32 @@ async def _build_provisioner(settings: Settings):
     raise ValueError(f"unknown provisioner backend: {backend!r}")
 
 
+def _build_image_registry_provider(settings: Settings) -> ImageRegistryProvider:
+    provider = settings.image_registry.provider
+    if provider == "local":
+        return LocalImageStore(settings.image_registry)
+    if provider == "acr":
+        return ACRRegistryProvider(settings.image_registry)
+    if provider == "aws":
+        return AWSImageRegistryProvider()
+    if provider == "gcp":
+        return GCPImageRegistryProvider()
+    raise ValueError(f"unknown image_registry provider: {provider!r}")
+
+
+def _build_object_storage_provider(settings: Settings) -> ObjectStorageProvider:
+    provider = settings.object_storage.provider
+    if provider == "minio":
+        return MinIOStorageProvider(settings.object_storage)
+    if provider == "azure_blob":
+        return AzureBlobStorageProvider(settings.object_storage)
+    if provider == "aws":
+        return AWSObjectStorageProvider()
+    if provider == "gcp":
+        return GCPObjectStorageProvider()
+    raise ValueError(f"unknown object_storage provider: {provider!r}")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     settings = get_settings()
@@ -119,6 +172,21 @@ async def lifespan(app: FastAPI):
     app.state.registry = load_registry()
     app.state.provisioner = await _build_provisioner(settings)
     app.state.redis = build_redis_client(settings)
+    app.state.image_registry_provider = _build_image_registry_provider(settings)
+    app.state.object_storage_provider = _build_object_storage_provider(settings)
+
+    # Rehydrate Registry.built_images from the latest successful Build row per
+    # component (doc §8, Phase 6) — otherwise a control-plane restart would forget
+    # every previously-built non-"image"-sourced component until it's rebuilt.
+    async with get_session_factory()() as session:
+        build_manager = BuildManager(
+            app.state.registry,
+            EntitlementService(session),
+            app.state.image_registry_provider,
+            app.state.object_storage_provider,
+            get_session_factory(),
+        )
+        await build_manager.hydrate_built_images(session)
 
     yield
 
@@ -177,6 +245,7 @@ def create_app() -> FastAPI:
     app.include_router(components_router)
     app.include_router(templates_router)
     app.include_router(admin_router)
+    app.include_router(builds_router)
     return app
 
 

@@ -3,6 +3,7 @@ from __future__ import annotations
 import uuid
 from datetime import UTC, datetime
 
+from app.domain.build import Artifact
 from app.domain.execution import (
     BatchCommand,
     BatchRunResult,
@@ -123,3 +124,53 @@ class FakeProvisioner:
 
     async def destroy(self, handle: SandboxHandle) -> None:
         self.destroyed.append(handle.sandbox_id)
+
+
+class FakeImageRegistryProvider:
+    """Records every push — used to assert BuildManager pushes exactly the artifact a
+    strategy returned, without a real Docker daemon or registry."""
+
+    def __init__(self, *, raise_on_push: Exception | None = None) -> None:
+        self.pushed: list[str] = []
+        self._raise_on_push = raise_on_push
+
+    async def push(self, local_tag: str) -> str:
+        self.pushed.append(local_tag)
+        if self._raise_on_push is not None:
+            raise self._raise_on_push
+        return f"registry.local/{local_tag}"
+
+    async def resolve(self, ref: str) -> str:
+        return f"registry.local/{ref}"
+
+
+class FakeObjectStorageProvider:
+    """In-memory dict standing in for MinIO/Blob — get() raises KeyError for a missing
+    key, matching ObjectStorageProvider's documented contract."""
+
+    def __init__(self) -> None:
+        self.store: dict[str, bytes] = {}
+
+    async def put(self, key: str, data: bytes) -> None:
+        self.store[key] = data
+
+    async def get(self, key: str) -> bytes:
+        if key not in self.store:
+            raise KeyError(key)
+        return self.store[key]
+
+
+class FakeBuildStrategy:
+    """Stands in for a real BuildStrategy (dockerfile/compose/pipeline/helm) in
+    BuildManager tests — returns a canned Artifact or raises, and records every call."""
+
+    def __init__(self, *, artifact: Artifact | None = None, raise_on_build: Exception | None = None) -> None:
+        self.calls: list[str] = []
+        self._artifact = artifact or Artifact(kind="image", ref="fake/local:1.0")
+        self._raise_on_build = raise_on_build
+
+    async def build(self, component, ctx):
+        self.calls.append(component.key)
+        if self._raise_on_build is not None:
+            raise self._raise_on_build
+        return self._artifact

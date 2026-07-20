@@ -147,6 +147,33 @@ class Run(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
+# --- Build system (doc §8, Phase 6) -------------------------------------------------
+
+class Build(Base):
+    __tablename__ = "builds"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    component_name: Mapped[str] = mapped_column(String(128))
+    component_version: Mapped[str] = mapped_column(String(64))
+    tenant_id: Mapped[str | None] = mapped_column(ForeignKey("tenants.id"), nullable=True)
+    """Null for a build of a public component; set for a tenant-private one — mirrors
+    the same public/private split component_entitlements uses (doc §3.6)."""
+    strategy: Mapped[str] = mapped_column(String(16))  # dockerfile | compose | pipeline | helm
+    status: Mapped[str] = mapped_column(String(16), default="pending")  # pending | running | succeeded | failed
+    image_ref: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    """Resolved, pullable ref after a successful image-kind Artifact is pushed via the
+    configured ImageRegistryProvider — this is what populates Registry.built_images."""
+    artifact_ref: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    """Object-store key for a successful manifest-kind Artifact (HelmChartStrategy) —
+    mutually exclusive with image_ref in practice, never both set."""
+    log_excerpt: Mapped[str | None] = mapped_column(Text, nullable=True)
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    requested_by: Mapped[str] = mapped_column(String(255))
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
 # --- Persistent workspaces (doc §10.2) — schema only until Phase 7 -----------------
 
 class Workspace(Base):

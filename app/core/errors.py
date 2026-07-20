@@ -37,3 +37,11 @@ class ExecutionTimeoutError(KubeSandboxError):
 
 class SandboxNotFoundError(KubeSandboxError):
     """Referenced sandbox id does not exist or has already been torn down."""
+
+
+class BuildError(KubeSandboxError):
+    """A BuildStrategy failed to produce a golden image/artifact (doc §8, Phase 6)."""
+
+
+class BuildNotFoundError(KubeSandboxError):
+    """Referenced build id does not exist."""

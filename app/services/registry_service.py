@@ -124,6 +124,7 @@ class RegistryService:
         path.write_text(yaml.safe_dump(raw, sort_keys=False))
 
         self._registry.components[key] = component
+        self._registry.component_dirs[key] = path.parent
 
         bare_name, _, version = key.rpartition("@")
         self._session.add(

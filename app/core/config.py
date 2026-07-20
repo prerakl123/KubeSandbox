@@ -44,7 +44,10 @@ class RedisSettings(BaseModel):
 
 
 class ObjectStorageSettings(BaseModel):
-    provider: Literal["minio", "azure_blob"] = "minio"
+    # "aws"/"gcp" are selectable so a misconfiguration fails loudly at startup
+    # (constructing the stub provider) rather than silently — doc §9's stub
+    # philosophy, not something a real environment is expected to actually pick.
+    provider: Literal["minio", "azure_blob", "aws", "gcp"] = "minio"
     endpoint: str = "http://localhost:9000"
     access_key: str = "kubesandbox"
     secret_key: str = "kubesandbox-secret"
@@ -52,7 +55,7 @@ class ObjectStorageSettings(BaseModel):
 
 
 class ImageRegistrySettings(BaseModel):
-    provider: Literal["local", "acr"] = "local"
+    provider: Literal["local", "acr", "aws", "gcp"] = "local"
     endpoint: str = "localhost:5000"
 
 

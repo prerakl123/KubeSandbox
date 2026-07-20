@@ -97,15 +97,8 @@ class SandboxService:
             f"language {language!r}; available: {available}"
         )
 
-    @staticmethod
-    def _resolve_image_ref(component: Component) -> str:
-        source = component.spec.source
-        if source.type != "image" or source.image is None:
-            raise KubeSandboxError(
-                f"component {component.key} uses source.type={source.type!r}; only "
-                "prebuilt images are runnable until BuildManager lands (roadmap Phase 6)"
-            )
-        return f"{source.image.repository}:{source.image.tag}"
+    def _resolve_image_ref(self, component: Component) -> str:
+        return self._registry.resolve_component_image(component)
 
     def _build_spec(self, component: Component) -> SandboxSpec:
         runtime = component.spec.runtime

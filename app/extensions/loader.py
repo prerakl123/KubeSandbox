@@ -17,6 +17,7 @@ import yaml
 
 from app.core.errors import (
     ComponentNotFoundError,
+    KubeSandboxError,
     ManifestValidationError,
     TemplateNotFoundError,
 )
@@ -73,6 +74,36 @@ class Registry:
 
     components: dict[str, Component] = field(default_factory=dict)
     templates: dict[str, SandboxTemplate] = field(default_factory=dict)
+    component_dirs: dict[str, Path] = field(default_factory=dict)
+    """Registry key -> on-disk directory holding that component's manifest (and, for
+    non-"image" source types, its Dockerfile/compose file/chart — doc §8, Phase 6).
+    Populated by load_components() (disk loader) and RegistryService.register_component
+    (API registration) — the two places that already compute this path for other
+    reasons. BuildManager is the only consumer."""
+    built_images: dict[str, str] = field(default_factory=dict)
+    """Registry key -> resolved, runnable image ref for a component whose source.type
+    isn't "image" (doc §8, Phase 6) — written by BuildManager after every successful
+    image build+push, and rehydrated at startup from the latest successful Build row
+    per component (BuildManager.hydrate_built_images). Empty until a component is
+    actually built; see resolve_component_image() below for how this gets consulted."""
+
+    def resolve_component_image(self, component: Component) -> str:
+        """The one place a runnable image ref is resolved for ANY source.type —
+        shared by template_render.py and sandbox_service.py so they can never drift.
+        source.type == "image" is unchanged, existing-component behavior; anything
+        else falls back to a BuildManager-produced image, or fails loudly pointing at
+        the build endpoint instead of silently guessing."""
+        source = component.spec.source
+        if source.type == "image" and source.image is not None:
+            return f"{source.image.repository}:{source.image.tag}"
+        built = self.built_images.get(component.key)
+        if built is not None:
+            return built
+        raise KubeSandboxError(
+            f"component {component.key} uses source.type={source.type!r} and has no "
+            "successful build yet — POST /v1/components/{name}/build first (doc §8, "
+            "Phase 6)"
+        )
 
     def get_component(self, name: str, version: str) -> Component:
         key = f"{name}@{version}"
@@ -165,10 +196,13 @@ def validate_template_manifest(raw: dict, *, source: Path) -> SandboxTemplate:
     return SandboxTemplate.model_validate(raw)
 
 
-def load_components(directory: Path = COMPONENTS_DIR) -> dict[str, Component]:
+def load_components(
+    directory: Path = COMPONENTS_DIR,
+) -> tuple[dict[str, Component], dict[str, Path]]:
     components: dict[str, Component] = {}
+    component_dirs: dict[str, Path] = {}
     if not directory.exists():
-        return components
+        return components, component_dirs
     for path in sorted(directory.rglob("component.yaml")):
         raw = yaml.safe_load(path.read_text())
         component = validate_component_manifest(raw, source=path)
@@ -176,7 +210,8 @@ def load_components(directory: Path = COMPONENTS_DIR) -> dict[str, Component]:
         if key in components:
             raise ManifestValidationError(f"duplicate component {key!r} at {path}")
         components[key] = component
-    return components
+        component_dirs[key] = path.parent
+    return components, component_dirs
 
 
 def load_templates(directory: Path = TEMPLATES_DIR) -> dict[str, SandboxTemplate]:
@@ -223,9 +258,11 @@ def validate_registry_semantics(registry: Registry) -> None:
 def load_registry(
     components_dir: Path = COMPONENTS_DIR, templates_dir: Path = TEMPLATES_DIR
 ) -> Registry:
+    components, component_dirs = load_components(components_dir)
     registry = Registry(
-        components=load_components(components_dir),
+        components=components,
         templates=load_templates(templates_dir),
+        component_dirs=component_dirs,
     )
     validate_registry_semantics(registry)
     return registry

@@ -3,10 +3,14 @@ name = "kubesandbox"
 version = "0.1.0"
 requires-python = ">=3.14"
 dependencies = [
+    "aioboto3>=15.5.0",
     "aiodocker==0.27.0",
     "alembic>=1.18.5",
     "asyncpg>=0.31.0",
+    "azure-identity>=1.25.3",
+    "azure-storage-blob>=12.30.0",
     "fastapi>=0.139.2",
+    "httpx>=0.28.1",
     "jsonschema>=4.26.0",
     "kubernetes-asyncio>=32.0.0",
     "pydantic>=2",
@@ -23,7 +27,6 @@ dependencies = [
 [dependency-groups]
 dev = [
     "aiosqlite>=0.22.1",
-    "httpx>=0.28.1",
     "pytest>=9.1.1",
     "pytest-asyncio>=1.4.0",
     "websockets>=16.1",
