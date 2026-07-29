@@ -1,12 +1,12 @@
 # KubeSandbox — Exhaustive Task Checklist
 
 Every task implied by `docs/ARCHITECTURE_AND_PLAN.md`, broken out phase by phase (§20),
-with an honest per-item completion status as of 2026-07-19. This is a granular expansion
+with an honest per-item completion status as of 2026-07-29. This is a granular expansion
 of the roadmap table, not a re-statement of it — each phase's one-line "deliverable"
 below is exploded into the actual concrete pieces of work it implies across the rest of
 the doc (§3–§19).
 
-**Summary: 78 / 103 items complete:**
+**Summary: 84 / 103 items complete:**
 - Phase 0 (20/21)
 - Phase 1 (21/21, fully live-verified)
 Phase 1 is no longer just "built" — it has been driven end-to-end against real Docker,
@@ -54,7 +54,26 @@ old or new — root-caused as a host Docker-packaging issue, not a KubeSandbox b
 Phase 6's "Known environment limitation found"). `demo-echo` (helm) and
 `ACRRegistryProvider`/`AzureBlobStorageProvider` remain unverified live exactly as
 flagged going in (no `helm` binary or Azure credentials on this machine).
-- Phases 7–9 and the cross-cutting section remain 0% started.
+- Phase 7 (6/6, implemented, unit-tested — 78 new unit tests, 237 total, passing —
+and partially live-verified: real Alembic migration + Docker volume create/delete +
+reconciler entrypoint against the real Postgres/Docker daemon, plus the persistent-
+workspace mount/ownership-fix mechanism isolated from the one blocking host issue)
+`PoolManager` (Postgres-backed claim ledger, not Redis — a deliberate design decision,
+see Phase 7's own section), weight-class segregation (an in-process semaphore for
+`heavy` on `local`, real `nodeSelector`/`tolerations` on `aks-prod`), warm-pool
+claim/release wiring into `execute()`/`create_sandbox()`, persistent workspaces
+(Docker named volumes, a per-workspace long-lived Kubernetes namespace+PVC), workspace
+archive/purge retention (`WorkspaceService.sweep_retention()`), and the reconciler
+(`app/reconciler/loop.py`, runnable standalone) are all real and unit-tested. The same
+snap-Docker/AppArmor `no-new-privileges` host limitation Phase 6 found and left
+unresolved blocked full end-to-end live verification of anything that actually starts
+a sandbox container — confirmed to reproduce identically for this phase's own new
+code paths, isolated and worked around piece-by-piece instead (see Phase 7's "Live
+verification" and "Known environment limitation" sections). One bug found (a
+mocked-client unit test caught a fresh-vs-reused-namespace logic error in
+`KubernetesProvisioner.acquire()`'s persistent path before it ever reached a live
+cluster) — see Phase 7's "Bugs found and fixed during live verification".
+- Phases 8–9 and the cross-cutting section remain 0% started.
 
 ---
 
@@ -1074,19 +1093,311 @@ against the real Docker daemon, the real `registry:2`/`minio` containers from
 
 ---
 
-## Phase 7 — Pooling & persistence (0/6)
+## Phase 7 — Pooling & persistence (6/6, implemented and unit-tested; live verification partial — same host limitation as Phase 6)
 
-- [ ] `PoolManager` service
-- [ ] Weight-class-based node-pool/queue segregation (light/standard/heavy)
-- [ ] Warm-pool claim wiring inside `acquire()` — `DockerProvisioner.recycle()` exists
-      and is unit-tested in isolation, but nothing ever calls it; `SandboxService`
-      always destroys ephemeral sandboxes instead of recycling them
-- [ ] PVC-backed (or bind-mount-backed, locally) persistent workspaces — the
-      `workspace.persistence_enabled` config flag exists and is unused
-- [ ] Workspace quota/retention enforcement — archive job, purge job (the `Workspace`
-      table exists from Phase 0; nothing reads or writes it)
-- [ ] `app/reconciler/loop.py` — TTL/GC/desired-state background loop (directory
-      exists, empty placeholder)
+- [x] `PoolManager` service (`app/services/pool_manager.py`) — atomic claim via
+      `SELECT ... FOR UPDATE SKIP LOCKED` against a new `pool_members` table
+      (Postgres, not Redis — see "Design decisions" below), `release()` (recycle then
+      re-list as claimable, falling back to `destroy()` on a `recycle()` failure so a
+      broken container/pod never leaks into the pool), and `replenish_one()` (tops up
+      one `(image_ref, weight_class)` key to a target count). Scoped to ad-hoc,
+      sidecar-less, non-persistent, non-heavy-uncapped specs only
+      (`PoolManager.is_poolable()`) — matching doc §4.3's own framing around bare
+      "batch/workflow runs," never a SandboxTemplate composing DB sidecars (which need
+      per-tenant credentials and `on_provision` hooks run fresh) or a persistent
+      sandbox (tied to one specific workspace's durable volume/PVC).
+- [x] Weight-class-based segregation (light/standard/heavy) — two different
+      mechanisms per backend, both real: `app/services/weight_class_scheduler.py`'s
+      `WeightClassScheduler` caps concurrent `heavy` sandboxes via an in-process
+      `asyncio.Semaphore` sized from `pool.heavy_max_concurrent`, held for
+      `execute()`'s whole acquire→run→release/destroy lifetime — the doc §7 "separate
+      resource budget/queue in local" stand-in, correct only because `local` always
+      runs exactly one control-plane replica. `KubernetesProvisioner` instead sets
+      `nodeSelector`/`tolerations` on `heavy` pods from
+      `provisioner.heavy_node_selector`/`heavy_tolerations`
+      (`SandboxService._apply_heavy_segregation`) — the real, doc-described node-pool
+      segregation mechanism for `aks-prod`.
+- [x] Warm-pool claim wiring inside `acquire()` — `SandboxService._acquire_for_execute`
+      tries `PoolManager.try_claim()` before `provisioner.acquire()`, for both
+      `execute()` and `create_sandbox()` (doc §4.3: "a session may originate from a
+      pool claim... but is immediately promoted to a dedicated, non-recycled pod" —
+      `create_sandbox()`/`destroy_sandbox()` may claim from the pool for a fast start
+      but never release back to it, matching that exact promotion language).
+      `execute()` releases a clean, poolable run back to the pool instead of
+      destroying it; a timed-out/truncated run, an exception, or a non-poolable spec
+      still always destroys, unchanged from Phase 1–6 behavior. Pooling is opt-in per
+      deployment (`pool.enabled`, false by default in `local.yaml`, true in
+      `aks-prod.yaml`) — `pool_manager=None` (the `SandboxService` constructor
+      default) reproduces every pre-Phase-7 test's exact expected behavior unchanged.
+- [x] Persistent workspaces — Docker: a named volume (`kubesandbox-ws-<workspace_id>`)
+      mounted at `/workspace` instead of tmpfs when `SandboxSpec.workspace_id` is set;
+      ownership fixed via one root `exec` (`CapAdd: ["CHOWN"]` alongside the existing
+      `CapDrop: ["ALL"]` — the same capability-restoration pattern Phase 5's DB
+      sidecar bootstrap fix already established) since a fresh named volume's mount
+      point is root-owned and a regular volume mount has no `uid=`/`gid=` option the
+      way tmpfs does. Kubernetes: a persistent sandbox reuses one
+      **long-lived, per-workspace namespace** (`<prefix>ws-<workspace_id>`, holding a
+      PVC) across its own create/destroy cycles instead of a fresh per-sandbox-id
+      namespace — required because a PVC is namespace-scoped and Kubernetes has no
+      cross-namespace PVC mount; `destroy()` on a persistent sandbox
+      (`SandboxHandle.persistent`, propagated from the `Sandbox.persistent` DB column
+      via `_handle_from_row`) only deletes the Pod, never the namespace. A stale Pod
+      left behind by a prior ungraceful teardown is detected and cleared
+      (`_ensure_no_stale_pod`) before a fresh one is created. Wired into
+      `SandboxService.create_sandbox(persistent=True)` via a new
+      `WorkspaceService.get_or_create()` (lazy, one `Workspace` row per user) +
+      `check_quota()` (soft — see "Known scope boundaries"). Guards against silently
+      losing data: creating a persistent sandbox against an `archived`/`deleted`
+      workspace raises rather than mounting a fresh, empty volume/PVC under the same
+      name (no restore path exists — see below).
+- [x] Workspace quota/retention enforcement — `WorkspaceService.sweep_retention()`
+      implements doc §10.2's exact state machine (`active -> archived -> deleted`),
+      driven by the reconciler: `active`, idle ≥ `idle_retention_days` (30) **or**
+      age ≥ `max_lifetime_days` (365, "requires explicit renewal... else follows the
+      same archive→delete path") → archive; `archived`, idle ≥
+      `idle_retention_days + archive_grace_days` (90 total) → purge. Both thresholds
+      measured from `last_access_at` (touched on every `create_sandbox(persistent=True)`,
+      `run_in_sandbox()`, and `open_pty()` against a persistent sandbox), per doc's own
+      "last session activity" wording, not whenever archival happened to run. A
+      workspace whose own sandbox is still live is skipped, not archived out from
+      under it (`_has_live_sandbox` check). New `Provisioner.archive_workspace()`
+      (tars a persistent volume/PVC's contents via a short-lived throwaway
+      container/pod — reusing the exact same exec-based plumbing as every other
+      sandbox I/O path, never `get_archive`/`docker cp`, per Phase 1's established
+      lesson), `Provisioner.delete_workspace_volume()` (removes the durable
+      volume/namespace entirely), `Provisioner.measure_workspace_usage()` (`du -sm`
+      against the same throwaway-mount pattern — refreshed every sweep for an idle
+      `active` workspace, so `check_quota()` enforces against a real, current number
+      instead of a permanent zero), and `Provisioner.restore_workspace()` (untars a
+      cold-storage archive back onto a fresh volume/PVC, paired with
+      `WorkspaceService.restore()` to explicitly bring an `archived` workspace back to
+      `active`) round out the Protocol; `ObjectStorageProvider` gained a `delete()`
+      method (MinIO/Azure real, AWS/GCP stubs) for the purge step.
+- [x] `app/reconciler/loop.py` — a real `ReconcilerLoop` (constructs its own
+      Provisioner/Registry/session-factory/ObjectStorageProvider via a new
+      `app/core/bootstrap.py`, shared with `app/main.py`'s lifespan so the two never
+      drift apart), runnable standalone via `uv run python -m app.reconciler.loop`
+      (doc's own "a dedicated worker," not an in-API background task). Each
+      fixed-interval tick (`reconciler.interval_seconds`, default 30s) runs four
+      independent jobs: **TTL reaping** (destroys any non-terminated `Sandbox` past
+      its `idle_ttl_seconds`/`max_ttl_seconds` — new columns on `sandboxes`, resolved
+      once at create time from a SandboxTemplate's `spec.ttl` or new `TTLSettings`
+      defaults for an ad-hoc request, and persisted since the reconciler runs in a
+      separate process with nothing else to read them from); **pool replenishment**
+      (tops up every poolable language component's warm pool to its configured
+      `pool.{light,standard,heavy}_pool_size`); **workspace retention sweep**; and
+      **orphan GC** (a new `Provisioner.list_sandbox_refs()` lists every live,
+      sandbox-id-labeled native resource — a Docker container via
+      `containers.list(filters=...)` + `.show()`, a Kubernetes namespace via
+      `list_namespace(label_selector=...)` — and destroys any with no matching,
+      non-terminated `Sandbox` row and older than `reconciler.orphan_grace_seconds`,
+      so a crash between `acquire()` and its row committing, or a control-plane
+      restart mid-`destroy()`, can't leak a resource forever). One bad tick logs and
+      moves on rather than killing the loop.
+
+### Prerequisites this phase needed but the checklist didn't spell out
+
+- `app/core/bootstrap.py` — `_build_provisioner`/`_build_image_registry_provider`/
+  `_build_object_storage_provider` were private functions inside `app/main.py`'s
+  lifespan; the reconciler needed the exact same construction logic in a second,
+  genuinely separate process, so they moved to a shared module both import, rather
+  than risking the two silently drifting apart over time.
+- `build_ad_hoc_spec()` (`app/services/sandbox_service.py`) — extracted from
+  `SandboxService._build_spec` (unchanged behavior, now a thin delegator) so the
+  reconciler's pool-replenishment job can build the identical `SandboxSpec` for a
+  registry component without needing a full `SandboxService` instance.
+- `app/provisioners/resources.py::parse_duration_to_seconds()` — doc's own
+  `SandboxTemplate.spec.ttl` examples ("15m", "2h") had no parser anywhere; needed to
+  turn those into the `idle_ttl_seconds`/`max_ttl_seconds` columns TTL reaping reads.
+- `SandboxHandle.persistent` and `SandboxSpec.workspace_id`/`workspace_size_mb`/
+  `node_selector`/`tolerations` (`app/domain/execution.py`) — none of these concepts
+  existed anywhere in the execution-domain model before this phase.
+- `NativeSandboxRef` (`app/domain/execution.py`) — orphan GC's return shape from
+  `list_sandbox_refs()`; carries a Docker main container's sidecar ids too (sidecars
+  share the same `sandbox-id` label, so `destroy()` needs `sidecar_refs` populated to
+  avoid leaking them when reaping an orphaned main container).
+
+### Design decisions
+
+- **Pool claim ledger lives in Postgres (`pool_members`), not Redis**, despite doc
+  §10.1's literal "pool claim locks" wording. `SELECT ... FOR UPDATE SKIP LOCKED`
+  against the same table that's the actual source of truth for "which sandbox is
+  this" gives an atomic, exactly-once claim with no separate cache to keep in sync or
+  leak on a crash between "claimed in Redis" and "reflected in Postgres" — still
+  satisfies "any replica can serve any session" (doc §2), since the claim is one
+  atomically-committed row mutation visible to every replica through the same
+  database. `pool_state` (the doc-described aggregate table) is kept too, but purely
+  as a recomputed-from-`pool_members` observability counter, not a claim mechanism.
+- **Heavy-class segregation is genuinely two different mechanisms, not one
+  abstracted over both backends** — a `local`-only in-process semaphore (correct only
+  under `local`'s exactly-one-replica guarantee) versus `aks-prod`'s real
+  node-pool-and-taint scheduling. Unifying these behind one interface would have
+  meant either faking node-pool semantics in Docker (meaningless — Docker has no
+  nodes) or faking a distributed semaphore for Kubernetes (unnecessary — the
+  scheduler already does this natively via taints/tolerations).
+
+### Bugs found and fixed during live verification (direct — this session had real Docker access)
+
+Unlike Phases 4–6, this session had direct access to the same Docker daemon as the
+user (confirmed via `docker ps` showing the compose infra already running), so
+verification was direct rather than relayed — but still hit the identical
+snap-Docker/AppArmor `no-new-privileges` block Phase 6 first found and left
+unresolved on this specific host (see "Known environment limitation" below,
+unchanged from Phase 6 — not re-litigated here).
+
+1. **No bugs found in the pool/persistence/reconciler code itself** during this
+   pass — every genuinely testable-here piece (the Alembic migration, `pool_members`
+   claim/release/replenish logic, `WorkspaceService.sweep_retention()`'s state
+   machine, the reconciler's four jobs, Docker named-volume create/delete, and the
+   mount+ownership-fix mechanism isolated from `no-new-privileges`) worked correctly
+   on the first or second live attempt — see "Live verification" below for exactly
+   what was run and how. This is different from every prior phase's live-verification
+   section, which each found 1–5 real bugs; the difference here is that Phase 7's
+   design leaned on already-proven patterns from earlier phases (the `CapAdd`
+   capability-restoration fix from Phase 5's bug #1, the exec-not-archive-API lesson
+   from Phase 1, the container-not-yet-running poll from Phase 6) rather than novel
+   Docker/K8s interactions, and unit tests with mocked `aiodocker`/`kubernetes_asyncio`
+   clients caught the logic bugs (an incorrect fresh-namespace stale-pod check; see
+   below) before they ever reached a live daemon.
+2. **A logic bug caught by unit tests, not live verification**: the first
+   `KubernetesProvisioner.acquire()` implementation for persistent sandboxes always
+   called `_ensure_no_stale_pod()`, even for a namespace it had *just* created this
+   same call — impossible to have a stale pod in a namespace that didn't exist a
+   moment ago, but the mocked `read_namespaced_pod` (returning "found" by default in
+   the test fixture) made `_ensure_no_stale_pod` think one existed, delete it, then
+   wait for a pod that was never coming, timing out. Fixed by having
+   `_ensure_persistent_namespace()` report whether the namespace already existed
+   (reused) vs. was freshly created, and only checking for a stale pod in the reused
+   case. Exactly the kind of bug a mocked-client unit test suite (this phase added
+   `test_docker_provisioner.py`, the first-ever dedicated Docker provisioner unit
+   tests, mirroring the pattern `test_kubernetes_provisioner.py` already used) is
+   designed to catch before it ever reaches a live daemon.
+
+### Live verification (Phase 7)
+
+Direct, against the real Docker daemon (`docker ps` confirmed the compose infra
+already running: Postgres/Redis/MinIO/registry) and the real Postgres instance:
+
+- **Alembic migration** (`7f07c054e570`) applied to real Postgres, confirmed via
+  `psql \d sandboxes`/`\d pool_members` that every new column/table landed exactly as
+  modeled, then downgraded and re-upgraded cleanly (Phase 0's own verification
+  pattern) — new columns/table gone after downgrade, back after re-upgrade.
+- **Docker named volume create/delete** — round-tripped directly against the real
+  daemon via `aiodocker` (`volumes.create()`/`.show()`/`.delete()`), confirming the
+  exact mechanism `delete_workspace_volume()` uses.
+- **Persistent-workspace mount + ownership fix, isolated from the `no-new-privileges`
+  block** — `docker run` with the exact same `--mount type=volume,...`,
+  `--cap-drop ALL --cap-add CHOWN` flags this phase's code constructs (but without
+  `--security-opt no-new-privileges`, to isolate the mount/ownership logic from the
+  unrelated, already-diagnosed host issue): `docker exec --user 0:0 ... chown
+  10001:10001 /workspace` succeeded, and a subsequent `docker exec --user 10001:10001
+  ... sh -c 'echo hello > /workspace/test.txt && cat /workspace/test.txt'` read back
+  `hello` — confirming the mount+ownership-fix mechanism `DockerProvisioner.acquire()`
+  implements for persistent workspaces is correct in isolation.
+- **A real `DockerProvisioner.acquire()` call with `workspace_id` set**, against the
+  real daemon with the `base` golden image freshly built for this — reproduced
+  *exactly* Phase 6's documented AppArmor failure signature (`ExitCode: 255`,
+  matching `exec /usr/bin/sleep: operation not permitted`), confirming this phase's
+  new code path hits the same well-understood, pre-existing host limitation and
+  nothing new or different about it.
+- **The reconciler's real entrypoint** (`ReconcilerLoop.create()` + one `.tick()`) run
+  directly against the real Postgres + Docker daemon with pooling/persistence both
+  off (matching `local.yaml`'s defaults) — completed cleanly with an all-zero result
+  (`reaped=0, pool_replenished=0, workspaces_archived=0, workspaces_purged=0,
+  orphans_reaped=0`), confirming Settings loading, Registry loading, the session
+  factory, and `DockerProvisioner` construction all wire together correctly outside
+  of pytest. Confirmed no test data landed in the real `sandboxes`/`workspaces`/
+  `pool_members` tables afterward.
+- Full unit suite: **237 passing** (up from Phase 6's 159 — 78 new tests this phase,
+  across `test_pool_manager.py`, `test_weight_class_scheduler.py`,
+  `test_sandbox_pooling.py`, `test_docker_provisioner.py` (new — first-ever dedicated
+  Docker provisioner unit tests), `test_kubernetes_provisioner.py`'s persistent-
+  namespace/archive/measure/restore/node-selector additions, `test_workspace_service.py`
+  (incl. `restore()`), `test_workspace_retention.py` (incl. usage-measurement
+  refresh), `test_reconciler.py`, and `test_sandboxes_api.py`'s persistent-sandbox-
+  over-HTTP additions).
+
+**One leaked debug container from manual verification, not removable on this
+host**: a plain `docker run` used to isolate the mount+ownership-fix logic (see
+above) left `manual-ws-test` (and its volume, `kubesandbox-ws-manual-test`) running —
+`docker rm -f`/`kill` against it fails with `permission denied`, the *same*
+snap/AppArmor confinement Phase 6 already documented for its own two leaked debug
+containers ("another symptom of the same snap/AppArmor confinement, not a
+KubeSandbox-related leak"). Not fixed — this is host packaging, not application code;
+flagged here rather than silently left, matching Phase 6's own precedent for the
+identical class of issue.
+
+### Known environment limitation found — not a KubeSandbox bug (same as Phase 6, reconfirmed)
+
+Re-confirmed at the start of this phase's session, unchanged from Phase 6: this
+machine's Docker is snap-installed, and its own AppArmor confinement conflicts with
+the `no-new-privileges` flag every sandbox container gets (doc §6 Layer 1) —
+reproduced again directly against a vanilla `debian:12-slim sleep 1` with only
+`--security-opt no-new-privileges` applied (`exec /usr/bin/sleep: operation not
+permitted`). This blocks live-verifying *any* code path that actually starts a
+hardened sandbox container end-to-end on this host — old or new, Phase 7-specific or
+not. Not fixed in code, for the same reason Phase 6 didn't fix it: weakening
+`no-new-privileges` to work around one host's broken Docker packaging would defeat
+the actual security property it exists for everywhere else. Remediation is unchanged:
+switch from `snap install docker` to the official `apt`-based Docker Engine install.
+
+### Known scope boundaries (Phase 7)
+
+- ~~Workspace quota is soft, and `used_mb` is never actually measured~~ — **closed**
+  after this section was first written: `Provisioner.measure_workspace_usage()`
+  (`du -sm` against the same throwaway container/pod pattern `archive_workspace`
+  uses) is real on both backends, and `WorkspaceService.sweep_retention()` now
+  refreshes `used_mb` for every `active` workspace with no currently-live sandbox on
+  each tick, before evaluating retention — `check_quota()` is genuinely enforced
+  against a live-ish number now, not a permanent zero. Still soft in the sense doc
+  §5.4 always meant it to be (no xfs project quota / cgroup-level hard cap), and
+  measurement is skipped for a workspace with a live sandbox attached (a Kubernetes
+  PVC is `ReadWriteOnce` — a second, measurement-only pod could fail to schedule if
+  the real sandbox pod landed on a different node; not worth that risk for an
+  advisory number) — a live workspace's `used_mb` only refreshes once its sandbox
+  goes idle enough for the next sweep to catch it.
+- ~~No restore path for an archived workspace~~ — **closed**: `Provisioner.
+  restore_workspace()` (untars onto a fresh volume/PVC, recreating a Kubernetes
+  workspace's namespace shell first if `delete_workspace_volume()` already removed
+  it) plus `WorkspaceService.restore()` (fetches the cold-storage tar, calls it, flips
+  the workspace back to `active`) are both real and unit-tested. Deliberately NOT
+  invoked automatically by `create_sandbox(persistent=True)` — that still raises
+  against a non-active workspace rather than silently deciding a slow, explicit
+  cold-storage fetch is what the caller wanted as a side effect of "just create the
+  sandbox"; a caller that wants the data back calls `WorkspaceService.restore()`
+  first. No HTTP endpoint exposes this yet (e.g. `POST /v1/workspaces/{id}/restore`)
+  — the service-layer primitive exists and is real, wiring a route to it is a small,
+  separate follow-up, not attempted here since nothing asked for it yet.
+- **`heavy_max_concurrent`'s semaphore only caps concurrency within one process.** By
+  design (see "Design decisions" above) — `local` always runs exactly one replica
+  (doc §7), so this is never meant to coordinate across replicas the way Redis or
+  Postgres-backed locking would; `aks-prod` doesn't use it at all, relying on real
+  node-pool taints/tolerations instead.
+- **`heavy_node_selector`/`heavy_tolerations` are real, wired, never exercised
+  against a real heavy-workload node pool.** No AKS infrastructure (or even a
+  multi-node kind cluster) exists in this environment — same honest "real code,
+  unverified live" flag Phase 3 carries for gVisor and Phase 6 carries for
+  `ACRRegistryProvider`.
+- **Orphan GC only covers ephemeral, `sandbox-id`-labeled resources** — a persistent
+  workspace's namespace (labeled `workspace-id`, not `sandbox-id`) is deliberately out
+  of its scope; that namespace's lifecycle is retention's job, not orphan GC's. A
+  persistent namespace whose `Workspace` row was hard-deleted out of band (bypassing
+  `sweep_retention()`) would not currently be caught by anything — a real, if narrow,
+  gap.
+- **No single template/spec combines a persistent workspace with DB sidecars in this
+  phase's test coverage.** Nothing in the code actually prevents it (a persistent
+  ad-hoc `create_sandbox()` request could in principle compose sidecars too), but it
+  was never exercised — flagged rather than silently assumed to work.
+- **The Kubernetes persistent-workspace path (per-workspace namespace, PVC, node
+  segregation) was verified only against mocked `kubernetes_asyncio` clients in unit
+  tests, not a real cluster** — the kind cluster from Phase 4's own "Known scope
+  boundaries" was already torn down before this phase started, and standing a new one
+  up wasn't attempted this pass (the user confirmed no `kubectl`/`kind` was readily
+  available this session either). Same honest flag as Phase 3's untested gVisor.
+- **`PoolState`'s aggregate `idle_count` is a recomputed observability counter, not
+  load-bearing for anything** — doc §14's `pool_hit_rate` metric would read it, but no
+  `GET /metrics` endpoint exists yet (roadmap Phase 9), so nothing actually surfaces
+  it today.
 
 ---
 

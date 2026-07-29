@@ -16,6 +16,7 @@ from app.extensions.loader import Registry
 from app.main import app
 from app.persistence.db import get_session
 from app.services.sandbox_service import SandboxService
+from app.services.workspace_service import WorkspaceService
 from tests.unit.factories import make_component
 from tests.unit.fakes import FakeProvisioner
 
@@ -100,6 +101,37 @@ async def test_run_in_sandbox_does_not_destroy_it(client, provisioner) -> None:
 
     get_resp = await client.get(f"/v1/sandboxes/{sandbox_id}")
     assert get_resp.json()["state"] == "active"
+
+
+async def test_create_sandbox_persistent_400s_when_workspaces_not_enabled(client) -> None:
+    # `client`'s SandboxService was built with no workspace_service (persistence
+    # disabled by default, doc §10.2/Phase 7) — persistent=True must fail loudly, not
+    # silently fall back to an ephemeral sandbox.
+    resp = await client.post("/v1/sandboxes", json={"language": "python", "persistent": True})
+    assert resp.status_code == 400
+    assert "not enabled" in resp.json()["detail"]
+
+
+async def test_create_sandbox_persistent_wires_workspace_when_enabled(db_session, registry, provisioner) -> None:
+    sandbox_service = SandboxService(
+        registry, provisioner, workspace_service=WorkspaceService(default_quota_mb=2048)
+    )
+
+    async def _override_get_session():
+        yield db_session
+
+    app.dependency_overrides[get_current_principal] = lambda: TENANT_A
+    app.dependency_overrides[get_session] = _override_get_session
+    app.dependency_overrides[get_sandbox_service] = lambda: sandbox_service
+    transport = ASGITransport(app=app)
+    try:
+        async with AsyncClient(transport=transport, base_url="http://test") as ac:
+            resp = await ac.post("/v1/sandboxes", json={"language": "python", "persistent": True})
+    finally:
+        app.dependency_overrides.clear()
+
+    assert resp.status_code == 201
+    assert resp.json()["persistent"] is True
     assert provisioner.destroyed == []
 
 

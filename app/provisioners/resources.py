@@ -43,3 +43,16 @@ def format_bytes_to_memory(num_bytes: int) -> str:
         if num_bytes % multiplier == 0:
             return f"{num_bytes // multiplier}{suffix}"
     return str(num_bytes)
+
+
+_DURATION_SUFFIXES = {"s": 1, "m": 60, "h": 3600, "d": 86400}
+
+
+def parse_duration_to_seconds(duration: str) -> int:
+    """"15m" -> 900; "2h" -> 7200 — the doc's own `SandboxTemplate.spec.ttl` examples
+    (§3.4), needed by Phase 7's reconciler to reap sandboxes past their idle/max TTL."""
+    duration = duration.strip()
+    suffix = duration[-1]
+    if suffix not in _DURATION_SUFFIXES:
+        raise ValueError(f"invalid duration string: {duration!r} (expected a trailing s/m/h/d)")
+    return int(duration[:-1]) * _DURATION_SUFFIXES[suffix]

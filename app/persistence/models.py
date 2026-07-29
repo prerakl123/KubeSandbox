@@ -1,10 +1,10 @@
 """SQLAlchemy 2.0 ORM models for the control-plane database (doc §10.1).
 
 Tables backing the Phase 0/1 vertical slice (tenants, users, api_keys, components,
-templates, sandboxes, runs, audit_logs) are load-bearing today. The entitlement,
-workspace, pool, and billing tables are schema laid down now so later phases (§20:
-Phase 2 entitlements, Phase 7 pooling/persistence, Phase 8 billing) don't need a
-disruptive migration — no service code writes to them yet.
+templates, sandboxes, runs, audit_logs) are load-bearing today, as are entitlements
+(Phase 2) and pooling/workspaces (Phase 7, as of this revision). The billing tables
+remain schema-only, laid down now so Phase 8 doesn't need a disruptive migration — no
+service code writes to them yet.
 """
 
 from __future__ import annotations
@@ -125,6 +125,17 @@ class Sandbox(Base):
     state: Mapped[str] = mapped_column(String(16), default="pending")
     weight_class: Mapped[str] = mapped_column(String(16), default="light")
     persistent: Mapped[bool] = mapped_column(Boolean, default=False)
+    workspace_id: Mapped[str | None] = mapped_column(ForeignKey("workspaces.id"), nullable=True)
+    """Set only when `persistent` is true (Phase 7) — which Workspace's durable
+    volume/PVC this sandbox mounted at `/workspace`. Null for every ephemeral sandbox,
+    which is all of them before this phase."""
+    idle_ttl_seconds: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    max_ttl_seconds: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    """Reconciler TTL inputs (doc §4.1, Phase 7) — resolved once at create time (from
+    the SandboxTemplate's `spec.ttl`, or `TTLSettings` defaults for an ad-hoc sandbox)
+    and persisted here since the reconciler runs in a separate process/request from
+    creation and has nothing else to read them from. Null means "never reap by TTL" —
+    reserved for a future admin override, nothing sets it today."""
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     last_active_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     terminated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
@@ -188,16 +199,43 @@ class Workspace(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
-# --- Pod pooling (doc §4.3) — schema only until Phase 7 -----------------------------
+# --- Pod pooling (doc §4.3) ----------------------------------------------------------
 
 class PoolState(Base):
+    """One aggregate row per (image_digest, weight_class) key — an observability
+    counter (doc §14's `pool_hit_rate` metric needs a denominator), not the claim
+    ledger itself; PoolMember below is the source of truth for which specific
+    sandboxes are actually idle and claimable."""
+
     __tablename__ = "pool_state"
+    __table_args__ = (UniqueConstraint("image_digest", "weight_class", name="uq_pool_state_key"),)
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
     image_digest: Mapped[str] = mapped_column(String(128))
     weight_class: Mapped[str] = mapped_column(String(16))
     idle_count: Mapped[int] = mapped_column(Integer, default=0)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class PoolMember(Base):
+    """One idle, claimable sandbox sitting in a warm pool (doc §4.3), keyed by
+    `(image_ref, weight_class)`. Deliberately NOT a row in `sandboxes`: a pool member
+    belongs to no tenant yet (`sandboxes.tenant_id` is required, on purpose — every
+    *claimed* sandbox is still tenant-scoped from the moment it's claimed), and
+    keeping the two tables separate means claiming one is a plain delete-and-recreate
+    transfer instead of a tenant-reassignment update on a table whose FK doesn't allow
+    a "no tenant yet" state. `PoolManager.try_claim()` is the only writer that deletes
+    a row here (atomically, via `SELECT ... FOR UPDATE SKIP LOCKED`); `release()` is
+    the only writer that inserts one."""
+
+    __tablename__ = "pool_members"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    image_ref: Mapped[str] = mapped_column(String(255))
+    weight_class: Mapped[str] = mapped_column(String(16))
+    backend: Mapped[str] = mapped_column(String(16))
+    native_ref: Mapped[str] = mapped_column(String(255))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
 # --- Billing & costing (doc §13) — schema only until Phase 8 -----------------------

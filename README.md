@@ -1,21 +1,26 @@
 # KubeSandbox
 
 Sandbox-provisioning control plane. See `docs/ARCHITECTURE_AND_PLAN.md` for the full
-design, and `docs/TASK_CHECKLIST.md` for an honest per-item completion status. This
-covers local setup through the Phase 0–6 slice: config, DB, the `python`/`node`/`go`/
-`bash`/`git`/`base` components, `DockerProvisioner` **and** `KubernetesProvisioner`,
-`POST /v1/execute` (ad-hoc language or SandboxTemplate composition), the non-ephemeral
-sandbox lifecycle (`POST /v1/sandboxes`, batch runs, file upload/download/tree, and
-interactive PTY attach over WebSocket), the component/template/entitlement registry
-APIs, the Kustomize sandbox-primitive manifests (NetworkPolicy/RBAC/ResourceQuota/
-LimitRange/RuntimeClass), database sidecars (`postgresql`/`mysql`/`redis`
-composed into a sandbox as a real second container, with a non-superuser role/ACL user
-provisioned by a `ComponentHook` — see "Try a database sidecar" below; all three are
-live-verified end to end against real containers, see `docs/TASK_CHECKLIST.md`'s
-Phase 5 section), and the build system (`BuildManager` — dockerfile/compose/pipeline/
-helm `BuildStrategy` implementations, `LocalImageStore`/`ACRRegistryProvider`,
-`MinIOStorageProvider`/`AzureBlobStorageProvider` — see "Try the build system (Phase 6)"
-below).
+design, `docs/TASK_CHECKLIST.md` for an honest per-item completion status, and
+`docs/DEPLOYMENT.md` for deploying this repo somewhere real (local recap, Azure/AKS
+step-by-step, generic/self-hosted Kubernetes, and a logging/observability feasibility
+breakdown). This README covers local setup through the Phase 0–7 slice: config, DB,
+the `python`/`node`/`go`/`bash`/`git`/`base` components, `DockerProvisioner` **and**
+`KubernetesProvisioner`, `POST /v1/execute` (ad-hoc language or SandboxTemplate
+composition), the non-ephemeral sandbox lifecycle (`POST /v1/sandboxes`, batch runs,
+file upload/download/tree, and interactive PTY attach over WebSocket), the
+component/template/entitlement registry APIs, the Kustomize sandbox-primitive
+manifests (NetworkPolicy/RBAC/ResourceQuota/LimitRange/RuntimeClass), database
+sidecars (`postgresql`/`mysql`/`redis` composed into a sandbox as a real second
+container, with a non-superuser role/ACL user provisioned by a `ComponentHook` — see
+"Try a database sidecar" below; all three are live-verified end to end against real
+containers, see `docs/TASK_CHECKLIST.md`'s Phase 5 section), the build system
+(`BuildManager` — dockerfile/compose/pipeline/helm `BuildStrategy` implementations,
+`LocalImageStore`/`ACRRegistryProvider`, `MinIOStorageProvider`/`AzureBlobStorageProvider`
+— see "Try the build system (Phase 6)" below), and pooling + persistent workspaces
+(`PoolManager`, weight-class segregation, Docker-named-volume/Kubernetes-PVC
+persistent workspaces, archive/purge retention, the reconciler — see "Try pooling &
+persistent workspaces (Phase 7)" below).
 
 Full interactive API docs (every endpoint annotated — summaries, parameter
 descriptions, grouped by tag) are served at `http://localhost:8000/docs` once the app
@@ -417,6 +422,93 @@ configured (`config/settings/aks-prod.yaml`) — `local.yaml` leaves it `null`, 
 plain kind node has no gVisor containerd shim anyway, so gVisor itself is never
 exercised locally; only the wiring (the config is read and consumed) is.
 
+### Try pooling & persistent workspaces (Phase 7)
+
+Both are off by default in `config/settings/local.yaml` (`pool.enabled: false`,
+`workspace.persistence_enabled: false`) — opt in with env overrides so existing
+`/v1/execute` behavior stays unchanged unless you ask for this:
+
+```bash
+# Enable a small warm pool (1 idle python sandbox) and persistent workspaces
+KUBESANDBOX_POOL__ENABLED=true \
+KUBESANDBOX_POOL__LIGHT_POOL_SIZE=1 \
+KUBESANDBOX_WORKSPACE__PERSISTENCE_ENABLED=true \
+uv run uvicorn app.main:app --reload
+```
+
+Pooling (doc §4.3): with `pool.enabled: true`, a clean ad-hoc `/v1/execute` run (no
+`template`, no DB sidecar, `weight_class != heavy`) is recycled back into a warm pool
+instead of destroyed — a second identical-language call claims that same container
+instead of creating a fresh one. Interactive/`create_sandbox()`/template/persistent
+sandboxes are never pooled (doc §4.3's "interactive sessions are never pooled after
+attach", generalized here to "never pooled in the first place" for anything that
+isn't a bare language component):
+
+```bash
+# First call acquires a fresh container and releases it to the pool afterward
+curl -s http://localhost:8000/v1/execute -H 'Content-Type: application/json' \
+  -d '{"language": "python", "code": "print(1)"}' | python3 -m json.tool
+
+# Second call claims the same pooled container instead of creating a new one —
+# confirm via `docker ps -a --filter name=kubesandbox-` staying at one container
+# across both calls, not two
+curl -s http://localhost:8000/v1/execute -H 'Content-Type: application/json' \
+  -d '{"language": "python", "code": "print(2)"}' | python3 -m json.tool
+```
+
+Persistent workspaces (doc §10.2): `POST /v1/sandboxes` with `"persistent": true`
+mounts the caller's durable per-user workspace at `/workspace` (a Docker named volume
+locally, keyed by workspace id — a per-workspace namespace holding a PVC on
+Kubernetes) instead of ephemeral tmpfs/emptyDir, created lazily on first use and
+reused across that user's future persistent sandboxes:
+
+```bash
+SANDBOX_ID=$(curl -s -X POST http://localhost:8000/v1/sandboxes \
+  -H 'Content-Type: application/json' \
+  -d '{"language": "python", "persistent": true}' \
+  | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')
+
+curl -s -X PUT "http://localhost:8000/v1/sandboxes/$SANDBOX_ID/files?path=note.txt" \
+  -H 'Content-Type: text/plain' --data 'still here after a restart'
+curl -s -X DELETE "http://localhost:8000/v1/sandboxes/$SANDBOX_ID"
+
+# A second persistent sandbox for the same user reuses the same workspace volume —
+# note.txt survives even though the first sandbox/container is long gone
+SANDBOX_ID_2=$(curl -s -X POST http://localhost:8000/v1/sandboxes \
+  -H 'Content-Type: application/json' -d '{"language": "python", "persistent": true}' \
+  | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')
+curl -s "http://localhost:8000/v1/sandboxes/$SANDBOX_ID_2/files?path=note.txt"
+```
+
+The reconciler (doc §4.1) is a separate worker process, not part of the API — TTL
+reaping, pool replenishment, workspace retention (archive/purge per doc §10.2's
+day thresholds), and orphan GC all run there on a fixed interval
+(`reconciler.interval_seconds`, default 30s):
+
+```bash
+uv run python -m app.reconciler.loop
+```
+
+**Known scope boundaries** (see `docs/TASK_CHECKLIST.md`'s Phase 7 section for the
+full detail): the pool claim ledger lives in Postgres (`pool_members`, atomic via
+`SELECT ... FOR UPDATE SKIP LOCKED`) rather than Redis, despite doc §10.1's literal
+wording — a deliberate simplification, not an oversight. `heavy_max_concurrent`'s
+in-process semaphore is a `local`-only stand-in for `aks-prod`'s real node-pool
+segregation (`heavy_node_selector`/`heavy_tolerations`, wired but unverified live —
+no real heavy node pool exists here, same honesty flag Phase 3/6 carry for
+gVisor/ACR). Workspace quota is soft — `used_mb` is never actually measured from real
+disk usage anywhere yet, so `check_quota()` is real but practically inert until a
+`du`-style measurement step exists. There's no restore path for an archived
+workspace — `create_sandbox(persistent=true)` against one raises rather than
+silently mounting a fresh, empty volume under the same name.
+
+**The same snap-Docker/AppArmor host issue documented in Phase 6** (see its
+troubleshooting note above) blocks live-verifying anything that actually starts a
+sandbox container on a snap-installed Docker host — pooling/persistent-workspace
+mounting were verified by isolating each piece (a plain volume create/delete, and a
+manual container run with `no-new-privileges` omitted to confirm the mount+chown
+logic itself is correct) rather than end-to-end through the API on this machine.
+
 ## Tests
 
 ```bash
@@ -436,7 +528,7 @@ registry/`helm`/MinIO aren't reachable.
 ## Layout
 
 See `docs/ARCHITECTURE_AND_PLAN.md` §18 for the full intended repository layout; this
-slice implements the Phase 0–6 subset of it (config, manifests/registry, domain models,
+slice implements the Phase 0–7 subset of it (config, manifests/registry, domain models,
 DB + migrations, the `python`/`node`/`go`/`bash`/`git`/`base` components,
 `DockerProvisioner` and `KubernetesProvisioner`, `SandboxService` (ad-hoc + SandboxTemplate
 composition + the non-ephemeral sandbox lifecycle), `/v1/execute`, `/v1/sandboxes`
@@ -445,10 +537,13 @@ PTY), the component/template/entitlement/publish-grant registry APIs, the Kustom
 sandbox-primitive manifests under `deploy/`, database sidecars
 (`components/databases/{postgresql,mysql,redis}`, multi-container composition in both
 provisioners, and the `ComponentHook` loader that provisions each sidecar's scoped
-role), and the build system (`app/build/strategies/{dockerfile,compose,pipeline,helm}.py`,
+role), the build system (`app/build/strategies/{dockerfile,compose,pipeline,helm}.py`,
 `app/services/build_manager.py`, `app/cloud/{registry,storage}.py`,
 `POST /v1/components/{name}/build` + `GET /v1/builds/{id}`, and the
-`jq`/`ripgrep`/`httpie`/`demo-echo` demo components — one per strategy). Everything
-else in that layout (pooling, billing, execution-time entitlement enforcement, real
-Kaniko/K8s-Job builds) is later-phase work per the roadmap in §20 — see
-`docs/TASK_CHECKLIST.md` for the exact per-item status and known gaps.
+`jq`/`ripgrep`/`httpie`/`demo-echo` demo components — one per strategy), and pooling +
+persistent workspaces (`app/services/{pool_manager,weight_class_scheduler,workspace_service}.py`,
+`app/reconciler/loop.py`, the `pool_members` table, persistent-workspace mounting in
+both provisioners). Everything else in that layout (billing, execution-time
+entitlement enforcement, real Kaniko/K8s-Job builds) is later-phase work per the
+roadmap in §20 — see `docs/TASK_CHECKLIST.md` for the exact per-item status and known
+gaps.

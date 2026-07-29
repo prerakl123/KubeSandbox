@@ -10,6 +10,7 @@ from app.domain.execution import (
     BatchCommand,
     BatchRunResult,
     FileEntry,
+    NativeSandboxRef,
     SandboxHandle,
     SandboxSpec,
     SandboxStatus,
@@ -110,4 +111,49 @@ def parse_find_output(text: str) -> list[FileEntry]:
     async def destroy(self, handle: SandboxHandle) -> None:
         """Graceful teardown: must be idempotent and must never leak the underlying
         resource even if the sandbox is already gone or was never fully provisioned."""
+        ...
+
+    async def archive_workspace(self, workspace_id: str, *, archiver_image: str) -> bytes:
+        """Doc §10.2 retention (Phase 7): returns a tar of a persistent workspace's
+        current contents — used with no sandbox currently attached to it (the
+        workspace's own sandbox, if any, is always destroyed before archival runs).
+        Implementations mount the durable volume/PVC into a short-lived, throwaway
+        container/pod just for this, since there's no already-running sandbox to
+        `exec` into by the time retention reaps an idle workspace. `archiver_image`
+        is caller-resolved (the registry's `base` component image) rather than
+        hardcoded here — a Provisioner has no dependency on the component registry
+        anywhere else (doc §4.2's abstraction boundary), and a bare image string
+        wouldn't be pullable as-is on every backend/registry combination anyway."""
+        ...
+
+    async def delete_workspace_volume(self, workspace_id: str) -> None:
+        """Permanently removes a persistent workspace's durable volume/PVC — called
+        right after a successful `archive_workspace()` upload (moving to cold
+        storage) and is the terminal step of doc §10.2's retention path. Idempotent:
+        a workspace with no volume/PVC left is already success, not an error."""
+        ...
+
+    async def measure_workspace_usage(self, workspace_id: str, *, archiver_image: str) -> int:
+        """Current disk usage of a persistent workspace's durable volume/PVC, in MB —
+        backs `WorkspaceService.check_quota()`'s enforcement. Same "no already-running
+        sandbox to exec into" reasoning as `archive_workspace`, same caller-resolved
+        `archiver_image` contract."""
+        ...
+
+    async def restore_workspace(self, workspace_id: str, data: bytes, *, archiver_image: str) -> None:
+        """Symmetric to `archive_workspace()`: un-tars `data` (as produced by a prior
+        `archive_workspace()` call) onto a fresh durable volume/PVC, recreating it if
+        `delete_workspace_volume()` already removed it. Used to bring an `archived`
+        workspace back to `active` (doc §10.2)."""
+        ...
+
+    async def list_sandbox_refs(self) -> list[NativeSandboxRef]:
+        """Every currently-live *ephemeral* sandbox-labeled native resource (a main
+        container for Docker, a namespace for Kubernetes) — the reconciler's orphan
+        GC (doc §4.1, Phase 7) cross-references this against non-terminated `Sandbox`
+        rows to find resources Postgres no longer knows about (a crash between
+        acquire() and the row being committed, a control-plane restart mid-teardown,
+        etc.) and removes them. Deliberately excludes persistent-workspace namespaces
+        (those carry a `workspace-id` label, not a `sandbox-id` one) — their lifecycle
+        is workspace retention's job, not orphan GC's."""
         ...

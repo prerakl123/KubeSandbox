@@ -29,15 +29,40 @@ provisioner:
   backend: kubernetes
   runtime_class: gvisor
   namespace_prefix: "kubesandbox-sb-"
+  # Real segregation is node-pool-level infra (roadmap Phase 9) — these two just wire
+  # the pod spec to whatever heavy-workload node pool/taint actually gets provisioned;
+  # REPLACE_ME until that node pool exists.
+  heavy_node_selector:
+    kubesandbox.io/workload-class: "REPLACE_ME_heavy"
+  heavy_tolerations:
+    - key: "kubesandbox.io/heavy"
+      operator: "Equal"
+      value: "true"
+      effect: "NoSchedule"
 
 pool:
   enabled: true
   light_pool_size: 10
   standard_pool_size: 5
   heavy_pool_size: 2
+  # Segregation on aks-prod comes from the node pool + taints above, not a semaphore
+  # (that's a `local`-only stand-in, doc §7) — null means unbounded here.
+  heavy_max_concurrent: null
 
 workspace:
   persistence_enabled: true
+  default_quota_mb: 10240
+  idle_retention_days: 30
+  archive_grace_days: 60
+  max_lifetime_days: 365
+
+ttl:
+  default_idle_seconds: 900
+  default_max_seconds: 7200
+
+reconciler:
+  interval_seconds: 30
+  orphan_grace_seconds: 120
 
 limits:
   default_wall_clock_seconds: 60

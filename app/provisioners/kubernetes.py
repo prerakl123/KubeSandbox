@@ -33,6 +33,7 @@ import json
 import os
 import time
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
@@ -55,6 +56,8 @@ from app.domain.execution import (
     BatchCommand,
     BatchRunResult,
     FileEntry,
+    NativeSandboxRef,
+    ResourceSpec,
     SandboxHandle,
     SandboxSpec,
     SandboxState,
@@ -73,6 +76,8 @@ logger = get_logger(__name__)
 
 _POD_NAME = "sandbox"
 _MAIN_CONTAINER = "main"
+_WORKSPACE_PVC_NAME = "workspace-pvc"
+_DEFAULT_WORKSPACE_SIZE_MB = 1024
 # Fixed across every golden image (doc §6 Layer 1: runAsUser/Group: 10001, always).
 _SANDBOX_UID = 10001
 _TERMINATION_GRACE_SECONDS = 5
@@ -199,28 +204,46 @@ class KubernetesProvisioner:
 
     async def acquire(self, spec: SandboxSpec) -> SandboxHandle:
         sandbox_id = str(uuid.uuid4())
-        namespace = f"{self._namespace_prefix}{sandbox_id.replace('-', '')[:16]}"
+        persistent = spec.workspace_id is not None
+        # A persistent workspace's PVC is namespace-scoped and Kubernetes has no
+        # cross-namespace PVC mount — so unlike the ephemeral path (a fresh,
+        # randomly-named namespace every time, deleted whole on destroy()), a
+        # persistent sandbox reuses one namespace, deterministically named off the
+        # workspace id, for that workspace's entire lifetime (doc §10.2, Phase 7).
+        namespace = (
+            f"{self._namespace_prefix}ws-{spec.workspace_id}"
+            if persistent
+            else f"{self._namespace_prefix}{sandbox_id.replace('-', '')[:16]}"
+        )
 
         try:
-            await self._core_v1.create_namespace(
-                client.V1Namespace(
-                    metadata=client.V1ObjectMeta(
-                        name=namespace,
-                        labels={"io.kubesandbox.sandbox-id": sandbox_id},
-                        annotations=dict(spec.labels),
+            if persistent:
+                namespace_existed = await self._ensure_persistent_namespace(namespace, spec)
+                if namespace_existed:
+                    # Only a *reused* namespace can possibly hold a leftover pod from a
+                    # prior, not-cleanly-destroyed session — one we just created this
+                    # instant cannot.
+                    await self._ensure_no_stale_pod(namespace)
+            else:
+                await self._core_v1.create_namespace(
+                    client.V1Namespace(
+                        metadata=client.V1ObjectMeta(
+                            name=namespace,
+                            labels={"io.kubesandbox.sandbox-id": sandbox_id},
+                            annotations=dict(spec.labels),
+                        )
                     )
                 )
-            )
-            await self._create_network_policy(namespace)
-            await self._create_resource_quota(namespace, spec)
-            await self._create_limit_range(namespace, spec)
+                await self._create_network_policy(namespace)
+                await self._create_resource_quota(namespace, spec)
+                await self._create_limit_range(namespace, spec)
             await self._create_pod(namespace, sandbox_id, spec)
             await self._wait_ready(namespace)
         except ApiException as exc:
-            await self._cleanup_namespace(namespace)
+            await self._cleanup_after_acquire_failure(namespace, persistent=persistent)
             raise ProvisionerError(f"failed to provision sandbox namespace {namespace!r}: {exc}") from exc
         except Exception:
-            await self._cleanup_namespace(namespace)
+            await self._cleanup_after_acquire_failure(namespace, persistent=persistent)
             raise
 
         return SandboxHandle(
@@ -232,7 +255,92 @@ class KubernetesProvisioner:
             # one pod are already addressed by name, unlike Docker where each sidecar
             # is a genuinely separate container with its own id.
             sidecar_refs={s.name: s.name for s in spec.sidecars},
+            persistent=persistent,
         )
+
+    async def _ensure_persistent_namespace(self, namespace: str, spec: SandboxSpec) -> bool:
+        """Provisions the namespace + its NetworkPolicy/ResourceQuota/LimitRange/PVC
+        exactly once per workspace — a no-op on every subsequent acquire() for the
+        same workspace, detected via a plain existence check rather than tracking
+        "did I already do this" anywhere else (the cluster's own state is the only
+        source of truth `acquire()` needs, consistent with "any replica can serve any
+        session", doc §2). Returns whether the namespace already existed (reused) —
+        `acquire()` only bothers checking for a leftover stale pod in that case; a
+        namespace created this instant cannot possibly have one."""
+        try:
+            await self._core_v1.read_namespace(namespace)
+            return True
+        except ApiException as exc:
+            if exc.status != 404:
+                raise
+
+        await self._core_v1.create_namespace(
+            client.V1Namespace(
+                metadata=client.V1ObjectMeta(
+                    name=namespace,
+                    labels={"io.kubesandbox.workspace-id": spec.workspace_id},
+                    annotations={**spec.labels, "io.kubesandbox.workspace-id": spec.workspace_id},
+                )
+            )
+        )
+        await self._create_network_policy(namespace)
+        await self._create_resource_quota(namespace, spec)
+        await self._create_limit_range(namespace, spec)
+        await self._create_pvc(namespace, spec)
+        return False
+
+    async def _create_pvc(self, namespace: str, spec: SandboxSpec) -> None:
+        # No storageClassName set — uses the cluster's default StorageClass. A real
+        # aks-prod deployment should pin one explicitly (e.g. Azure Disk/Files backed);
+        # left unset here since neither this session nor kind has one worth hardcoding.
+        size_mb = spec.workspace_size_mb or _DEFAULT_WORKSPACE_SIZE_MB
+        pvc = client.V1PersistentVolumeClaim(
+            metadata=client.V1ObjectMeta(name=_WORKSPACE_PVC_NAME, namespace=namespace),
+            spec=client.V1PersistentVolumeClaimSpec(
+                access_modes=["ReadWriteOnce"],
+                resources=client.V1ResourceRequirements(requests={"storage": f"{size_mb}Mi"}),
+            ),
+        )
+        await self._core_v1.create_namespaced_persistent_volume_claim(namespace, pvc)
+
+    async def _ensure_no_stale_pod(self, namespace: str) -> None:
+        """A prior session for this workspace may have left its Pod behind (e.g. a
+        crash before destroy() ran) — `_create_pod()` always creates fresh, so a
+        leftover must be cleared first or creation fails with a 409 AlreadyExists."""
+        try:
+            await self._core_v1.read_namespaced_pod(_POD_NAME, namespace)
+        except ApiException as exc:
+            if exc.status == 404:
+                return
+            raise
+        await self._delete_pod_only(namespace)
+        await self._wait_pod_gone(namespace)
+
+    async def _wait_pod_gone(self, namespace: str, *, timeout_seconds: float = 30.0) -> None:
+        deadline = time.monotonic() + timeout_seconds
+        while time.monotonic() < deadline:
+            try:
+                await self._core_v1.read_namespaced_pod(_POD_NAME, namespace)
+            except ApiException as exc:
+                if exc.status == 404:
+                    return
+                raise
+            await asyncio.sleep(0.5)
+        raise ProvisionerError(f"timed out waiting for stale pod in {namespace!r} to be removed")
+
+    async def _delete_pod_only(self, namespace: str) -> None:
+        with contextlib.suppress(ApiException):
+            await self._core_v1.delete_namespaced_pod(_POD_NAME, namespace)
+
+    async def _cleanup_after_acquire_failure(self, namespace: str, *, persistent: bool) -> None:
+        """Ephemeral: the namespace was just created for this one attempt, so tearing
+        the whole thing down is correct (existing behavior). Persistent: the namespace
+        holds a durable PVC and may predate this attempt (a returning workspace) — only
+        the pod this attempt tried to create is this attempt's to clean up."""
+        if persistent:
+            await self._delete_pod_only(namespace)
+        else:
+            await self._cleanup_namespace(namespace)
 
     async def _create_network_policy(self, namespace: str) -> None:
         # Default-deny both directions (doc §6 Layer 3, §12) — no ingress/egress rules
@@ -318,6 +426,12 @@ class KubernetesProvisioner:
                 automount_service_account_token=False,
                 termination_grace_period_seconds=_TERMINATION_GRACE_SECONDS,
                 runtime_class_name=self._runtime_class,
+                # Heavy-weight-class node segregation (doc §4.3, Phase 7) — empty for
+                # every non-heavy spec (SandboxService only ever populates these for
+                # `weight_class == HEAVY`), so this is a no-op change for every
+                # existing light/standard pod.
+                node_selector=dict(spec.node_selector) or None,
+                tolerations=[client.V1Toleration(**t) for t in spec.tolerations] or None,
                 security_context=client.V1PodSecurityContext(
                     run_as_non_root=True,
                     run_as_user=_SANDBOX_UID,
@@ -356,8 +470,24 @@ class KubernetesProvisioner:
                 # execve out of /tmp work at all (see docs/TASK_CHECKLIST.md Phase 1/2's
                 # "5th bug"). Disk-backed emptyDir has no such noexec default, sidestepping
                 # that entire class of bug instead of reproducing it.
+                #
+                # workdir gets the durable PVC instead of emptyDir when persistent (Phase
+                # 7, doc §10.2) — every other writable path (e.g. /tmp) stays emptyDir
+                # regardless, since only the workspace itself needs to survive sessions.
                 volumes=[
-                    client.V1Volume(name=_volume_name(p), empty_dir=client.V1EmptyDirVolumeSource())
+                    client.V1Volume(
+                        name=_volume_name(p),
+                        persistent_volume_claim=(
+                            client.V1PersistentVolumeClaimVolumeSource(claim_name=_WORKSPACE_PVC_NAME)
+                            if spec.workspace_id is not None and p == spec.workdir
+                            else None
+                        ),
+                        empty_dir=(
+                            None
+                            if spec.workspace_id is not None and p == spec.workdir
+                            else client.V1EmptyDirVolumeSource()
+                        ),
+                    )
                     for p in spec.writable_paths
                 ]
                 + [
@@ -465,15 +595,175 @@ class KubernetesProvisioner:
         )
 
     async def destroy(self, handle: SandboxHandle) -> None:
-        """Graceful eradication: deleting the namespace cascades to the pod (and its
-        NetworkPolicy/ResourceQuota/LimitRange) — nothing sandbox-scoped can leak once
-        this call succeeds. Safe to call more than once: "already gone" is success."""
+        """Graceful eradication: for an ephemeral sandbox, deleting the whole namespace
+        cascades to the pod (and its NetworkPolicy/ResourceQuota/LimitRange) — nothing
+        sandbox-scoped can leak once this call succeeds. For a persistent sandbox
+        (`handle.persistent`), only the Pod is deleted — the namespace holds that
+        workspace's durable PVC and must survive for its next session (doc §10.2,
+        Phase 7); the workspace itself is reaped separately, by retention (archive/
+        purge), never by a sandbox's own destroy(). Safe to call more than once either
+        way: "already gone" is success."""
+        if handle.persistent:
+            await self._delete_pod_only(handle.native_ref)
+            return
         try:
             await self._core_v1.delete_namespace(handle.native_ref)
         except ApiException as exc:
             if exc.status == 404:
                 return
             raise ProvisionerError(f"failed to destroy sandbox {handle.sandbox_id}: {exc}") from exc
+
+    # -- persistent workspace retention (doc §10.2, Phase 7) --------------------------
+
+    async def _run_against_workspace_pvc(
+        self,
+        workspace_id: str,
+        archiver_image: str,
+        build_command: Callable[[str], list[str]],
+        *,
+        read_only: bool,
+        stdin: bytes = b"",
+    ) -> _RawExecResult:
+        """Shared plumbing for `archive_workspace`/`measure_workspace_usage`/
+        `restore_workspace`: creates a short-lived throwaway pod (named `_POD_NAME` —
+        no already-running sandbox to exec into by the time retention reaps an idle
+        workspace, its own sandbox having already been destroyed) mounting the
+        workspace's PVC, execs `build_command(mount_path)` via the same exec plumbing
+        `recycle()`/`get_file()` already use, and always removes the pod afterward.
+        Never touches the namespace itself — that's `delete_workspace_volume`'s job."""
+        namespace = f"{self._namespace_prefix}ws-{workspace_id}"
+        mount_path = "/workspace-mount"
+        pod = client.V1Pod(
+            metadata=client.V1ObjectMeta(name=_POD_NAME, namespace=namespace),
+            spec=client.V1PodSpec(
+                restart_policy="Never",
+                automount_service_account_token=False,
+                termination_grace_period_seconds=_TERMINATION_GRACE_SECONDS,
+                security_context=client.V1PodSecurityContext(
+                    run_as_non_root=True,
+                    run_as_user=_SANDBOX_UID,
+                    run_as_group=_SANDBOX_UID,
+                    fs_group=_SANDBOX_UID,
+                    seccomp_profile=client.V1SeccompProfile(type="RuntimeDefault"),
+                ),
+                containers=[
+                    client.V1Container(
+                        name=_MAIN_CONTAINER,
+                        image=archiver_image,
+                        command=["sleep", "infinity"],
+                        security_context=client.V1SecurityContext(
+                            allow_privilege_escalation=False,
+                            capabilities=client.V1Capabilities(drop=["ALL"]),
+                            read_only_root_filesystem=True,
+                        ),
+                        volume_mounts=[
+                            client.V1VolumeMount(name="workspace-src", mount_path=mount_path, read_only=read_only)
+                        ],
+                    )
+                ],
+                volumes=[
+                    client.V1Volume(
+                        name="workspace-src",
+                        persistent_volume_claim=client.V1PersistentVolumeClaimVolumeSource(
+                            claim_name=_WORKSPACE_PVC_NAME, read_only=read_only
+                        ),
+                    )
+                ],
+            ),
+        )
+        try:
+            await self._core_v1.create_namespaced_pod(namespace, pod)
+            await self._wait_ready(namespace)
+            return await self._run_exec_raw(
+                namespace,
+                build_command(mount_path),
+                stdin=stdin,
+                timeout_seconds=60,
+                max_output_bytes=20 * 1024**3,  # generous — doc §10.2's default quota is 10 GiB
+            )
+        except ApiException as exc:
+            raise ProvisionerError(f"failed to run against workspace {workspace_id} PVC: {exc}") from exc
+        finally:
+            await self._delete_pod_only(namespace)
+
+    async def archive_workspace(self, workspace_id: str, *, archiver_image: str) -> bytes:
+        raw = await self._run_against_workspace_pvc(
+            workspace_id,
+            archiver_image,
+            lambda mount_path: ["tar", "czf", "-", "-C", mount_path, "."],
+            read_only=True,
+        )
+        if raw.exit_code or raw.truncated:
+            raise ProvisionerError(
+                f"failed to archive workspace {workspace_id}: tar exited {raw.exit_code} (truncated={raw.truncated})"
+            )
+        return raw.stdout
+
+    async def measure_workspace_usage(self, workspace_id: str, *, archiver_image: str) -> int:
+        raw = await self._run_against_workspace_pvc(
+            workspace_id, archiver_image, lambda mount_path: ["du", "-sm", mount_path], read_only=True
+        )
+        if raw.exit_code:
+            raise ProvisionerError(f"failed to measure workspace {workspace_id} usage: du exited {raw.exit_code}")
+        return int(raw.stdout.split()[0])
+
+    async def restore_workspace(self, workspace_id: str, data: bytes, *, archiver_image: str) -> None:
+        """Symmetric to `archive_workspace()`. Unlike Docker (where a bare
+        `volumes.create()` suffices), `delete_workspace_volume()` already removed the
+        *entire namespace* holding the PVC — so this recreates the namespace shell
+        first (with placeholder resource sizing; a real `create_sandbox(persistent=
+        True)` call never resizes an existing namespace's quota/limits either — sized
+        once, at first creation, a known characteristic of this design, not something
+        restore introduces) before mounting it writable and untarring `data` in."""
+        namespace = f"{self._namespace_prefix}ws-{workspace_id}"
+        try:
+            await self._core_v1.read_namespace(namespace)
+        except ApiException as exc:
+            if exc.status != 404:
+                raise ProvisionerError(f"failed to restore workspace {workspace_id}: {exc}") from exc
+            placeholder_spec = SandboxSpec(
+                image=archiver_image,
+                command=["sleep", "infinity"],
+                resources=ResourceSpec(cpu="1", memory="512Mi"),
+                workspace_id=workspace_id,
+            )
+            await self._ensure_persistent_namespace(namespace, placeholder_spec)
+
+        raw = await self._run_against_workspace_pvc(
+            workspace_id,
+            archiver_image,
+            lambda mount_path: ["tar", "xzf", "-", "-C", mount_path],
+            read_only=False,
+            stdin=data,
+        )
+        if raw.exit_code:
+            raise ProvisionerError(
+                f"failed to restore workspace {workspace_id}: tar exited {raw.exit_code}: {raw.stderr!r}"
+            )
+
+    async def delete_workspace_volume(self, workspace_id: str) -> None:
+        """The workspace's namespace holds nothing but that one workspace's PVC (+
+        NetworkPolicy/ResourceQuota/LimitRange) — deleting it is the correct, total
+        teardown, not an over-broad one."""
+        await self._cleanup_namespace(f"{self._namespace_prefix}ws-{workspace_id}")
+
+    # -- orphan GC (doc §4.1, Phase 7) -------------------------------------------------
+
+    async def list_sandbox_refs(self) -> list[NativeSandboxRef]:
+        namespaces = await self._core_v1.list_namespace(label_selector="io.kubesandbox.sandbox-id")
+        refs = []
+        for ns in namespaces.items:
+            sandbox_id = (ns.metadata.labels or {}).get("io.kubesandbox.sandbox-id")
+            if not sandbox_id:
+                continue
+            # Sidecars are just other containers in the same Pod/namespace, not
+            # separate namespaces — deleting the namespace (destroy()'s existing
+            # ephemeral-path behavior) already reaps them, so there's no analogous
+            # sidecar_refs to populate here, unlike Docker.
+            refs.append(
+                NativeSandboxRef(sandbox_id=sandbox_id, native_ref=ns.metadata.name, created_at=ns.metadata.creation_timestamp)
+            )
+        return refs
 
     # -- files -------------------------------------------------------------------------
 

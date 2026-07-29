@@ -5,13 +5,29 @@ ephemeral sandbox through acquire -> exec_batch -> destroy, and persists the run
 `run_in_sandbox` — for sandboxes that outlive a single request, which interactive PTY
 attach (Phase 4) and multiple batch runs against one warm sandbox both need.
 
-No pooling/recycling yet (Phase 7) — `execute()`'s ephemeral sandboxes are always
-destroyed after one run; sandboxes created via `create_sandbox()` live until
-`destroy_sandbox()` is called (or the Phase 7 reconciler reaps them by TTL, not yet
-wired). Two ways to resolve a spec either way: a single ad-hoc language component
-(Phase 1), or a SandboxTemplate composed from base + multiple components (Phase 2, doc
-§3.4) — see template_render.render_template for how the latter merges component specs
-into one runnable SandboxSpec.
+Pooling (Phase 7, doc §4.3): both `execute()` and `create_sandbox()` try a warm-pool
+claim before falling back to `provisioner.acquire()` — "a session may originate from a
+pool claim (fast start)". Only `execute()` ever *returns* a sandbox to the pool
+(`recycle()`, on a clean run of a poolable spec); `create_sandbox()`/
+`destroy_sandbox()` never do — "interactive sessions are never pooled after attach...
+destroyed (not recycled) on disconnect+TTL", which this generalizes to "any
+non-ephemeral sandbox once it exists," not just ones that reached an attach. When
+`pool_manager` is None (the constructor default, and what `pool.enabled: false`'s
+config wiring passes), every acquire/release call falls straight through to the
+provisioner exactly as before this phase — pooling is opt-in, never a behavior change
+for a deployment that hasn't turned it on.
+
+TTL (doc §4.1): every sandbox this service creates gets `idle_ttl_seconds`/
+`max_ttl_seconds` resolved once (from its SandboxTemplate's `spec.ttl`, or the
+`TTLSettings` defaults for an ad-hoc, template-less request) and persisted onto its
+`Sandbox` row — the Phase 7 reconciler reads those columns to reap it later; this
+service itself never enforces a TTL, it only records the inputs the reconciler needs
+since it runs in a separate process/request with nothing else to read them from.
+
+Two ways to resolve a spec either way: a single ad-hoc language component (Phase 1),
+or a SandboxTemplate composed from base + multiple components (Phase 2, doc §3.4) —
+see template_render.render_template for how the latter merges component specs into
+one runnable SandboxSpec.
 """
 
 from __future__ import annotations
@@ -42,12 +58,39 @@ from app.domain.execution import (
 from app.domain.manifests import Component
 from app.extensions.hooks import RenderContext, load_hook
 from app.extensions.loader import Registry
-from app.persistence.models import Run, Sandbox
+from app.persistence.models import Run, Sandbox, Workspace
 from app.provisioners.base import Provisioner, PTYStream
+from app.provisioners.resources import parse_duration_to_seconds
 from app.services.credentials import DbCredentials
+from app.services.pool_manager import PoolManager
 from app.services.template_render import RenderedTemplateSpec, render_template
+from app.services.weight_class_scheduler import WeightClassScheduler
+from app.services.workspace_service import WorkspaceService
 
 logger = get_logger(__name__)
+
+
+def build_ad_hoc_spec(registry: Registry, component: Component) -> SandboxSpec:
+    """Resolves a single language/tool component into a runnable `SandboxSpec` — the
+    same shape `SandboxService._build_spec` uses for an ad-hoc (template-less)
+    `execute()`/`create_sandbox()` request. Standalone (not a method) so the Phase 7
+    reconciler can build the exact same spec for pool replenishment (doc §4.3)
+    without needing a full `SandboxService` instance."""
+    runtime = component.spec.runtime
+    access = component.spec.access
+    return SandboxSpec(
+        image=registry.resolve_component_image(component),
+        command=["sleep", "infinity"],  # acquire() always launches the idle keep-alive
+        workdir=access.filesystem.workdir,
+        writable_paths=list(access.filesystem.writablePaths),
+        read_only_root_filesystem=access.filesystem.readOnlyRootFilesystem,
+        resources=ResourceSpec(cpu=runtime.resources.limits.cpu, memory=runtime.resources.limits.memory),
+        weight_class=WeightClass(runtime.weightClass),
+        wall_clock_seconds=access.limits.wallClockSeconds,
+        max_output_bytes=access.limits.outputBytes,
+        max_processes=access.limits.processes,
+        labels={"io.kubesandbox.component": component.key},
+    )
 
 
 @dataclass
@@ -60,12 +103,36 @@ class _ResolvedSpec:
     against — the main-tool component matching the requested language."""
     sidecar_components: list[Component] = field(default_factory=list)
     sidecar_credentials: dict[str, DbCredentials] = field(default_factory=dict)
+    ttl_idle: str = ""
+    ttl_max: str = ""
+    """Doc §3.4 duration strings ("15m", "2h") off the resolved SandboxTemplate, if
+    any — empty for an ad-hoc (template-less) request, in which case the service falls
+    back to its own configured defaults (see `_resolve_ttl_seconds`)."""
 
 
 class SandboxService:
-    def __init__(self, registry: Registry, provisioner: Provisioner) -> None:
+    def __init__(
+        self,
+        registry: Registry,
+        provisioner: Provisioner,
+        *,
+        pool_manager: PoolManager | None = None,
+        default_idle_ttl_seconds: int = 900,
+        default_max_ttl_seconds: int = 7_200,
+        weight_class_scheduler: WeightClassScheduler | None = None,
+        heavy_node_selector: dict[str, str] | None = None,
+        heavy_tolerations: list[dict[str, str]] | None = None,
+        workspace_service: WorkspaceService | None = None,
+    ) -> None:
         self._registry = registry
         self._provisioner = provisioner
+        self._pool_manager = pool_manager
+        self._default_idle_ttl_seconds = default_idle_ttl_seconds
+        self._default_max_ttl_seconds = default_max_ttl_seconds
+        self._weight_class_scheduler = weight_class_scheduler or WeightClassScheduler()
+        self._heavy_node_selector = heavy_node_selector or {}
+        self._heavy_tolerations = heavy_tolerations or []
+        self._workspace_service = workspace_service
 
     def _resolve_component(self, language: str, version: str | None) -> Component:
         try:
@@ -101,21 +168,7 @@ class SandboxService:
         return self._registry.resolve_component_image(component)
 
     def _build_spec(self, component: Component) -> SandboxSpec:
-        runtime = component.spec.runtime
-        access = component.spec.access
-        return SandboxSpec(
-            image=self._resolve_image_ref(component),
-            command=["sleep", "infinity"],  # acquire() always launches the idle keep-alive
-            workdir=access.filesystem.workdir,
-            writable_paths=list(access.filesystem.writablePaths),
-            read_only_root_filesystem=access.filesystem.readOnlyRootFilesystem,
-            resources=ResourceSpec(cpu=runtime.resources.limits.cpu, memory=runtime.resources.limits.memory),
-            weight_class=WeightClass(runtime.weightClass),
-            wall_clock_seconds=access.limits.wallClockSeconds,
-            max_output_bytes=access.limits.outputBytes,
-            max_processes=access.limits.processes,
-            labels={"io.kubesandbox.component": component.key},
-        )
+        return build_ad_hoc_spec(self._registry, component)
 
     @staticmethod
     def _source_filename(component: Component) -> str:
@@ -158,20 +211,68 @@ class SandboxService:
             rendered = self._resolve_template(template)
             component = self._pick_template_component(rendered, language)
             return _ResolvedSpec(
-                spec=rendered.sandbox_spec,
+                spec=self._apply_heavy_segregation(rendered.sandbox_spec),
                 template_ref=rendered.template_key,
                 component_refs=[c.key for c in rendered.main_components],
                 component=component,
                 sidecar_components=rendered.sidecar_components,
                 sidecar_credentials=rendered.sidecar_credentials,
+                ttl_idle=rendered.ttl_idle,
+                ttl_max=rendered.ttl_max,
             )
         component = self._resolve_component(language, version)
         return _ResolvedSpec(
-            spec=self._build_spec(component),
+            spec=self._apply_heavy_segregation(self._build_spec(component)),
             template_ref=None,
             component_refs=[component.key],
             component=component,
         )
+
+    def _apply_heavy_segregation(self, spec: SandboxSpec) -> SandboxSpec:
+        """K8s-only node segregation for `heavy` sandboxes (doc §4.3) — a no-op for
+        every other weight class, and a no-op on Docker too (DockerProvisioner never
+        reads `node_selector`/`tolerations`)."""
+        if spec.weight_class != WeightClass.HEAVY or not (self._heavy_node_selector or self._heavy_tolerations):
+            return spec
+        return spec.model_copy(
+            update={"node_selector": dict(self._heavy_node_selector), "tolerations": list(self._heavy_tolerations)}
+        )
+
+    def _resolve_ttl_seconds(self, resolved: _ResolvedSpec) -> tuple[int, int]:
+        idle = parse_duration_to_seconds(resolved.ttl_idle) if resolved.ttl_idle else self._default_idle_ttl_seconds
+        maximum = parse_duration_to_seconds(resolved.ttl_max) if resolved.ttl_max else self._default_max_ttl_seconds
+        return idle, maximum
+
+    async def _acquire_for_execute(self, spec: SandboxSpec, session: AsyncSession) -> SandboxHandle:
+        """Warm-pool claim first (doc §4.3), falling back to a fresh
+        `provisioner.acquire()` on a pool miss or when pooling isn't wired up
+        (`pool_manager is None`) — identical to pre-Phase-7 behavior either way."""
+        if self._pool_manager is not None:
+            claimed = await self._pool_manager.try_claim(spec, session=session)
+            if claimed is not None:
+                return claimed
+        return await self._provisioner.acquire(spec)
+
+    @staticmethod
+    def _is_clean_run(result: BatchRunResult) -> bool:
+        """Doc §4.3: "after a batch run completes cleanly" — about the sandbox's own
+        health, not the user's program's exit code. A non-zero exit is still a clean
+        run of a perfectly healthy sandbox; a timeout or truncated output means the
+        sandbox hit a resource limit and shouldn't be trusted to go back in the pool."""
+        return not result.timed_out and not result.truncated
+
+    async def _release_or_destroy(
+        self, handle: SandboxHandle, spec: SandboxSpec, result: BatchRunResult | None, session: AsyncSession
+    ) -> None:
+        if (
+            result is not None
+            and self._is_clean_run(result)
+            and self._pool_manager is not None
+            and PoolManager.is_poolable(spec)
+        ):
+            await self._pool_manager.release(handle, spec, session=session)
+            return
+        await self._provisioner.destroy(handle)
 
     async def _provision_sidecars(
         self,
@@ -221,6 +322,7 @@ class SandboxService:
             native_ref=row.native_ref,
             created_at=row.created_at,
             sidecar_refs=row.sidecar_refs,
+            persistent=row.persistent,
         )
 
     def _sidecar_components_for_row(self, row: Sandbox) -> list[Component]:
@@ -266,34 +368,46 @@ class SandboxService:
     ) -> BatchRunResult:
         resolved = self._resolve_spec(language=language, version=version, template=template)
         batch_command = self._build_batch_command(resolved.component, code, stdin)
+        idle_ttl_seconds, max_ttl_seconds = self._resolve_ttl_seconds(resolved)
 
-        handle = await self._provisioner.acquire(resolved.spec)
+        # Held for the whole acquire->run->release/destroy lifetime, not just the
+        # acquire — doc §4.3's "must not starve light ones" means capping concurrently
+        # *running* heavy sandboxes, not just concurrent acquisitions (doc §7's local
+        # stand-in for aks-prod's real node-pool segregation; see
+        # WeightClassScheduler's own docstring for why this is Docker/local-only and
+        # scoped to execute()'s fully self-contained lifetime).
+        async with self._weight_class_scheduler.slot(resolved.spec.weight_class):
+            handle = await self._acquire_for_execute(resolved.spec, session)
 
-        sandbox_row = Sandbox(
-            id=handle.sandbox_id,
-            tenant_id=tenant_id,
-            user_id=user_id,
-            template_ref=resolved.template_ref,
-            component_refs=resolved.component_refs,
-            backend=handle.backend,
-            native_ref=handle.native_ref,
-            sidecar_refs=handle.sidecar_refs,
-            state="active",
-            weight_class=resolved.spec.weight_class.value,
-            persistent=False,
-        )
-        session.add(sandbox_row)
-        await session.flush()
+            sandbox_row = Sandbox(
+                id=handle.sandbox_id,
+                tenant_id=tenant_id,
+                user_id=user_id,
+                template_ref=resolved.template_ref,
+                component_refs=resolved.component_refs,
+                backend=handle.backend,
+                native_ref=handle.native_ref,
+                sidecar_refs=handle.sidecar_refs,
+                state="active",
+                weight_class=resolved.spec.weight_class.value,
+                persistent=False,
+                idle_ttl_seconds=idle_ttl_seconds,
+                max_ttl_seconds=max_ttl_seconds,
+            )
+            session.add(sandbox_row)
+            await session.flush()
 
-        try:
-            await self._provision_sidecars(handle, resolved.sidecar_components, resolved.sidecar_credentials)
-            result = await self._provisioner.exec_batch(handle, batch_command)
-        finally:
-            # Graceful eradication (doc §4.1): always tear down the ephemeral sandbox,
-            # whether sidecar provisioning or the run itself succeeded, failed, or
-            # timed out.
-            await self._teardown_sidecars(handle, resolved.sidecar_components)
-            await self._provisioner.destroy(handle)
+            result: BatchRunResult | None = None
+            try:
+                await self._provision_sidecars(handle, resolved.sidecar_components, resolved.sidecar_credentials)
+                result = await self._provisioner.exec_batch(handle, batch_command)
+            finally:
+                # Graceful eradication (doc §4.1): always tear down or release the
+                # ephemeral sandbox, whether sidecar provisioning or the run itself
+                # succeeded, failed, or timed out — a clean, poolable, pooling-enabled run
+                # goes back to the warm pool (doc §4.3); everything else is destroyed.
+                await self._teardown_sidecars(handle, resolved.sidecar_components)
+                await self._release_or_destroy(handle, resolved.spec, result, session)
 
         session.add(
             Run(
@@ -325,19 +439,50 @@ class SandboxService:
         language: str,
         version: str | None = None,
         template: str | None = None,
+        persistent: bool = False,
         tenant_id: str,
         user_id: str | None,
         session: AsyncSession,
     ) -> Sandbox:
         resolved = self._resolve_spec(language=language, version=version, template=template)
-        handle = await self._provisioner.acquire(resolved.spec)
+        idle_ttl_seconds, max_ttl_seconds = self._resolve_ttl_seconds(resolved)
+
+        workspace_id: str | None = None
+        if persistent:
+            if self._workspace_service is None:
+                raise KubeSandboxError("persistent workspaces are not enabled in this environment")
+            if user_id is None:
+                raise KubeSandboxError("a persistent sandbox requires an authenticated user")
+            workspace = await self._workspace_service.get_or_create(user_id, session=session)
+            if workspace.state != "active":
+                # An archived/deleted workspace's durable volume/PVC no longer exists
+                # (retention's archive step removes it right after a successful cold-
+                # storage upload, doc §10.2) — silently mounting workspace_id here
+                # would just create a fresh, EMPTY volume under the same name, not
+                # restore anything. Restoring is a deliberate, separate, potentially
+                # slow operation (WorkspaceService.restore()) — never an implicit side
+                # effect of "just create the sandbox," so this fails loudly instead.
+                raise KubeSandboxError(
+                    f"workspace {workspace.id} is {workspace.state!r}, not active — call "
+                    "WorkspaceService.restore() first if you want its data back"
+                )
+            self._workspace_service.check_quota(workspace)
+            self._workspace_service.touch(workspace)
+            workspace_id = workspace.id
+            resolved.spec = resolved.spec.model_copy(
+                update={"workspace_id": workspace.id, "workspace_size_mb": workspace.quota_mb}
+            )
+
+        handle = await self._acquire_for_execute(resolved.spec, session)
 
         try:
             await self._provision_sidecars(handle, resolved.sidecar_components, resolved.sidecar_credentials)
         except Exception:
             # Nothing's been persisted yet at this point — the caller has no id to
             # destroy this by later, so a provisioning failure must clean up here or
-            # the sandbox (and its sidecar) leaks with no way to reach it again.
+            # the sandbox (and its sidecar) leaks with no way to reach it again. Always
+            # destroy, never release to the pool: a sandbox whose own sidecar failed
+            # to provision is not a clean, poolable resource (doc §4.3).
             await self._provisioner.destroy(handle)
             raise
 
@@ -352,7 +497,10 @@ class SandboxService:
             sidecar_refs=handle.sidecar_refs,
             state="active",
             weight_class=resolved.spec.weight_class.value,
-            persistent=False,
+            persistent=persistent,
+            workspace_id=workspace_id,
+            idle_ttl_seconds=idle_ttl_seconds,
+            max_ttl_seconds=max_ttl_seconds,
         )
         session.add(sandbox_row)
         await session.commit()
@@ -400,8 +548,23 @@ class SandboxService:
         """Interactive attach (doc §5.2, Phase 4) — the WS gateway's only touchpoint
         into Provisioner-land, keeping SandboxService the sole seam that talks to a
         Provisioner directly (doc §4.2's whole point)."""
-        handle = await self._live_handle(sandbox_id, tenant_id, session)
-        return await self._provisioner.attach(handle)
+        row = await self.get_sandbox(sandbox_id, tenant_id, session)
+        if row.state == "terminated":
+            raise SandboxNotFoundError(sandbox_id)
+        await self._touch_workspace(row, session)
+        return await self._provisioner.attach(self._handle_from_row(row))
+
+    async def _touch_workspace(self, row: Sandbox, session: AsyncSession) -> None:
+        """Doc §10.2 retention is keyed off "last session activity" — a persistent
+        sandbox's own workspace must reflect real use (attach, or a batch run against
+        it), not just its creation time, or the reconciler's idle-retention sweep
+        could archive an actively-used workspace out from under a long-lived session."""
+        if row.workspace_id is None:
+            return
+        workspace = await session.get(Workspace, row.workspace_id)
+        if workspace is not None:
+            workspace.last_access_at = datetime.now(UTC)
+            await session.commit()
 
     async def _live_handle(self, sandbox_id: str, tenant_id: str, session: AsyncSession) -> SandboxHandle:
         row = await self.get_sandbox(sandbox_id, tenant_id, session)
@@ -453,6 +616,7 @@ class SandboxService:
         result = await self._provisioner.exec_batch(handle, batch_command)
 
         row.last_active_at = datetime.now(UTC)
+        await self._touch_workspace(row, session)
         session.add(
             Run(
                 sandbox_id=row.id,

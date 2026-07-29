@@ -69,6 +69,16 @@ class ProvisionerSettings(BaseModel):
     runtime_class: str | None = None  # e.g. "gvisor" on aks-prod
     kubeconfig_path: str | None = None
     namespace_prefix: str = "kubesandbox-sb-"
+    heavy_node_selector: dict[str, str] = Field(default_factory=dict)
+    """K8s-only (doc §4.3): schedules `heavy` weight-class pods onto a segregated node
+    pool via `nodeSelector`. Empty (the `local` default) means no selector is set —
+    every pod lands on whatever node kind/AKS picks, same as today. Real segregation
+    on `aks-prod` also needs a matching `heavy_tolerations` entry for whatever taint
+    that node pool carries; both are config, not code, so an admin can repoint them at
+    a real node pool without a redeploy."""
+    heavy_tolerations: list[dict[str, str]] = Field(default_factory=list)
+    """Each entry is a raw K8s Toleration dict (`key`/`operator`/`value`/`effect`) —
+    passed straight through to `V1Toleration(**entry)`."""
 
 
 class PoolSettings(BaseModel):
@@ -78,6 +88,15 @@ class PoolSettings(BaseModel):
     light_pool_size: int = 0
     standard_pool_size: int = 0
     heavy_pool_size: int = 0
+    heavy_max_concurrent: int | None = None
+    """Doc §4.3: heavy templates "must not starve light ones". On `aks-prod` that's a
+    real, separate node pool (`heavy_node_selector`/`heavy_tolerations` above); on
+    `local` there's only one Docker host, so this caps how many `heavy` sandboxes may
+    run concurrently via an in-process semaphore (doc §7's own table: "a separate
+    resource budget/queue in local"). `None` = unbounded. Only meaningful with 1
+    control-plane replica (doc §7: local always runs exactly 1) — a semaphore can't
+    cap anything cluster-wide across replicas, which is exactly why `aks-prod` uses
+    real node-pool segregation instead of this."""
 
 
 class WorkspaceSettings(BaseModel):
@@ -88,6 +107,28 @@ class WorkspaceSettings(BaseModel):
     idle_retention_days: int = 30
     archive_grace_days: int = 60
     max_lifetime_days: int = 365
+
+
+class TTLSettings(BaseModel):
+    """Sandbox idle/max TTL defaults (doc §4.1) for ad-hoc sandboxes that weren't
+    created from a SandboxTemplate — a template declares its own `spec.ttl` (doc
+    §3.4), but a bare `language=`/`version=` request (Phase 1's `execute()`/Phase 4's
+    `create_sandbox()` path) has no template to read one from."""
+
+    default_idle_seconds: int = 900  # 15m, matches templates/base-dev-lab.yaml's own default
+    default_max_seconds: int = 7_200  # 2h, ditto
+
+
+class ReconcilerSettings(BaseModel):
+    """The dedicated reconciler worker (doc §4.1, §20 Phase 7) — a separate process
+    from the API, per doc's own wording, not an in-API background task."""
+
+    interval_seconds: int = 30
+    orphan_grace_seconds: int = 120
+    """A provisioner-native resource (container/namespace) carrying a
+    `io.kubesandbox.sandbox-id` label with no matching, non-terminated `Sandbox` row is
+    an orphan — but only once it's older than this grace window, so a sandbox that's
+    mid-`acquire()` (row not committed yet) isn't mistaken for one."""
 
 
 class ExecutionLimits(BaseModel):
@@ -120,6 +161,8 @@ class Settings(BaseSettings):
     provisioner: ProvisionerSettings = Field(default_factory=ProvisionerSettings)
     pool: PoolSettings = Field(default_factory=PoolSettings)
     workspace: WorkspaceSettings = Field(default_factory=WorkspaceSettings)
+    ttl: TTLSettings = Field(default_factory=TTLSettings)
+    reconciler: ReconcilerSettings = Field(default_factory=ReconcilerSettings)
     limits: ExecutionLimits = Field(default_factory=ExecutionLimits)
     billing: BillingSettings = Field(default_factory=BillingSettings)
     auth: AuthSettings = Field(default_factory=AuthSettings)

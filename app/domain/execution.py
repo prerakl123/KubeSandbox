@@ -85,6 +85,23 @@ class SandboxSpec(BaseModel):
     max_processes: int = 128
     labels: dict[str, str] = Field(default_factory=dict)
     sidecars: list[SidecarSpec] = Field(default_factory=list)
+    workspace_id: str | None = None
+    """Set only for a persistent sandbox (doc §10.2, Phase 7) — provisioners mount a
+    durable volume/PVC keyed by this id at `workdir` instead of ephemeral tmpfs/
+    emptyDir, so the same workspace survives across that workspace's own sandbox
+    create/destroy cycles. `None` (the default, and the only value pooling/`execute()`
+    ever use) means today's ephemeral-only behavior, unchanged."""
+    workspace_size_mb: int | None = None
+    """The owning Workspace's quota (doc §10.2) — only meaningful alongside
+    `workspace_id`; sizes the Kubernetes PVC request (Docker named volumes have no
+    size cap of their own, so this is a no-op there beyond documentation)."""
+    node_selector: dict[str, str] = Field(default_factory=dict)
+    """K8s-only heavy-weight-class node segregation (doc §4.3) — ignored by
+    DockerProvisioner, which has no node concept. Populated by SandboxService from
+    `settings.provisioner.heavy_node_selector` only when `weight_class == HEAVY`."""
+    tolerations: list[dict[str, str]] = Field(default_factory=list)
+    """Raw K8s Toleration dicts matching `node_selector` above — same K8s-only,
+    heavy-only, config-driven story."""
 
 
 class SandboxHandle(BaseModel):
@@ -99,12 +116,31 @@ class SandboxHandle(BaseModel):
     (each sidecar is its own container sharing main's network namespace), or the same
     name again for Kubernetes (sidecars are just other containers in the same Pod,
     addressed by name)."""
+    persistent: bool = False
+    """True when this handle backs a persistent-workspace sandbox (Phase 7) — the only
+    thing `KubernetesProvisioner.destroy()` reads to decide whether to delete just the
+    Pod (persistent: its namespace holds the durable PVC and must survive) or the
+    whole namespace (ephemeral: today's behavior, unchanged). Docker's `destroy()`
+    doesn't need this — a named volume already survives a plain container removal
+    regardless (Docker's `v=True` on delete only reaps *anonymous* volumes)."""
 
 
 class SandboxStatus(BaseModel):
     sandbox_id: str
     state: SandboxState
     detail: str | None = None
+
+
+class NativeSandboxRef(BaseModel):
+    """One live, sandbox-labeled native resource discovered directly from the
+    provisioner backend (doc §4.1's "garbage-collects orphaned pods", Phase 7's
+    reconciler) — independent of anything in Postgres, since the whole point is
+    finding resources Postgres doesn't (or no longer) knows about."""
+
+    sandbox_id: str
+    native_ref: str
+    created_at: datetime
+    sidecar_refs: dict[str, str] = Field(default_factory=dict)
 
 
 class BatchCommand(BaseModel):

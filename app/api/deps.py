@@ -23,9 +23,27 @@ from app.persistence.models import ApiKey, Tenant, User
 from app.provisioners.base import Provisioner
 from app.services.build_manager import BuildManager
 from app.services.entitlement_service import EntitlementService
+from app.services.pool_manager import PoolManager
 from app.services.registry_service import RegistryService
 from app.services.sandbox_service import SandboxService
 from app.services.template_service import TemplateService
+from app.services.weight_class_scheduler import WeightClassScheduler
+from app.services.workspace_service import WorkspaceService
+
+_weight_class_scheduler: WeightClassScheduler | None = None
+
+
+def _get_weight_class_scheduler() -> WeightClassScheduler:
+    # Module-level singleton, not per-request: an asyncio.Semaphore's whole point here
+    # is capping concurrency *across* requests within this one process (doc §7 — local
+    # always runs exactly 1 replica, so "this process" is the whole deployment).
+    # Constructing a fresh one per request would cap nothing.
+    global _weight_class_scheduler
+    if _weight_class_scheduler is None:
+        _weight_class_scheduler = WeightClassScheduler(
+            heavy_max_concurrent=get_settings().pool.heavy_max_concurrent
+        )
+    return _weight_class_scheduler
 
 # Local-dev-only fallback identity, used only when auth.disabled (which config.py
 # refuses outside app_env=local — see app/core/config.py's model_validator).
@@ -125,15 +143,36 @@ def get_provisioner_ws(websocket: WebSocket) -> Provisioner:
     return websocket.app.state.provisioner
 
 
+def _build_sandbox_service(registry: Registry, provisioner: Provisioner) -> SandboxService:
+    settings = get_settings()
+    pool_manager = PoolManager(provisioner) if settings.pool.enabled else None
+    workspace_service = (
+        WorkspaceService(default_quota_mb=settings.workspace.default_quota_mb)
+        if settings.workspace.persistence_enabled
+        else None
+    )
+    return SandboxService(
+        registry,
+        provisioner,
+        pool_manager=pool_manager,
+        default_idle_ttl_seconds=settings.ttl.default_idle_seconds,
+        default_max_ttl_seconds=settings.ttl.default_max_seconds,
+        weight_class_scheduler=_get_weight_class_scheduler(),
+        heavy_node_selector=settings.provisioner.heavy_node_selector,
+        heavy_tolerations=settings.provisioner.heavy_tolerations,
+        workspace_service=workspace_service,
+    )
+
+
 def get_sandbox_service(
     registry: Registry = Depends(get_registry),
     provisioner: Provisioner = Depends(get_provisioner),
 ) -> SandboxService:
-    return SandboxService(registry, provisioner)
+    return _build_sandbox_service(registry, provisioner)
 
 
 def get_sandbox_service_ws(websocket: WebSocket) -> SandboxService:
-    return SandboxService(websocket.app.state.registry, websocket.app.state.provisioner)
+    return _build_sandbox_service(websocket.app.state.registry, websocket.app.state.provisioner)
 
 
 def get_entitlement_service(session: AsyncSession = Depends(get_session)) -> EntitlementService:

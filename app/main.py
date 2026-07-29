@@ -12,20 +12,7 @@ from app.api.v1.execute import router as execute_router
 from app.api.v1.health import router as health_router
 from app.api.v1.sandboxes import router as sandboxes_router
 from app.api.v1.templates import router as templates_router
-from app.cloud.registry import (
-    ACRRegistryProvider,
-    AWSImageRegistryProvider,
-    GCPImageRegistryProvider,
-    ImageRegistryProvider,
-    LocalImageStore,
-)
-from app.cloud.storage import (
-    AWSObjectStorageProvider,
-    AzureBlobStorageProvider,
-    GCPObjectStorageProvider,
-    MinIOStorageProvider,
-    ObjectStorageProvider,
-)
+from app.core.bootstrap import build_image_registry_provider, build_object_storage_provider, build_provisioner
 from app.core.config import get_settings
 from app.core.errors import (
     BuildNotFoundError,
@@ -37,13 +24,10 @@ from app.core.errors import (
     SandboxNotFoundError,
     TemplateNotFoundError,
 )
-from app.core.config import Settings
 from app.core.logging import configure_logging, get_logger
 from app.extensions.loader import load_registry
 from app.persistence.db import get_session_factory
 from app.persistence.redis import build_redis_client
-from app.provisioners.docker import DockerProvisioner
-from app.provisioners.kubernetes import KubernetesProvisioner
 from app.services.build_manager import BuildManager
 from app.services.entitlement_service import EntitlementService
 from app.streaming.ws_gateway import router as ws_router
@@ -124,45 +108,6 @@ _TAGS_METADATA = [
 ]
 
 
-async def _build_provisioner(settings: Settings):
-    backend = settings.provisioner.backend
-    if backend == "docker":
-        return DockerProvisioner()
-    if backend == "kubernetes":
-        return await KubernetesProvisioner.create(
-            kubeconfig_path=settings.provisioner.kubeconfig_path,
-            namespace_prefix=settings.provisioner.namespace_prefix,
-            runtime_class=settings.provisioner.runtime_class,
-        )
-    raise ValueError(f"unknown provisioner backend: {backend!r}")
-
-
-def _build_image_registry_provider(settings: Settings) -> ImageRegistryProvider:
-    provider = settings.image_registry.provider
-    if provider == "local":
-        return LocalImageStore(settings.image_registry)
-    if provider == "acr":
-        return ACRRegistryProvider(settings.image_registry)
-    if provider == "aws":
-        return AWSImageRegistryProvider()
-    if provider == "gcp":
-        return GCPImageRegistryProvider()
-    raise ValueError(f"unknown image_registry provider: {provider!r}")
-
-
-def _build_object_storage_provider(settings: Settings) -> ObjectStorageProvider:
-    provider = settings.object_storage.provider
-    if provider == "minio":
-        return MinIOStorageProvider(settings.object_storage)
-    if provider == "azure_blob":
-        return AzureBlobStorageProvider(settings.object_storage)
-    if provider == "aws":
-        return AWSObjectStorageProvider()
-    if provider == "gcp":
-        return GCPObjectStorageProvider()
-    raise ValueError(f"unknown object_storage provider: {provider!r}")
-
-
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     settings = get_settings()
@@ -170,10 +115,10 @@ async def lifespan(app: FastAPI):
     logger.info("startup", app_env=settings.app_env, provisioner=settings.provisioner.backend)
 
     app.state.registry = load_registry()
-    app.state.provisioner = await _build_provisioner(settings)
+    app.state.provisioner = await build_provisioner(settings)
     app.state.redis = build_redis_client(settings)
-    app.state.image_registry_provider = _build_image_registry_provider(settings)
-    app.state.object_storage_provider = _build_object_storage_provider(settings)
+    app.state.image_registry_provider = build_image_registry_provider(settings)
+    app.state.object_storage_provider = build_object_storage_provider(settings)
 
     # Rehydrate Registry.built_images from the latest successful Build row per
     # component (doc §8, Phase 6) — otherwise a control-plane restart would forget

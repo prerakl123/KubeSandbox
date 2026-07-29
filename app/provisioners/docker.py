@@ -22,12 +22,15 @@ import contextlib
 import json
 import time
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
 import aiodocker
 from aiodocker.exceptions import DockerContainerError, DockerError
 from aiodocker.stream import Stream
+from aiodocker.utils import clean_filters
+from aiodocker.volumes import DockerVolume
 
 from app.core.errors import ProvisionerError, SandboxNotFoundError
 from app.core.logging import get_logger
@@ -36,6 +39,7 @@ from app.domain.execution import (
     BatchCommand,
     BatchRunResult,
     FileEntry,
+    NativeSandboxRef,
     SandboxHandle,
     SandboxSpec,
     SandboxState,
@@ -124,40 +128,68 @@ class DockerProvisioner:
 
     async def acquire(self, spec: SandboxSpec) -> SandboxHandle:
         sandbox_id = str(uuid.uuid4())
+        persistent = spec.workspace_id is not None
+        volume_name = self._workspace_volume_name(spec.workspace_id) if persistent else None
+        if volume_name is not None:
+            # Docker's "create" is idempotent by name — if it already exists (a
+            # returning workspace), the API returns the existing volume unmodified
+            # rather than erroring (confirmed against the Engine API docs, not
+            # guessed; same "safe to always call" shape as recycle()'s rm -rf).
+            await self._docker.volumes.create({"Name": volume_name})
+
+        # Persistent workspaces mount a named volume at workdir instead of tmpfs — a
+        # named volume outlives this container (and destroy()'s `v=True`, which only
+        # reaps *anonymous* volumes, never a named one). Every other writable path
+        # (e.g. /tmp) stays tmpfs regardless, since only the workspace itself needs to
+        # survive across sessions.
+        tmpfs_paths = [p for p in spec.writable_paths if not (persistent and p == spec.workdir)]
+        host_config = {
+            "NanoCpus": parse_cpu_to_nanocpus(spec.resources.cpu),
+            "Memory": parse_memory_to_bytes(spec.resources.memory),
+            "PidsLimit": spec.max_processes,
+            "ReadonlyRootfs": spec.read_only_root_filesystem,
+            # Explicit uid/gid/mode: an unqualified tmpfs mount defaults to root-owned,
+            # which the sandbox's non-root uid then can't write into (confirmed
+            # against a live daemon — "Permission denied" writing into /workspace).
+            # Explicit "exec": confirmed against a live daemon that Docker silently
+            # mounts an unqualified tmpfs `noexec` — harmless for interpreted
+            # languages (they never execve anything out of /workspace or /tmp) but
+            # it breaks every compiled-language component (Go's `go run` compiles a
+            # fresh binary into $GOTMPDIR/$GOCACHE, both under /tmp, then execve's
+            # it — "permission denied" with no other symptom). Doesn't weaken
+            # containment: the sandboxed non-root user can already run arbitrary
+            # code via the language interpreter/compiler itself.
+            "Tmpfs": {
+                path: f"rw,exec,nosuid,nodev,size=1g,uid={_SANDBOX_UID},gid={_SANDBOX_UID},mode=0755"
+                for path in tmpfs_paths
+            },
+            "CapDrop": ["ALL"],
+            "SecurityOpt": ["no-new-privileges"],
+            # Default-deny is the floor everywhere (doc §12); local has no
+            # mirror/egress proxy wired up yet, so full isolation is correct here.
+            "NetworkMode": "none",
+        }
+        if volume_name is not None:
+            host_config["Mounts"] = [
+                {"Type": "volume", "Source": volume_name, "Target": spec.workdir, "ReadOnly": False}
+            ]
+            # A fresh named volume's mount point is root-owned, same problem tmpfs
+            # would have without the uid=/gid= options above — but a regular volume
+            # mount has no such option, so ownership is fixed with one root exec
+            # right after start instead (see below). CHOWN is the one capability that
+            # exec needs for it (doc §16/Phase 5's identical "capabilities gate root's
+            # own powers too" finding) — doesn't expose anything to sandboxed user
+            # code, which always execs as the non-root _SANDBOX_EXEC_USER explicitly,
+            # never as root, so this capability sits unused in its bounding set.
+            host_config["CapAdd"] = ["CHOWN"]
+
         config = {
             "Image": spec.image,
             "Cmd": ["sleep", "infinity"],
             "WorkingDir": spec.workdir,
             "Env": [f"{k}={v}" for k, v in spec.env.items()],
             "Labels": {**spec.labels, "io.kubesandbox.sandbox-id": sandbox_id},
-            "HostConfig": {
-                "NanoCpus": parse_cpu_to_nanocpus(spec.resources.cpu),
-                "Memory": parse_memory_to_bytes(spec.resources.memory),
-                "PidsLimit": spec.max_processes,
-                "ReadonlyRootfs": spec.read_only_root_filesystem,
-                # No persistent workspace support yet (Phase 7) — writable paths are
-                # tmpfs, which also makes recycle() (wipe workspace) trivial. Explicit
-                # uid/gid/mode: an unqualified tmpfs mount defaults to root-owned,
-                # which the sandbox's non-root uid then can't write into (confirmed
-                # against a live daemon — "Permission denied" writing into /workspace).
-                # Explicit "exec": confirmed against a live daemon that Docker silently
-                # mounts an unqualified tmpfs `noexec` — harmless for interpreted
-                # languages (they never execve anything out of /workspace or /tmp) but
-                # it breaks every compiled-language component (Go's `go run` compiles a
-                # fresh binary into $GOTMPDIR/$GOCACHE, both under /tmp, then execve's
-                # it — "permission denied" with no other symptom). Doesn't weaken
-                # containment: the sandboxed non-root user can already run arbitrary
-                # code via the language interpreter/compiler itself.
-                "Tmpfs": {
-                    path: f"rw,exec,nosuid,nodev,size=1g,uid={_SANDBOX_UID},gid={_SANDBOX_UID},mode=0755"
-                    for path in spec.writable_paths
-                },
-                "CapDrop": ["ALL"],
-                "SecurityOpt": ["no-new-privileges"],
-                # Default-deny is the floor everywhere (doc §12); local has no
-                # mirror/egress proxy wired up yet, so full isolation is correct here.
-                "NetworkMode": "none",
-            },
+            "HostConfig": host_config,
         }
 
         try:
@@ -174,6 +206,8 @@ class DockerProvisioner:
 
         try:
             await self._wait_container_running(container)
+            if volume_name is not None:
+                await self._fix_workspace_ownership(container, spec.workdir)
         except ProvisionerError:
             await self._force_remove(container.id)
             raise
@@ -209,7 +243,32 @@ class DockerProvisioner:
             native_ref=container.id,
             created_at=datetime.now(UTC),
             sidecar_refs=sidecar_refs,
+            persistent=persistent,
         )
+
+    @staticmethod
+    def _workspace_volume_name(workspace_id: str) -> str:
+        return f"kubesandbox-ws-{workspace_id}"
+
+    async def _fix_workspace_ownership(
+        self, container: aiodocker.docker.DockerContainer, workdir: str
+    ) -> None:
+        """A brand-new named volume's mount point is root-owned; idempotent to run on
+        every acquire() (a non-recursive chown of just the mount point itself, not
+        `-R` — cheap regardless of how much the workspace already holds, and a no-op
+        once it's already 10001:10001 from a prior session)."""
+        exec_obj = await container.exec(
+            cmd=["chown", _SANDBOX_EXEC_USER, workdir], stdout=True, stderr=True, user="0:0"
+        )
+        async with exec_obj.start(detach=False) as stream:
+            output = b""
+            while (msg := await stream.read_out()) is not None:
+                output += msg.data
+        info = await exec_obj.inspect()
+        if info.get("ExitCode"):
+            raise ProvisionerError(
+                f"failed to fix ownership of persistent workspace at {workdir}: {output!r}"
+            )
 
     async def _wait_container_running(
         self, container: aiodocker.docker.DockerContainer, *, timeout_seconds: float = 10.0
@@ -384,6 +443,166 @@ class DockerProvisioner:
         container = self._docker.containers.container(native_ref)
         with contextlib.suppress(DockerError):
             await container.delete(force=True, v=True)
+
+    # -- persistent workspace retention (doc §10.2, Phase 7) --------------------------
+
+    async def archive_workspace(self, workspace_id: str, *, archiver_image: str) -> bytes:
+        """No already-running sandbox to `exec` into by the time retention reaps an
+        idle workspace (its sandbox, if any, is always destroyed first) — so this
+        mounts the named volume read-only into a short-lived throwaway container of
+        its own, tars it via `exec` (never `get_archive`/`docker cp` — confirmed
+        unreliable against these mounts back in Phase 1, see docker.py's module
+        docstring lesson), and removes the container regardless of outcome."""
+        data, exit_code = await self._exec_against_workspace_mount(
+            workspace_id, archiver_image, lambda mount_path: ["tar", "czf", "-", "-C", mount_path, "."]
+        )
+        if exit_code:
+            raise ProvisionerError(f"failed to archive workspace {workspace_id}: tar exited {exit_code}")
+        return data
+
+    async def measure_workspace_usage(self, workspace_id: str, *, archiver_image: str) -> int:
+        """Backs `WorkspaceService.check_quota()` — without something periodically
+        calling this and writing the result into `Workspace.used_mb` (the
+        reconciler's job), quota checks run against a stale value forever. Same
+        throwaway-mount pattern as `archive_workspace`, just `du` instead of `tar`."""
+        data, exit_code = await self._exec_against_workspace_mount(
+            workspace_id, archiver_image, lambda mount_path: ["du", "-sm", mount_path]
+        )
+        if exit_code:
+            raise ProvisionerError(f"failed to measure workspace {workspace_id} usage: du exited {exit_code}")
+        return int(data.split()[0])
+
+    async def _exec_against_workspace_mount(
+        self, workspace_id: str, archiver_image: str, build_cmd: Callable[[str], list[str]]
+    ) -> tuple[bytes, int]:
+        """Shared plumbing for `archive_workspace`/`measure_workspace_usage`: mounts
+        the named volume read-only into a short-lived throwaway container, execs
+        `build_cmd(mount_path)`, and always removes the container afterward."""
+        mount_path = "/workspace-src"
+        container = await self._docker.containers.run(
+            {
+                "Image": archiver_image,
+                "Cmd": ["sleep", "infinity"],
+                "HostConfig": {
+                    "Mounts": [
+                        {
+                            "Type": "volume",
+                            "Source": self._workspace_volume_name(workspace_id),
+                            "Target": mount_path,
+                            "ReadOnly": True,
+                        }
+                    ],
+                    "NetworkMode": "none",
+                    "CapDrop": ["ALL"],
+                    "SecurityOpt": ["no-new-privileges"],
+                },
+            },
+            name=f"kubesandbox-wsmount-{uuid.uuid4().hex[:12]}",
+        )
+        try:
+            await self._wait_container_running(container)
+            exec_obj = await container.exec(cmd=build_cmd(mount_path), stdout=True, stderr=False, user="0:0")
+            chunks: list[bytes] = []
+            async with exec_obj.start(detach=False) as stream:
+                while (msg := await stream.read_out()) is not None:
+                    chunks.append(msg.data)
+            info = await exec_obj.inspect()
+            return b"".join(chunks), info.get("ExitCode") or 0
+        except DockerError as exc:
+            raise ProvisionerError(f"failed to run against workspace {workspace_id} mount: {exc}") from exc
+        finally:
+            await self._force_remove(container.id)
+
+    async def restore_workspace(self, workspace_id: str, data: bytes, *, archiver_image: str) -> None:
+        """Symmetric to `archive_workspace()`: untars `data` onto a fresh named volume
+        (created if missing, same idempotent `volumes.create()` `acquire()` uses),
+        via a throwaway container mounting it writable this time, then fixes
+        ownership exactly like a brand-new persistent sandbox's first `acquire()`
+        would. Used to un-archive a workspace back to `active` (doc §10.2)."""
+        volume_name = self._workspace_volume_name(workspace_id)
+        await self._docker.volumes.create({"Name": volume_name})
+        mount_path = "/workspace-restore"
+        container = await self._docker.containers.run(
+            {
+                "Image": archiver_image,
+                "Cmd": ["sleep", "infinity"],
+                "HostConfig": {
+                    "Mounts": [
+                        {"Type": "volume", "Source": volume_name, "Target": mount_path, "ReadOnly": False}
+                    ],
+                    "NetworkMode": "none",
+                    "CapDrop": ["ALL"],
+                    "CapAdd": ["CHOWN"],
+                    "SecurityOpt": ["no-new-privileges"],
+                },
+            },
+            name=f"kubesandbox-wsrestore-{uuid.uuid4().hex[:12]}",
+        )
+        try:
+            await self._wait_container_running(container)
+            exec_obj = await container.exec(
+                cmd=["tar", "xzf", "-", "-C", mount_path], stdin=True, stdout=True, stderr=True, user="0:0"
+            )
+            stream = exec_obj.start(detach=False)
+            output = bytearray()
+            try:
+                await stream._init()  # noqa: SLF001 — must run before write_in/half-close, see module docstring
+                await stream.write_in(data)
+                _half_close_stdin(stream)
+                while (msg := await stream.read_out()) is not None:
+                    output.extend(msg.data)
+            finally:
+                with contextlib.suppress(Exception):
+                    await stream.close()
+            info = await exec_obj.inspect()
+            if info.get("ExitCode"):
+                raise ProvisionerError(
+                    f"failed to restore workspace {workspace_id} (exit {info.get('ExitCode')}): "
+                    f"{output.decode(errors='replace')!r}"
+                )
+            await self._fix_workspace_ownership(container, mount_path)
+        except DockerError as exc:
+            raise ProvisionerError(f"failed to restore workspace {workspace_id}: {exc}") from exc
+        finally:
+            await self._force_remove(container.id)
+
+    async def delete_workspace_volume(self, workspace_id: str) -> None:
+        volume = DockerVolume(self._docker, self._workspace_volume_name(workspace_id))
+        try:
+            await volume.delete(force=True)
+        except DockerError as exc:
+            if exc.status != 404:
+                raise ProvisionerError(f"failed to delete workspace volume for {workspace_id}: {exc}") from exc
+
+    # -- orphan GC (doc §4.1, Phase 7) -------------------------------------------------
+
+    async def list_sandbox_refs(self) -> list[NativeSandboxRef]:
+        containers = await self._docker.containers.list(
+            all=True, filters=clean_filters({"label": ["io.kubesandbox.sandbox-id"]})
+        )
+        mains: dict[str, dict] = {}
+        sidecar_refs: dict[str, dict[str, str]] = {}
+        for container in containers:
+            info = await container.show()
+            labels = (info.get("Config") or {}).get("Labels") or {}
+            sandbox_id = labels.get("io.kubesandbox.sandbox-id")
+            if not sandbox_id:
+                continue
+            sidecar_name = labels.get("io.kubesandbox.sidecar")
+            if sidecar_name:
+                sidecar_refs.setdefault(sandbox_id, {})[sidecar_name] = container.id
+            else:
+                mains[sandbox_id] = info
+
+        return [
+            NativeSandboxRef(
+                sandbox_id=sandbox_id,
+                native_ref=info["Id"],
+                created_at=datetime.fromisoformat(info["Created"].replace("Z", "+00:00")),
+                sidecar_refs=sidecar_refs.get(sandbox_id, {}),
+            )
+            for sandbox_id, info in mains.items()
+        ]
 
     # -- files -------------------------------------------------------------------------
 

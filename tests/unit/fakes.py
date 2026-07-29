@@ -59,6 +59,7 @@ class FakeProvisioner:
         self.exec_calls: list[BatchCommand] = []
         self.exec_in_calls: list[tuple[str, list[str]]] = []
         self.destroyed: list[str] = []
+        self.recycled: list[str] = []
         self.put_files_calls: list[dict[str, str]] = []
         self.attached: list[str] = []
         self._batch_result = batch_result
@@ -67,6 +68,14 @@ class FakeProvisioner:
         self._tree = tree or []
         self._pty_events = pty_events or []
         self._exec_in_result = exec_in_result
+        self.raise_on_recycle: Exception | None = None
+        self.archived_workspaces: list[str] = []
+        self.deleted_workspace_volumes: list[str] = []
+        self._archive_data = b"fake-tar-bytes"
+        self.native_sandbox_refs: list = []
+        self.measured_workspaces: list[str] = []
+        self.usage_by_workspace: dict[str, int] = {}
+        self.restored_workspaces: list[tuple[str, bytes]] = []
 
     async def acquire(self, spec: SandboxSpec) -> SandboxHandle:
         self.acquired.append(spec)
@@ -120,10 +129,29 @@ class FakeProvisioner:
         return self._tree
 
     async def recycle(self, handle: SandboxHandle) -> None:
-        pass
+        if self.raise_on_recycle is not None:
+            raise self.raise_on_recycle
+        self.recycled.append(handle.sandbox_id)
 
     async def destroy(self, handle: SandboxHandle) -> None:
         self.destroyed.append(handle.sandbox_id)
+
+    async def archive_workspace(self, workspace_id: str, *, archiver_image: str) -> bytes:
+        self.archived_workspaces.append(workspace_id)
+        return self._archive_data
+
+    async def delete_workspace_volume(self, workspace_id: str) -> None:
+        self.deleted_workspace_volumes.append(workspace_id)
+
+    async def measure_workspace_usage(self, workspace_id: str, *, archiver_image: str) -> int:
+        self.measured_workspaces.append(workspace_id)
+        return self.usage_by_workspace.get(workspace_id, 0)
+
+    async def restore_workspace(self, workspace_id: str, data: bytes, *, archiver_image: str) -> None:
+        self.restored_workspaces.append((workspace_id, data))
+
+    async def list_sandbox_refs(self):
+        return self.native_sandbox_refs
 
 
 class FakeImageRegistryProvider:
@@ -158,6 +186,9 @@ class FakeObjectStorageProvider:
         if key not in self.store:
             raise KeyError(key)
         return self.store[key]
+
+    async def delete(self, key: str) -> None:
+        self.store.pop(key, None)
 
 
 class FakeBuildStrategy:

@@ -28,15 +28,30 @@ provisioner:
   backend: docker
   runtime_class: null
   namespace_prefix: "kubesandbox-sb-"
+  heavy_node_selector: {}
+  heavy_tolerations: []
 
 pool:
   enabled: false
   light_pool_size: 0
   standard_pool_size: 0
   heavy_pool_size: 0
+  heavy_max_concurrent: 2
 
 workspace:
   persistence_enabled: false
+  default_quota_mb: 10240
+  idle_retention_days: 30
+  archive_grace_days: 60
+  max_lifetime_days: 365
+
+ttl:
+  default_idle_seconds: 900
+  default_max_seconds: 7200
+
+reconciler:
+  interval_seconds: 30
+  orphan_grace_seconds: 120
 
 limits:
   default_wall_clock_seconds: 60

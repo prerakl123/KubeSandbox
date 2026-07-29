@@ -37,6 +37,11 @@ class ObjectStorageProvider(Protocol):
     """Raises KeyError if `key` doesn't exist — callers (PipelineBuildStrategy's cache
     check, HelmChartStrategy) use this to distinguish "not cached yet" from a real
     transport error, which propagates as whatever the backend client itself raises."""
+    async def delete(self, key: str) -> None: ...
+    """Permanently removes an object — doc §10.2's hard-delete step for a workspace
+    past its archive grace period (Phase 7). Idempotent: deleting an already-gone key
+    is success, not an error, matching every other teardown-style call in this
+    codebase (Provisioner.destroy(), etc.)."""
 
 
 class MinIOStorageProvider:
@@ -86,6 +91,13 @@ class MinIOStorageProvider:
             async with response["Body"] as stream:
                 return await stream.read()
 
+    async def delete(self, key: str) -> None:
+        # S3's DELETE is idempotent by design (204 whether or not the key existed) —
+        # no NoSuchKey to catch here, unlike get().
+        async with self._client() as client:
+            await self._ensure_bucket(client)
+            await client.delete_object(Bucket=self._bucket, Key=key)
+
 
 class AzureBlobStorageProvider:
     """Real Azure Blob implementation via the async `azure-storage-blob` client,
@@ -113,6 +125,16 @@ class AzureBlobStorageProvider:
                 downloader = await blob.download_blob()
                 return await downloader.readall()
 
+    async def delete(self, key: str) -> None:
+        async with DefaultAzureCredential() as credential:
+            async with BlobServiceClient(self._account_url, credential=credential) as service:
+                blob = service.get_container_client(self._container).get_blob_client(key)
+                # delete_blob() itself 404s on an already-gone blob — swallow that one
+                # case to match the idempotent-teardown contract every other delete-
+                # style call in this codebase already follows.
+                if await blob.exists():
+                    await blob.delete_blob()
+
 
 class AWSObjectStorageProvider:
     async def put(self, key: str, data: bytes) -> None:
@@ -121,10 +143,16 @@ class AWSObjectStorageProvider:
     async def get(self, key: str) -> bytes:
         raise NotImplementedError(_UNSUPPORTED)
 
+    async def delete(self, key: str) -> None:
+        raise NotImplementedError(_UNSUPPORTED)
+
 
 class GCPObjectStorageProvider:
     async def put(self, key: str, data: bytes) -> None:
         raise NotImplementedError(_UNSUPPORTED)
 
     async def get(self, key: str) -> bytes:
+        raise NotImplementedError(_UNSUPPORTED)
+
+    async def delete(self, key: str) -> None:
         raise NotImplementedError(_UNSUPPORTED)

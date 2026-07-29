@@ -52,6 +52,13 @@ class CreateSandboxRequest(BaseModel):
         description="SandboxTemplate ref ('name@version') to compose the sandbox "
         "from (doc §3.4), instead of a single ad-hoc component.",
     )
+    persistent: bool = Field(
+        default=False,
+        description="Mount the caller's durable per-user workspace (doc §10.2) at "
+        "/workspace instead of ephemeral storage — created lazily on first use, "
+        "subject to that user's quota, and never returned to a warm pool. Requires "
+        "an authenticated user and `workspace.persistence_enabled` in this environment.",
+    )
 
 
 class SandboxResponse(BaseModel):
@@ -64,6 +71,7 @@ class SandboxResponse(BaseModel):
     template_ref: str | None = Field(description="SandboxTemplate ref this sandbox was composed from, if any.")
     component_refs: list[str] = Field(description="Resolved component keys ('name@version') backing this sandbox.")
     weight_class: str = Field(description="light | standard | heavy — drives pooling/segregation (doc §4.3).")
+    persistent: bool = Field(description="Whether this sandbox mounted a durable per-user workspace (doc §10.2).")
     created_at: datetime
     last_active_at: datetime | None = Field(description="Last time a batch run or attach touched this sandbox.")
     terminated_at: datetime | None = Field(description="When this sandbox was torn down, if it has been.")
@@ -77,6 +85,7 @@ def _summarize(row: Sandbox, *, state_override: str | None = None) -> SandboxRes
         template_ref=row.template_ref,
         component_refs=list(row.component_refs or []),
         weight_class=row.weight_class,
+        persistent=row.persistent,
         created_at=row.created_at,
         last_active_at=row.last_active_at,
         terminated_at=row.terminated_at,
@@ -119,6 +128,7 @@ async def create_sandbox(
         language=body.language,
         version=body.version,
         template=body.template,
+        persistent=body.persistent,
         tenant_id=principal.tenant_id,
         user_id=principal.user_id,
         session=session,

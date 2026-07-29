@@ -27,7 +27,7 @@ from app.domain.execution import (
     SandboxState,
     SidecarSpec,
 )
-from app.provisioners.kubernetes import KubernetesProvisioner
+from app.provisioners.kubernetes import _POD_NAME, KubernetesProvisioner
 
 
 def make_spec(**overrides) -> SandboxSpec:
@@ -211,6 +211,205 @@ async def test_acquire_wires_runtime_class_when_configured(provisioner):
 
     pod_call = provisioner._core_v1.create_namespaced_pod.call_args
     assert pod_call.args[1].spec.runtime_class_name == "gvisor"
+
+
+async def test_acquire_leaves_node_selector_and_tolerations_unset_by_default(provisioner):
+    provisioner._core_v1.read_namespaced_pod.return_value = _running_pod()
+
+    await provisioner.acquire(make_spec())
+
+    pod_spec = provisioner._core_v1.create_namespaced_pod.call_args.args[1].spec
+    assert pod_spec.node_selector is None
+    assert pod_spec.tolerations is None
+
+
+async def test_acquire_wires_heavy_node_selector_and_tolerations_when_set(provisioner):
+    provisioner._core_v1.read_namespaced_pod.return_value = _running_pod()
+
+    await provisioner.acquire(
+        make_spec(
+            node_selector={"kubesandbox.io/workload-class": "heavy"},
+            tolerations=[{"key": "kubesandbox.io/heavy", "operator": "Equal", "value": "true", "effect": "NoSchedule"}],
+        )
+    )
+
+    pod_spec = provisioner._core_v1.create_namespaced_pod.call_args.args[1].spec
+    assert pod_spec.node_selector == {"kubesandbox.io/workload-class": "heavy"}
+    assert len(pod_spec.tolerations) == 1
+    assert pod_spec.tolerations[0].key == "kubesandbox.io/heavy"
+    assert pod_spec.tolerations[0].effect == "NoSchedule"
+
+
+async def test_acquire_persistent_creates_deterministic_namespace_and_pvc(provisioner):
+    provisioner._core_v1.read_namespace.side_effect = ApiException(status=404)
+    provisioner._core_v1.read_namespaced_pod.return_value = _running_pod()
+
+    handle = await provisioner.acquire(make_spec(workspace_id="ws-abc", workspace_size_mb=2048))
+
+    assert handle.native_ref == "kubesandbox-sb-ws-ws-abc"
+    assert handle.persistent is True
+
+    provisioner._core_v1.create_namespace.assert_awaited_once()
+    ns_call = provisioner._core_v1.create_namespace.call_args
+    assert ns_call.args[0].metadata.name == "kubesandbox-sb-ws-ws-abc"
+
+    pvc_call = provisioner._core_v1.create_namespaced_persistent_volume_claim.call_args
+    assert pvc_call.args[0] == "kubesandbox-sb-ws-ws-abc"
+    pvc_spec = pvc_call.args[1].spec
+    assert pvc_spec.resources.requests == {"storage": "2048Mi"}
+    assert pvc_spec.access_modes == ["ReadWriteOnce"]
+
+    pod_spec = provisioner._core_v1.create_namespaced_pod.call_args.args[1].spec
+    workspace_volume = next(v for v in pod_spec.volumes if v.name == "vol-workspace")
+    assert workspace_volume.persistent_volume_claim.claim_name == "workspace-pvc"
+    assert workspace_volume.empty_dir is None
+    # /tmp still gets a plain emptyDir — only workdir is durable.
+    tmp_volume = next(v for v in pod_spec.volumes if v.name == "vol-tmp")
+    assert tmp_volume.empty_dir is not None
+    assert tmp_volume.persistent_volume_claim is None
+
+
+async def test_acquire_persistent_reuses_existing_namespace_without_recreating_it(provisioner):
+    provisioner._core_v1.read_namespace.return_value = SimpleNamespace()  # already exists
+    provisioner._core_v1.read_namespaced_pod.side_effect = [
+        ApiException(status=404),  # _ensure_no_stale_pod: none present
+        _running_pod(),  # _wait_ready: pod just created is up
+    ]
+
+    handle = await provisioner.acquire(make_spec(workspace_id="ws-abc"))
+
+    assert handle.persistent is True
+    provisioner._core_v1.create_namespace.assert_not_called()
+    provisioner._core_v1.create_namespaced_persistent_volume_claim.assert_not_called()
+    provisioner._core_v1.create_namespaced_pod.assert_awaited_once()
+
+
+async def test_acquire_persistent_removes_stale_pod_before_creating_fresh_one(provisioner):
+    provisioner._core_v1.read_namespace.return_value = SimpleNamespace()
+    provisioner._core_v1.read_namespaced_pod.side_effect = [
+        SimpleNamespace(),  # _ensure_no_stale_pod: a leftover pod exists
+        ApiException(status=404),  # _wait_pod_gone: confirmed removed
+        _running_pod(),  # _wait_ready: the freshly created pod
+    ]
+
+    await provisioner.acquire(make_spec(workspace_id="ws-abc"))
+
+    provisioner._core_v1.delete_namespaced_pod.assert_awaited_once_with(_POD_NAME, "kubesandbox-sb-ws-ws-abc")
+
+
+async def test_acquire_persistent_failure_only_deletes_pod_not_namespace(provisioner):
+    provisioner._core_v1.read_namespace.side_effect = ApiException(status=404)
+    provisioner._core_v1.create_namespaced_pod.side_effect = ApiException(status=500, reason="boom")
+
+    with pytest.raises(ProvisionerError):
+        await provisioner.acquire(make_spec(workspace_id="ws-abc"))
+
+    provisioner._core_v1.delete_namespace.assert_not_called()
+    provisioner._core_v1.delete_namespaced_pod.assert_awaited_once()
+
+
+async def test_archive_workspace_creates_archiver_pod_tars_and_cleans_up(provisioner):
+    provisioner._core_v1.read_namespaced_pod.return_value = _running_pod()
+    conn = FakeWsConn(
+        [
+            FakeWsMessage(WSMsgType.BINARY, bytes([1]) + b"tar-bytes"),
+            FakeWsMessage(WSMsgType.BINARY, bytes([3]) + b'{"metadata":{},"status":"Success"}'),
+        ]
+    )
+    provisioner._exec_v1.connect_get_namespaced_pod_exec.return_value = FakeWsCtx(conn)
+
+    data = await provisioner.archive_workspace("ws-abc", archiver_image="kubesandbox/base:1.0")
+
+    assert data == b"tar-bytes"
+    pod_call = provisioner._core_v1.create_namespaced_pod.call_args
+    assert pod_call.args[0] == "kubesandbox-sb-ws-ws-abc"
+    pod = pod_call.args[1]
+    assert pod.metadata.name == _POD_NAME
+    assert pod.spec.containers[0].image == "kubesandbox/base:1.0"
+    assert pod.spec.containers[0].security_context.read_only_root_filesystem is True
+    assert pod.spec.volumes[0].persistent_volume_claim.claim_name == "workspace-pvc"
+
+    provisioner._core_v1.delete_namespaced_pod.assert_awaited_once_with(_POD_NAME, "kubesandbox-sb-ws-ws-abc")
+    provisioner._core_v1.delete_namespace.assert_not_called()
+
+
+async def test_archive_workspace_raises_on_nonzero_tar_exit(provisioner):
+    provisioner._core_v1.read_namespaced_pod.return_value = _running_pod()
+    conn = FakeWsConn(
+        [
+            FakeWsMessage(
+                WSMsgType.BINARY,
+                bytes([3]) + b'{"metadata":{},"status":"Failure","details":{"causes":[{"message":"1"}]}}',
+            )
+        ]
+    )
+    provisioner._exec_v1.connect_get_namespaced_pod_exec.return_value = FakeWsCtx(conn)
+
+    with pytest.raises(ProvisionerError, match="failed to archive workspace"):
+        await provisioner.archive_workspace("ws-abc", archiver_image="kubesandbox/base:1.0")
+
+    # Cleanup still runs even on failure.
+    provisioner._core_v1.delete_namespaced_pod.assert_awaited_once_with(_POD_NAME, "kubesandbox-sb-ws-ws-abc")
+
+
+async def test_measure_workspace_usage_parses_du_output(provisioner):
+    provisioner._core_v1.read_namespaced_pod.return_value = _running_pod()
+    conn = FakeWsConn(
+        [
+            FakeWsMessage(WSMsgType.BINARY, bytes([1]) + b"42\t/workspace-mount\n"),
+            FakeWsMessage(WSMsgType.BINARY, bytes([3]) + b'{"metadata":{},"status":"Success"}'),
+        ]
+    )
+    provisioner._exec_v1.connect_get_namespaced_pod_exec.return_value = FakeWsCtx(conn)
+
+    usage_mb = await provisioner.measure_workspace_usage("ws-abc", archiver_image="kubesandbox/base:1.0")
+
+    assert usage_mb == 42
+    provisioner._core_v1.delete_namespaced_pod.assert_awaited_once_with(_POD_NAME, "kubesandbox-sb-ws-ws-abc")
+
+
+async def test_restore_workspace_reuses_existing_namespace(provisioner):
+    provisioner._core_v1.read_namespace.return_value = SimpleNamespace()  # already exists
+    provisioner._core_v1.read_namespaced_pod.return_value = _running_pod()
+    conn = FakeWsConn([FakeWsMessage(WSMsgType.BINARY, bytes([3]) + b'{"metadata":{},"status":"Success"}')])
+    provisioner._exec_v1.connect_get_namespaced_pod_exec.return_value = FakeWsCtx(conn)
+
+    await provisioner.restore_workspace("ws-abc", b"tar-payload", archiver_image="kubesandbox/base:1.0")
+
+    provisioner._core_v1.create_namespace.assert_not_called()
+    pod = provisioner._core_v1.create_namespaced_pod.call_args.args[1]
+    assert pod.spec.containers[0].volume_mounts[0].read_only is False
+    assert pod.spec.volumes[0].persistent_volume_claim.read_only is False
+
+
+async def test_restore_workspace_recreates_missing_namespace_first(provisioner):
+    provisioner._core_v1.read_namespace.side_effect = ApiException(status=404)
+    provisioner._core_v1.read_namespaced_pod.return_value = _running_pod()
+    conn = FakeWsConn([FakeWsMessage(WSMsgType.BINARY, bytes([3]) + b'{"metadata":{},"status":"Success"}')])
+    provisioner._exec_v1.connect_get_namespaced_pod_exec.return_value = FakeWsCtx(conn)
+
+    await provisioner.restore_workspace("ws-abc", b"tar-payload", archiver_image="kubesandbox/base:1.0")
+
+    provisioner._core_v1.create_namespace.assert_awaited_once()
+    provisioner._core_v1.create_namespaced_persistent_volume_claim.assert_awaited_once()
+
+
+async def test_delete_workspace_volume_deletes_the_whole_persistent_namespace(provisioner):
+    await provisioner.delete_workspace_volume("ws-abc")
+
+    provisioner._core_v1.delete_namespace.assert_awaited_once_with("kubesandbox-sb-ws-ws-abc")
+
+
+async def test_destroy_persistent_only_deletes_pod_not_namespace(provisioner):
+    handle = SandboxHandle(
+        sandbox_id="s1", backend="kubernetes", native_ref="kubesandbox-sb-ws-ws-abc",
+        created_at=datetime.now(UTC), persistent=True,
+    )
+
+    await provisioner.destroy(handle)
+
+    provisioner._core_v1.delete_namespaced_pod.assert_awaited_once_with(_POD_NAME, "kubesandbox-sb-ws-ws-abc")
+    provisioner._core_v1.delete_namespace.assert_not_called()
 
 
 async def test_acquire_cleans_up_namespace_on_pod_creation_failure(provisioner):
