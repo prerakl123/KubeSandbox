@@ -6,7 +6,7 @@ of the roadmap table, not a re-statement of it — each phase's one-line "delive
 below is exploded into the actual concrete pieces of work it implies across the rest of
 the doc (§3–§19).
 
-**Summary: 84 / 103 items complete:**
+**Summary: 90 / 103 items complete:**
 - Phase 0 (20/21)
 - Phase 1 (21/21, fully live-verified)
 Phase 1 is no longer just "built" — it has been driven end-to-end against real Docker,
@@ -73,7 +73,37 @@ verification" and "Known environment limitation" sections). One bug found (a
 mocked-client unit test caught a fresh-vs-reused-namespace logic error in
 `KubernetesProvisioner.acquire()`'s persistent path before it ever reached a live
 cluster) — see Phase 7's "Bugs found and fixed during live verification".
-- Phases 8–9 and the cross-cutting section remain 0% started.
+- Phase 8 (6/6, implemented, unit-tested — 284 total tests passing — and
+live-verified against real Postgres/HTTP, including the doc §13 exit criterion's
+blocking half end to end)
+`BillingService` dispatches to `CreditBillingStrategy` (hard pre-authorization
+against a wallet balance, real-time deduction) or `PayAsYouGoBillingStrategy`
+(advisory spend-cap only, invoice-draft `settle()`), both wired into
+`SandboxService.execute()`/`create_sandbox()`/`destroy_sandbox()` and three admin
+endpoints (`PATCH .../billing`, `POST .../pricing-rules`, `POST .../credit`). Opt-in
+via `billing.enabled` (false by default in both env profiles — see Phase 8's own
+section for why) so existing behavior is unchanged unless explicitly turned on.
+Initial pass (262 tests) live-verified `BillingService` directly against real
+Postgres and, over real HTTP with billing enabled, the blocking half of doc §13's
+exit criterion (`POST /v1/execute` returned a real 429 for an unfunded wallet, then
+passed cleanly once funded) — the successful-run half stopped at the same
+pre-existing snap-Docker/AppArmor host limitation Phases 6/7 already documented,
+unrelated to this phase's own code. A same-session follow-up (prompted by an
+explicit "was this a real constraint, or deferred scope?" question) then closed
+every "known scope boundary" that wasn't a genuine blocker: `BillingService.
+adjust_credit()` + `POST .../credit` (wallet top-up), `destroy_sandbox()` now bills
+a non-ephemeral sandbox's real lifetime (closing `create_sandbox()`'s own gap and,
+for free, TTL-reaped sandboxes too, since the reconciler already routes through
+`destroy_sandbox()`), and a new reconciler job prices `storage_gb_day` for active
+workspaces — plus a net-new, not-in-doc-§13 credit/overusage *request* workflow
+(`credit_requests` table + migration, self-service `POST/GET
+/v1/billing/credit-requests`, admin `GET`/`PATCH /v1/admin/credit-requests`) so a
+blocked tenant has a real path forward besides an admin acting out of band. Two
+real bugs found and fixed during this follow-up (a `Decimal`/`float` arithmetic
+crash in `adjust_credit()`, and `destroy_sandbox()` not threading the reconciler's
+own tick timestamp through) — see Phase 8's own "Follow-up" section for full detail
+on both passes.
+- Phase 9 and the cross-cutting section remain 0% started.
 
 ---
 
@@ -1401,16 +1431,312 @@ switch from `snap install docker` to the official `apt`-based Docker Engine inst
 
 ---
 
-## Phase 8 — Billing (0/6)
+## Phase 8 — Billing (6/6, implemented, unit-tested — 284 total tests passing —
+and live-verified against real Postgres/HTTP for the blocking half of the exit
+criterion; the successful-run half stops at the same pre-existing, unresolved
+host limitation Phases 6/7 already documented. Includes a same-session follow-up
+that closed every non-blocking known scope boundary, plus a new credit-request
+workflow — see the "Follow-up" section below the original 6 items.)
 
-- [ ] `BillingService`
-- [ ] `CreditBillingStrategy`
-- [ ] `PayAsYouGoBillingStrategy`
-- [ ] `PATCH /v1/admin/tenants/{id}/billing`
-- [ ] `POST /v1/admin/pricing-rules`
-- [ ] Usage-event recording wired into `SandboxService.execute()` — every billing/usage
-      table (`billing_accounts`, `pricing_rules`, `usage_records`, `credit_wallets`,
-      `credit_ledger`, `invoices`) exists from Phase 0; none of them are ever written to
+- [x] `BillingService` (`app/services/billing_service.py`) — resolves a tenant's
+      `BillingAccount.mode` (creating one, defaulted to `billing.default_mode`, on
+      first use — same lazy-`get_or_create` shape as `WorkspaceService.get_or_create`)
+      and dispatches `authorize()`/`record_usage()`/`settle()` to the matching
+      `CostingStrategy`. Config-only constructor, session passed per call (the
+      `WorkspaceService` pattern, not `EntitlementService`'s session-in-constructor
+      one) since the same instance is reused across both the admin endpoints and
+      `SandboxService`'s call sites. Opt-in like `PoolManager`/`WorkspaceService`
+      before it: `app/api/deps.py::_build_sandbox_service` only constructs one (and
+      passes it to `SandboxService`) when `settings.billing.enabled` is true — false
+      by default in both `local.yaml`/`aks-prod.yaml`, since a fresh credit-mode
+      tenant's zero wallet balance would otherwise block every sandbox creation the
+      instant this was silently turned on. Also provides `set_mode()` and
+      `add_pricing_rule()`, the service-layer primitives behind the two admin
+      endpoints below.
+- [x] `CreditBillingStrategy` — `authorize()` prices a `UsageEstimate` against the
+      latest applicable `pricing_rules` row per resource type and hard-blocks (doc
+      §13: "before any resource is provisioned") when the estimated cost exceeds
+      `CreditWallet.balance`. `record_usage()` prices the actual `UsageEvent`,
+      deducts it from the wallet in real time, and writes a `CreditLedgerEntry` audit
+      row (`delta`, `reason`, `balance_after`) per deduction. `settle()` still
+      produces a draft `Invoice` for reporting parity with PAYG (doc: "both
+      strategies write to usage_records so reporting is uniform"), even though a
+      credit tenant has already paid via the wallet in real time — not a bill on top
+      of that.
+- [x] `PayAsYouGoBillingStrategy` — `authorize()` is advisory-only (doc §13.2): with
+      no `spend_cap` set (the default), always authorized; with one set, blocks only
+      when this calendar-month-to-date's `usage_records` cost plus the new estimate
+      would exceed it. `record_usage()` writes `usage_records` only — PAYG tenants
+      have no wallet. `settle()` is genuinely "the real work" here: sums
+      `usage_records` over a `BillingPeriod` into a draft `Invoice`
+      (`status="draft"`) via the same `_generate_invoice_draft` helper
+      `CreditBillingStrategy.settle()` calls, so both modes share one code path for
+      it. Actual payment collection remains a deliberate stub everywhere (doc §13) —
+      nothing beyond a draft `Invoice` row is ever produced.
+- [x] `PATCH /v1/admin/tenants/{id}/billing` (`app/api/v1/admin.py`) — `{mode,
+      spend_cap?}` exactly per doc §17's own illustrative body; admin-only, creates the
+      tenant's `BillingAccount` if it doesn't exist yet.
+- [x] `POST /v1/admin/pricing-rules` — `{resource_type, unit_cost, currency?,
+      effective_from?}`; admin-only; always appends a new versioned row rather than
+      replacing any existing rule for the same `resource_type` (doc §10.1's own
+      "multiple rules... coexist" framing) — `effective_from` lets an admin schedule a
+      future rate change without disturbing the currently-active one.
+- [x] Usage-event recording wired into `SandboxService.execute()` — `_authorize_billing()`
+      (a shared helper also used by `create_sandbox()`, see below) runs before
+      `acquire()`, pricing a `UsageEstimate` derived from the resolved spec's
+      resource *limits* × the run's `wall_clock_seconds` cap (doc §13's own
+      pre-authorization framing is a ceiling check, not a promise of the final bill).
+      After the run completes, `usage_events_for_run()` turns the resolved spec's
+      resource limits × the run's *actual* `duration_ms` into `cpu_second`/
+      `memory_gb_second` (+ `db_hour` per composed DB sidecar) `UsageEvent`s, each
+      tied back to the real, already-flushed `Sandbox`/`Run` row ids, and
+      `BillingService.record_usage()` prices/persists them in the same transaction as
+      the `Run` row and the sandbox's `state="terminated"` flip. A no-op end to end
+      (zero extra queries beyond the existing flush) whenever `billing_service is
+      None`, reproducing every pre-Phase-8 test's exact behavior unchanged.
+
+### Prerequisites this phase needed but the checklist didn't spell out
+
+- `app/domain/billing.py` — `UsageEstimate`/`UsageEvent`/`AuthResult`/`BillingPeriod`
+  dataclasses + the `CostingStrategy` Protocol (doc §13's own shown signatures,
+  extended with an explicit `session` keyword — every other service in this codebase
+  threads a caller-supplied `AsyncSession` rather than owning one — and an `account`
+  keyword so a strategy never has to re-query the `BillingAccount` row
+  `BillingService` already resolved).
+- `BillingAuthorizationError` (`app/core/errors.py`) — a `QuotaExceededError`
+  subclass, not a new top-level error type: doc §11 itself groups "credit
+  balance/spend cap" alongside quotas ("quotas (max concurrent sandboxes, cpu/mem,
+  monthly minutes, credit balance/spend cap) enforced by QuotaService/BillingService
+  before create"), and the subclass inherits the existing 429 mapping in
+  `app/main.py` with zero new exception-handler registration.
+- `BillingSettings.enabled` (`app/core/config.py`) — the doc's own settings model only
+  had `default_mode`; an explicit opt-in flag was needed for the same reason
+  `pool.enabled`/`workspace.persistence_enabled` needed one before it — see the
+  `BillingService` bullet above for why defaulting this to true anywhere would have
+  been an immediate regression.
+- `estimate_usage_for_spec()`/`usage_events_for_run()`/`db_sidecar_count()`
+  (`app/services/billing_service.py`) — turn a `SandboxSpec` + a duration into
+  `UsageEstimate`/`UsageEvent`s; shared by both `SandboxService` call sites so
+  pre-authorization and actual recording are computed identically.
+
+### Known scope boundaries (Phase 8)
+
+- ~~No admin endpoint funds a tenant's credit wallet~~ — **closed** in the same
+  session, once asked whether this was a real constraint or just deferred scope: see
+  "Follow-up" below for `BillingService.adjust_credit()` +
+  `POST /v1/admin/tenants/{id}/credit`, and the credit/overusage *request* workflow
+  built on top of it.
+- ~~Only `execute()`'s usage is ever recorded — `create_sandbox()`/`run_in_sandbox()`
+  are authorized but never billed for their actual consumption~~ — **closed**: see
+  "Follow-up" below for `destroy_sandbox()` now billing a non-ephemeral sandbox's real
+  `created_at -> terminated_at` span.
+- ~~`storage_gb_day` (persistent workspaces) is never emitted~~ — **closed**: see
+  "Follow-up" below for the reconciler's new `bill_workspace_storage()` job.
+- **Usage is priced by configured resource *limits* × wall-clock duration, not real
+  per-container cgroup measurement.** No metrics pipeline exists yet to measure
+  actual CPU/memory consumption (that's Prometheus wiring, roadmap Phase 9) — the
+  same "honest, not literal telemetry" flag Phase 5 already gave `maxDbSizeMB`. Still
+  open — genuinely needs Phase 9's metrics pipeline, not just more service-layer code.
+- **PAYG's "billing cycle" is the calendar month to date**, with no `Invoice`/cycle-
+  boundary bookkeeping to anchor it more precisely — simple, and not something an
+  admin can misconfigure, but not doc-specified either. Still open.
+- **No pricing rule for a resource type prices it as free (cost 0), logged rather
+  than raised.** Deliberate: an admin who hasn't configured pricing yet shouldn't
+  have every sandbox creation start failing with an opaque error the moment
+  `billing.enabled` flips true — but it does mean an unpriced resource type silently
+  contributes nothing to any bill until priced. Still open, by design.
+
+### Follow-up: closing the three scope boundaries above, plus a new credit-request workflow
+
+Prompted by an explicit question — "was this a real constraint, or deferred scope?" —
+for all three; none were a genuine blocker (unlike, say, the AppArmor host issue or
+missing Azure credentials), so all three were closed in the same session, plus a new,
+not-in-doc-§13 feature the user asked for on top: a self-service "request more
+credit/overusage headroom" workflow.
+
+- **Wallet top-up**: `BillingService.adjust_credit()` (`app/services/billing_service.py`)
+  — the only way to fund/correct a `CreditWallet` balance short of a direct DB
+  write, writing a `CreditLedgerEntry` per call (positive `delta` = top-up, negative =
+  deduction/correction). Exposed as `POST /v1/admin/tenants/{id}/credit`
+  (`{delta, reason?}`), admin-only.
+- **Non-ephemeral usage billed for real, at `destroy_sandbox()` time**: a new
+  `SandboxService._spec_resources_for_row()` re-derives a persisted sandbox's
+  `ResourceSpec` the same way `_sidecar_components_for_row()` already re-derives its
+  sidecar Components (ad-hoc: `build_ad_hoc_spec(component).resources`; templated:
+  `render_template(...).sandbox_spec.resources`). `destroy_sandbox()` now bills
+  `usage_events_for_run()` against `now - row.created_at` before flipping the row to
+  `terminated`. This required refactoring `estimate_usage_for_spec()`/
+  `usage_events_for_run()` to take a bare `ResourceSpec` instead of a full
+  `SandboxSpec` (all either ever read) — `destroy_sandbox()` has no image/command/etc.
+  to reconstruct for an already-persisted sandbox, only its resource limits.
+  `destroy_sandbox()` also gained an optional `now: datetime | None` parameter so the
+  reconciler's `reap_expired_sandboxes()` can pass its own tick timestamp through —
+  every sandbox reaped in one tick bills against the same `now` instead of each
+  hitting a slightly different real wall-clock read (a real bug caught by a unit
+  test *before* this even needed live verification — see "Bugs found" below). This
+  also closes TTL-reaped sandboxes for free: `reap_expired_sandboxes()` already
+  routed through `destroy_sandbox()` since Phase 7, so no separate reconciler wiring
+  was needed for that path.
+- **`storage_gb_day` wired into the reconciler**: a new `bill_workspace_storage()`
+  job (`app/reconciler/loop.py`, the module docstring's new job #4) prices every
+  `active` `Workspace`'s current `used_mb` against the tick interval as GB-days —
+  `(used_mb / 1024) * (interval_seconds / 86_400)` — once per tick, skipping
+  never-measured (`used_mb == 0`) workspaces. `Workspace` has no `tenant_id` column of
+  its own (only `user_id`); resolved via `User.tenant_id` rather than adding one,
+  since nothing else needs it. Deliberately NOT gated on "no live sandbox" the way
+  `sweep_retention()`'s own `used_mb` *refresh* is (that gate exists to avoid a risky
+  extra measurement pod on a `ReadWriteOnce` PVC, doc §10.2/Phase 7) — storage cost
+  accrues whether or not a sandbox is currently attached, so billing against
+  whatever `used_mb` last read is correct either way. `run_tick()` now also
+  constructs a `BillingService` from `settings.billing.*`, gated on
+  `billing.enabled` exactly like every other opt-in reconciler job.
+- **New: a credit/overusage request workflow** (not in doc §13's original design —
+  added because a tenant that just hit `BillingAuthorizationError` had no path
+  forward besides an admin acting out of band). A new `credit_requests` table
+  (Alembic revision `4657775fb046`, autogenerated and verified to upgrade **and**
+  downgrade cleanly against real Postgres — the first migration in this repo
+  generated against a live Postgres instance rather than a throwaway SQLite DB, since
+  one was finally available this session): `tenant_id`, `user_id`, `amount`,
+  `reason`, `status` (`pending`/`approved`/`denied`), `review_note`, `reviewed_by`,
+  `created_at`, `reviewed_at`. `BillingService.request_credit()` (validates
+  `amount > 0`, else raises), `list_credit_requests()` (tenant/status filterable), and
+  `review_credit_request()` — approving applies `amount` *before* marking the request
+  approved (so a failure applying it never leaves a request incorrectly marked
+  approved): `adjust_credit()` for a credit-mode tenant, or a `spend_cap` increase for
+  a PAYG-mode tenant (PAYG has no wallet, so a cap bump is its closest analog to "more
+  headroom"). New self-service router `app/api/v1/billing.py`:
+  `POST/GET /v1/billing/credit-requests` (any authenticated principal, scoped to
+  their own tenant — never sees another tenant's requests). New admin endpoints in
+  `app/api/v1/admin.py`: `GET /v1/admin/credit-requests` (tenant/status filterable),
+  `PATCH /v1/admin/credit-requests/{id}` (`{approve, note?}`).
+
+#### Bugs found and fixed during this follow-up
+
+1. **`adjust_credit(tenant_id, delta: float, ...)` crashed with `TypeError:
+   unsupported operand type(s) for +: 'float' and 'decimal.Decimal'`** the moment a
+   real caller (`review_credit_request()`, passing `request.amount`) handed it a
+   value read back from a `Numeric` column — SQLAlchemy returns `Decimal`, not
+   `float`, for those regardless of the ORM's declared Python type hint. Every other
+   arithmetic site in `billing_service.py` already defensively wraps a
+   Numeric-sourced value in `float(...)` before mixing it with a plain float; this
+   one didn't. Fixed at both ends: `review_credit_request()` now passes
+   `float(request.amount)`, and `adjust_credit()` itself now coerces `delta` to
+   `float` unconditionally on entry — belt-and-suspenders, since this exact class of
+   bug (a Numeric column's `Decimal` meeting a plain `float` in arithmetic) is easy to
+   reintroduce at a new call site later. Caught immediately by
+   `test_approving_a_credit_request_tops_up_a_credit_mode_wallet`, never reached live
+   verification.
+2. **`destroy_sandbox()` ignored the reconciler's own tick `now` and always read
+   real wall-clock time**, so a TTL-reaped sandbox with a deliberately old
+   `created_at` (e.g. a test backdating it to isolate a specific duration) got billed
+   for the gap between its backdated `created_at` and the *real* current time, not
+   the reconciler's simulated `now` — surfaced as an assertion off by ~210 days in
+   `test_reap_expired_sandboxes_bills_real_lifetime_usage_when_billing_enabled`
+   before this was fixed. Fixed by giving `destroy_sandbox()` an optional
+   `now: datetime | None = None` parameter (defaulting to real time when omitted,
+   unchanged for every other caller) and having `reap_expired_sandboxes()` pass its
+   own `now` through — every sandbox reaped in the same tick now bills against one
+   consistent timestamp instead of drifting across individual `datetime.now(UTC)`
+   reads.
+
+### Live verification of this follow-up
+
+- **Migration** (`4657775fb046`) applied to real Postgres, confirmed the exact
+  `credit_requests` schema via `psql \d credit_requests` (columns, FKs to
+  `tenants`/`users`), then downgraded and re-upgraded cleanly (Phase 0's own
+  verification pattern) — table gone after downgrade, back after re-upgrade.
+- **The full credit-request workflow driven over real HTTP** end to end
+  (`KUBESANDBOX_BILLING__ENABLED=true uv run uvicorn app.main:app`, real Postgres):
+  `POST /v1/billing/credit-requests` (created a real `pending` row) ->
+  `GET /v1/billing/credit-requests` (the requester saw their own request) ->
+  `PATCH /v1/admin/credit-requests/{id}` as a non-admin (real `403`, confirming a
+  requester can't self-approve) -> the same call as admin (`{"approve": true}`,
+  returned `status: "approved"`) -> a zero-delta
+  `POST /v1/admin/tenants/{id}/credit` call read back the wallet balance, confirming
+  the approved amount had actually landed (100 -> +250 -> 1250, matching this same
+  tenant's balance from Phase 8's own earlier live-verification pass plus this
+  request's amount).
+- Full unit suite: **284 passing** (up from Phase 8's 262 — 22 new tests this
+  follow-up: 3 for `adjust_credit()`, 8 for the credit-request service methods, 3 for
+  `destroy_sandbox()`'s destroy-time billing (incl. idempotency and a
+  `billing_service=None` regression test), 1 for TTL-reap billing, 4 for
+  `bill_workspace_storage()`/its `run_tick()` wiring, and 3 new HTTP-level tests
+  across `test_api_v1_endpoints.py`).
+
+### Known scope boundaries (this follow-up)
+
+- **No notification when a credit request is filed or reviewed** — purely a queued
+  row; an admin has to poll `GET /v1/admin/credit-requests?status=pending`. No
+  email/Slack/webhook integration exists anywhere in this codebase to hang one off
+  of.
+- **No rate limit on filing requests** — a tenant can file arbitrarily many pending
+  requests; cross-cutting rate limiting (doc's own roadmap item, "Cross-cutting"
+  section below) doesn't exist yet for any endpoint, not just this one.
+- **Approving a PAYG request raises `spend_cap` but never clears it back down** —
+  there's no corresponding "reduce my cap" request type; an admin can still `PATCH
+  .../billing` directly to lower it.
+
+### Live verification (Phase 8)
+
+Direct (this session has real Docker/Postgres access, confirmed via `docker ps`
+showing the compose infra already running) — but the same snap-Docker/AppArmor
+`no-new-privileges` host limitation Phases 6/7 documented and left unresolved is
+still present on this machine (reconfirmed directly: a vanilla `debian:12-slim sleep
+1` with only `--security-opt no-new-privileges` still fails with `exec /usr/bin/sleep:
+operation not permitted`), and this session's Docker daemon doesn't have the
+`python`/`node`/`go` golden images built (only `base`/`jq`/`ripgrep`/`httpie` survive
+from Phases 6/7's own sessions) — so, as with Phase 6/7, live verification is split
+into what's reachable without starting a hardened sandbox container, and what isn't:
+
+- **`BillingService` exercised directly against real Postgres** (not just the
+  SQLite-backed unit tests): `authorize()`/`record_usage()`/`add_pricing_rule()`/
+  `set_mode()`/`settle()` all round-tripped correctly — a `CreditWallet` was really
+  debited in real time, a `CreditLedgerEntry` really landed, and a PAYG `settle()`
+  produced a real draft `Invoice` row with the correct summed `total_cost`. This is
+  also what surfaced a real, live-only-catchable Postgres behavior: `usage_records`'
+  `sandbox_id`/`run_id` foreign keys are genuinely enforced (SQLite, which the unit
+  tests run against, doesn't enforce FKs by default) — a synthetic `sandbox_id` not
+  backed by a real `Sandbox` row is rejected with a real `ForeignKeyViolationError`.
+  Not a bug: `SandboxService.execute()` always flushes its `Sandbox`/`Run` rows
+  *before* calling `record_usage()`, so the real wiring never hits this; it was
+  purely an artifact of a throwaway verification script's fake id, fixed by inserting
+  a real `Sandbox` row first — but worth recording as exactly the kind of constraint
+  only a real Postgres session enforces, the same lesson Phase 3's live kind-cluster
+  pass drew about label-value validation mocks can't catch.
+- **`POST /v1/admin/pricing-rules` and `PATCH /v1/admin/tenants/{id}/billing` driven
+  over real HTTP** (`KUBESANDBOX_BILLING__ENABLED=true uv run uvicorn app.main:app`,
+  local-dev auth-disabled principal, real Postgres) — both returned the expected
+  bodies and landed real rows.
+- **The doc §13 exit criterion's blocking half, confirmed live end to end over real
+  HTTP with zero container involvement**: with `billing.enabled=true`, two real
+  pricing rules configured, and the local-dev tenant's wallet unfunded (balance 0),
+  `POST /v1/execute` returned a real `429` — `{"detail":"insufficient credit:
+  estimated cost 0.7500 exceeds balance 0.0000"}` — confirming the block happens
+  before `acquire()` is ever called, exactly as doc §13 specifies. Funding that same
+  tenant's wallet directly (`INSERT INTO credit_wallets ...`, the exact gap flagged
+  above) and retrying made the `429` disappear entirely — the request then failed
+  with a `502` for an unrelated, expected reason (`pull access denied for
+  kubesandbox/python` — that image was never built on this session's daemon),
+  proving authorization now passes cleanly and the request proceeds exactly as far
+  as pre-Phase-8 code would.
+- **The doc §13 exit criterion's successful-run half — actually completing a run and
+  seeing `usage_records`/wallet deduction land via the real HTTP path — could not be
+  confirmed end-to-end on this machine**, blocked by the same pre-existing AppArmor
+  limitation (and missing `python` image) Phase 6/7 already documented, unrelated to
+  this phase's own code. Covered instead by `tests/unit/test_sandbox_billing.py`
+  (`FakeProvisioner`-backed) plus the direct-`BillingService`-against-real-Postgres
+  pass above, which together exercise every piece of the same path independently.
+- Full unit suite: **262 passing** (up from Phase 7's 237 — 25 new tests this phase,
+  across `test_billing_service.py` (strategies, pricing lookup/precedence, settle) and
+  `test_sandbox_billing.py` (execute()/create_sandbox() gating + usage recording,
+  including a regression test proving `billing_service=None` reproduces pre-Phase-8
+  behavior exactly), plus two new HTTP-level admin-endpoint tests in
+  `test_api_v1_endpoints.py`.
+- Leftover local-dev-only test artifacts from this pass (harmless, matching every
+  prior phase's own precedent of not scrubbing local dev Postgres after live
+  verification): a couple of extra `tenants` rows, two `pricing_rules` rows
+  (`cpu_second`/`memory_gb_second`), and a funded `credit_wallets` row for the
+  `local-dev` tenant.
 
 ---
 

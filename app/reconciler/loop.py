@@ -1,15 +1,21 @@
 """The reconciler (doc §4.1, §20 Phase 7) — a dedicated worker process, not an
 in-API background task (doc's own wording: "a dedicated worker; upgradeable to a
-`kopf` operator in aks-prod"). Runs a fixed-interval tick doing four independent jobs:
+`kopf` operator in aks-prod"). Runs a fixed-interval tick doing five independent jobs:
 
 1. TTL reaping — destroys any non-terminated Sandbox past its `idle_ttl_seconds`
    (no activity since `last_active_at`, or `created_at` if it never ran anything) or
-   `max_ttl_seconds` (age since `created_at`, regardless of activity).
+   `max_ttl_seconds` (age since `created_at`, regardless of activity). Routes through
+   `SandboxService.destroy_sandbox()`, which also bills a non-ephemeral sandbox's
+   real lifetime usage when billing is enabled (doc §13, Phase 8) — no separate
+   wiring needed here for that.
 2. Pool replenishment — tops up each poolable language component's warm pool to its
    configured target count (doc §4.3). No-op when `pool.enabled` is false.
 3. Workspace retention sweep — archives/purges persistent workspaces per doc §10.2.
    No-op when `workspace.persistence_enabled` is false.
-4. Orphan GC — removes provisioner-native resources (a Docker container, a
+4. Workspace storage billing (doc §13/§10.1's `storage_gb_day`) — prices each active
+   workspace's last-measured `used_mb` against the tick interval as GB-days. No-op
+   when `billing.enabled` is false.
+5. Orphan GC — removes provisioner-native resources (a Docker container, a
    Kubernetes namespace) carrying a `sandbox-id` label with no matching, non-
    terminated `Sandbox` row — a crash between `acquire()` and its row being
    committed, or a control-plane restart mid-`destroy()`, could otherwise leak one
@@ -38,11 +44,13 @@ from app.core.bootstrap import build_object_storage_provider, build_provisioner
 from app.core.config import Settings, get_settings
 from app.core.errors import ComponentNotFoundError, KubeSandboxError
 from app.core.logging import configure_logging, get_logger
+from app.domain.billing import UsageEvent
 from app.domain.execution import SandboxHandle
 from app.extensions.loader import Registry, load_registry
 from app.persistence.db import get_session_factory
-from app.persistence.models import Sandbox
+from app.persistence.models import Sandbox, User, Workspace
 from app.provisioners.base import Provisioner
+from app.services.billing_service import BillingService
 from app.services.pool_manager import PoolManager
 from app.services.sandbox_service import SandboxService, build_ad_hoc_spec
 from app.services.workspace_service import WorkspaceService
@@ -57,6 +65,7 @@ class ReconcileTickResult:
     workspaces_archived: list[str] = field(default_factory=list)
     workspaces_purged: list[str] = field(default_factory=list)
     workspaces_skipped_active: list[str] = field(default_factory=list)
+    workspace_storage_billed: list[str] = field(default_factory=list)
     orphans_reaped: list[str] = field(default_factory=list)
 
 
@@ -90,7 +99,7 @@ async def reap_expired_sandboxes(
         past_max_ttl = row.max_ttl_seconds is not None and age_seconds >= row.max_ttl_seconds
         if not (past_idle_ttl or past_max_ttl):
             continue
-        await sandbox_service.destroy_sandbox(row.id, row.tenant_id, session)
+        await sandbox_service.destroy_sandbox(row.id, row.tenant_id, session, now=now)
         reaped.append(row.id)
         logger.info(
             "reconciler_ttl_reaped",
@@ -153,6 +162,48 @@ def _resolve_archiver_image(registry: Registry) -> str | None:
         return None
 
 
+async def bill_workspace_storage(
+    *, session: AsyncSession, billing_service: BillingService, interval_seconds: int
+) -> list[str]:
+    """Prices persistent-workspace storage (doc §10.1/§13's `storage_gb_day` resource
+    type) — the one usage dimension `SandboxService` has no natural call site for,
+    since it accrues continuously whether or not a sandbox is currently running
+    against the workspace, not per-run or per-sandbox-lifetime. Billed once per tick
+    against whatever `used_mb` currently holds (refreshed by `sweep_retention()` just
+    before this runs, for any workspace with no live sandbox — otherwise the last
+    measurement stands, same "advisory, not real-time" honesty flag `used_mb` itself
+    already carries, doc §5.4/Phase 7). `Workspace` has no `tenant_id` column of its
+    own (only `user_id`); resolved here via `User.tenant_id` rather than adding one,
+    since nothing else needs it.
+
+    A workspace with `used_mb == 0` (never measured, or genuinely empty) is skipped —
+    zero quantity would price to zero anyway, but skipping avoids a pointless
+    `usage_records` row per idle-empty workspace per tick.
+    """
+    billed: list[str] = []
+    gb_days = interval_seconds / 86_400
+    rows = (await session.execute(select(Workspace).where(Workspace.state == "active"))).scalars().all()
+    for workspace in rows:
+        if workspace.used_mb <= 0:
+            continue
+        tenant_id = (
+            await session.execute(select(User.tenant_id).where(User.id == workspace.user_id))
+        ).scalar_one_or_none()
+        if tenant_id is None:
+            logger.warning("workspace_storage_billing_skipped_no_tenant", workspace_id=workspace.id)
+            continue
+        quantity = (workspace.used_mb / 1024) * gb_days
+        await billing_service.record_usage(
+            tenant_id,
+            UsageEvent(resource_type="storage_gb_day", quantity=quantity, sandbox_id=None, run_id=None),
+            session=session,
+        )
+        billed.append(workspace.id)
+    if billed:
+        await session.commit()
+    return billed
+
+
 async def run_tick(
     *,
     session: AsyncSession,
@@ -179,7 +230,10 @@ async def run_tick(
         if settings.workspace.persistence_enabled
         else None
     )
-    sandbox_service = SandboxService(registry, provisioner, pool_manager=pool_manager)
+    billing_service = BillingService(default_mode=settings.billing.default_mode) if settings.billing.enabled else None
+    sandbox_service = SandboxService(
+        registry, provisioner, pool_manager=pool_manager, billing_service=billing_service
+    )
 
     result.reaped = await reap_expired_sandboxes(session=session, sandbox_service=sandbox_service, now=now)
 
@@ -204,6 +258,11 @@ async def run_tick(
             result.workspaces_purged = sweep.purged
             result.workspaces_skipped_active = sweep.skipped_active
 
+    if billing_service is not None:
+        result.workspace_storage_billed = await bill_workspace_storage(
+            session=session, billing_service=billing_service, interval_seconds=settings.reconciler.interval_seconds
+        )
+
     result.orphans_reaped = await reap_orphans(
         session=session,
         provisioner=provisioner,
@@ -218,6 +277,7 @@ async def run_tick(
         pool_replenished=sum(result.pool_replenished.values()),
         workspaces_archived=len(result.workspaces_archived),
         workspaces_purged=len(result.workspaces_purged),
+        workspace_storage_billed=len(result.workspace_storage_billed),
         orphans_reaped=len(result.orphans_reaped),
     )
     return result

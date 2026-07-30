@@ -60,6 +60,10 @@ limits:
 
 billing:
   default_mode: credit
+  # Off by default — see app/core/config.py's BillingSettings.enabled docstring. Flip
+  # to true (and configure pricing-rules + fund tenant wallets via the admin APIs)
+  # to actually exercise pre-authorization/usage-recording locally.
+  enabled: false
 
 auth:
   # Convenience only: lets /execute be exercised without an IdP during local dev.

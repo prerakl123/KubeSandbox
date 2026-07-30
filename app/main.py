@@ -6,6 +6,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
 from app.api.v1.admin import router as admin_router
+from app.api.v1.billing import router as billing_router
 from app.api.v1.builds import router as builds_router
 from app.api.v1.components import router as components_router
 from app.api.v1.execute import router as execute_router
@@ -190,6 +191,7 @@ def create_app() -> FastAPI:
     app.include_router(components_router)
     app.include_router(templates_router)
     app.include_router(admin_router)
+    app.include_router(billing_router)
     app.include_router(builds_router)
     return app
 

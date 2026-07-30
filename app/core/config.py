@@ -139,6 +139,14 @@ class ExecutionLimits(BaseModel):
 
 class BillingSettings(BaseModel):
     default_mode: Literal["credit", "payg"] = "credit"
+    enabled: bool = False
+    """Opt-in like `pool.enabled`/`workspace.persistence_enabled` before it (doc
+    §4.3/§10.2's own precedent): false leaves SandboxService built with
+    `billing_service=None`, so authorize()/record_usage() are skipped entirely — zero
+    behavior change for a deployment that hasn't turned this on. Deliberately false in
+    both `local.yaml` and `aks-prod.yaml` — flipping it on for real requires funding
+    tenant wallets and configuring `pricing_rules` first (doc §13's admin APIs), or a
+    fresh credit-mode tenant's zero balance blocks every sandbox creation outright."""
 
 
 class AuthSettings(BaseModel):

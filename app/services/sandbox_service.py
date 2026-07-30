@@ -38,6 +38,7 @@ from datetime import UTC, datetime
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.errors import (
+    BillingAuthorizationError,
     ComponentNotFoundError,
     KubeSandboxError,
     SandboxNotFoundError,
@@ -61,6 +62,7 @@ from app.extensions.loader import Registry
 from app.persistence.models import Run, Sandbox, Workspace
 from app.provisioners.base import Provisioner, PTYStream
 from app.provisioners.resources import parse_duration_to_seconds
+from app.services.billing_service import BillingService, db_sidecar_count, estimate_usage_for_spec, usage_events_for_run
 from app.services.credentials import DbCredentials
 from app.services.pool_manager import PoolManager
 from app.services.template_render import RenderedTemplateSpec, render_template
@@ -123,6 +125,7 @@ class SandboxService:
         heavy_node_selector: dict[str, str] | None = None,
         heavy_tolerations: list[dict[str, str]] | None = None,
         workspace_service: WorkspaceService | None = None,
+        billing_service: BillingService | None = None,
     ) -> None:
         self._registry = registry
         self._provisioner = provisioner
@@ -133,6 +136,7 @@ class SandboxService:
         self._heavy_node_selector = heavy_node_selector or {}
         self._heavy_tolerations = heavy_tolerations or []
         self._workspace_service = workspace_service
+        self._billing_service = billing_service
 
     def _resolve_component(self, language: str, version: str | None) -> Component:
         try:
@@ -243,6 +247,25 @@ class SandboxService:
         maximum = parse_duration_to_seconds(resolved.ttl_max) if resolved.ttl_max else self._default_max_ttl_seconds
         return idle, maximum
 
+    async def _authorize_billing(
+        self, resolved: _ResolvedSpec, seconds: int, *, tenant_id: str, session: AsyncSession
+    ) -> None:
+        """Pre-authorization (doc §13: "before any resource is provisioned") — a no-op
+        whenever billing isn't wired up (`billing_service is None`, what `billing.enabled:
+        false` — the default — passes), identical to every other opt-in feature in this
+        service. `seconds` is a ceiling, not a promise of the run's actual duration:
+        `execute()` passes its own wall-clock cap; `create_sandbox()` passes
+        `max_ttl_seconds`, since a warm sandbox's real lifetime isn't known upfront but
+        the reconciler guarantees it never outlives that TTL."""
+        if self._billing_service is None:
+            return
+        estimate = estimate_usage_for_spec(
+            resolved.spec.resources, seconds, db_sidecar_count=db_sidecar_count(resolved.sidecar_components)
+        )
+        auth = await self._billing_service.authorize(tenant_id, estimate, session=session)
+        if not auth.authorized:
+            raise BillingAuthorizationError(auth.reason or "billing authorization denied")
+
     async def _acquire_for_execute(self, spec: SandboxSpec, session: AsyncSession) -> SandboxHandle:
         """Warm-pool claim first (doc §4.3), falling back to a fresh
         `provisioner.acquire()` on a pool miss or when pooling isn't wired up
@@ -335,6 +358,21 @@ class SandboxService:
         rendered = self._resolve_template(row.template_ref)
         return rendered.sidecar_components
 
+    def _spec_resources_for_row(self, row: Sandbox) -> ResourceSpec:
+        """Re-derives a persisted sandbox's resource limits, the same way
+        `_sidecar_components_for_row` re-derives its sidecar Components — `Sandbox`
+        doesn't store its own `SandboxSpec.resources` directly, only enough (
+        `template_ref`/`component_refs`) to reconstruct it. Needed by
+        `destroy_sandbox()` to price a non-ephemeral sandbox's actual lifetime usage
+        (doc §13) without re-deriving the whole spec (image/command/etc. it doesn't
+        need for that)."""
+        if row.template_ref:
+            return self._resolve_template(row.template_ref).sandbox_spec.resources
+        if not row.component_refs:
+            raise KubeSandboxError(f"sandbox {row.id} has no known runnable component")
+        component = self._registry.resolve_component_ref(row.component_refs[0])
+        return self._build_spec(component).resources
+
     def _resolve_component_for_run(self, row: Sandbox, language: str | None) -> Component:
         """Which component a POST .../runs call should execute against — the same
         component(s) the sandbox was created with, not a fresh registry lookup by
@@ -369,6 +407,9 @@ class SandboxService:
         resolved = self._resolve_spec(language=language, version=version, template=template)
         batch_command = self._build_batch_command(resolved.component, code, stdin)
         idle_ttl_seconds, max_ttl_seconds = self._resolve_ttl_seconds(resolved)
+        await self._authorize_billing(
+            resolved, resolved.spec.wall_clock_seconds, tenant_id=tenant_id, session=session
+        )
 
         # Held for the whole acquire->run->release/destroy lifetime, not just the
         # acquire — doc §4.3's "must not starve light ones" means capping concurrently
@@ -409,21 +450,32 @@ class SandboxService:
                 await self._teardown_sidecars(handle, resolved.sidecar_components)
                 await self._release_or_destroy(handle, resolved.spec, result, session)
 
-        session.add(
-            Run(
-                sandbox_id=handle.sandbox_id,
-                tenant_id=tenant_id,
-                command=batch_command.command,
-                exit_code=result.exit_code,
-                stdout_excerpt=result.stdout[:10_000],
-                stderr_excerpt=result.stderr[:10_000],
-                variables=result.variables,
-                truncated=result.truncated,
-                timed_out=result.timed_out,
-                duration_ms=result.duration_ms,
-            )
+        run_row = Run(
+            sandbox_id=handle.sandbox_id,
+            tenant_id=tenant_id,
+            command=batch_command.command,
+            exit_code=result.exit_code,
+            stdout_excerpt=result.stdout[:10_000],
+            stderr_excerpt=result.stderr[:10_000],
+            variables=result.variables,
+            truncated=result.truncated,
+            timed_out=result.timed_out,
+            duration_ms=result.duration_ms,
         )
+        session.add(run_row)
         sandbox_row.state = "terminated"
+
+        if self._billing_service is not None:
+            await session.flush()  # populates run_row.id for the usage records below
+            for event in usage_events_for_run(
+                resolved.spec.resources,
+                result.duration_ms,
+                sandbox_id=handle.sandbox_id,
+                run_id=run_row.id,
+                db_sidecar_count=db_sidecar_count(resolved.sidecar_components),
+            ):
+                await self._billing_service.record_usage(tenant_id, event, session=session)
+
         await session.commit()
 
         return result
@@ -446,6 +498,7 @@ class SandboxService:
     ) -> Sandbox:
         resolved = self._resolve_spec(language=language, version=version, template=template)
         idle_ttl_seconds, max_ttl_seconds = self._resolve_ttl_seconds(resolved)
+        await self._authorize_billing(resolved, max_ttl_seconds, tenant_id=tenant_id, session=session)
 
         workspace_id: str | None = None
         if persistent:
@@ -533,15 +586,42 @@ class SandboxService:
             await session.commit()
         return row, status
 
-    async def destroy_sandbox(self, sandbox_id: str, tenant_id: str, session: AsyncSession) -> None:
+    async def destroy_sandbox(
+        self, sandbox_id: str, tenant_id: str, session: AsyncSession, *, now: datetime | None = None
+    ) -> None:
+        """`now` is settable so a caller reaping many sandboxes in one pass (the
+        reconciler's `reap_expired_sandboxes()`) can bill every one of them against the
+        same tick timestamp instead of each hitting a slightly different real
+        `datetime.now(UTC)` — matters for tests, harmless drift otherwise."""
         row = await self.get_sandbox(sandbox_id, tenant_id, session)
         if row.state == "terminated":
             return  # idempotent, mirrors Provisioner.destroy()'s own idempotency
         handle = self._handle_from_row(row)
-        await self._teardown_sidecars(handle, self._sidecar_components_for_row(row))
+        sidecar_components = self._sidecar_components_for_row(row)
+        await self._teardown_sidecars(handle, sidecar_components)
         await self._provisioner.destroy(handle)
+        now = now or datetime.now(UTC)
+
+        if self._billing_service is not None:
+            # Bills this non-ephemeral sandbox's whole real lifetime (created_at ->
+            # now), closing the gap execute()'s own per-run billing doesn't cover —
+            # a warm/interactive sandbox was only ever *authorized* at create time
+            # (against a max_ttl_seconds ceiling), never actually billed until now.
+            # Also covers a TTL reap for free: the reconciler's reap_expired_sandboxes()
+            # already calls destroy_sandbox() directly, so no separate wiring is needed
+            # there (see usage_events_for_run's own docstring).
+            duration_ms = max(0, int((now - row.created_at).total_seconds() * 1000))
+            for event in usage_events_for_run(
+                self._spec_resources_for_row(row),
+                duration_ms,
+                sandbox_id=row.id,
+                run_id=None,
+                db_sidecar_count=db_sidecar_count(sidecar_components),
+            ):
+                await self._billing_service.record_usage(tenant_id, event, session=session)
+
         row.state = "terminated"
-        row.terminated_at = datetime.now(UTC)
+        row.terminated_at = now
         await session.commit()
 
     async def open_pty(self, sandbox_id: str, tenant_id: str, session: AsyncSession) -> PTYStream:

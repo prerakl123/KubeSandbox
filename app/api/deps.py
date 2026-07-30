@@ -21,6 +21,7 @@ from app.extensions.loader import Registry
 from app.persistence.db import get_session, get_session_factory
 from app.persistence.models import ApiKey, Tenant, User
 from app.provisioners.base import Provisioner
+from app.services.billing_service import BillingService
 from app.services.build_manager import BuildManager
 from app.services.entitlement_service import EntitlementService
 from app.services.pool_manager import PoolManager
@@ -143,6 +144,10 @@ def get_provisioner_ws(websocket: WebSocket) -> Provisioner:
     return websocket.app.state.provisioner
 
 
+def get_billing_service() -> BillingService:
+    return BillingService(default_mode=get_settings().billing.default_mode)
+
+
 def _build_sandbox_service(registry: Registry, provisioner: Provisioner) -> SandboxService:
     settings = get_settings()
     pool_manager = PoolManager(provisioner) if settings.pool.enabled else None
@@ -151,6 +156,7 @@ def _build_sandbox_service(registry: Registry, provisioner: Provisioner) -> Sand
         if settings.workspace.persistence_enabled
         else None
     )
+    billing_service = get_billing_service() if settings.billing.enabled else None
     return SandboxService(
         registry,
         provisioner,
@@ -161,6 +167,7 @@ def _build_sandbox_service(registry: Registry, provisioner: Provisioner) -> Sand
         heavy_node_selector=settings.provisioner.heavy_node_selector,
         heavy_tolerations=settings.provisioner.heavy_tolerations,
         workspace_service=workspace_service,
+        billing_service=billing_service,
     )
 
 

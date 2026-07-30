@@ -193,6 +193,86 @@ async def test_admin_publish_grants_endpoints(client) -> None:
     assert len(list_resp.json()) == 1
 
 
+async def test_admin_billing_endpoints(client) -> None:
+    set_resp = await client.patch(
+        "/v1/admin/tenants/tenant-a/billing",
+        json={"mode": "payg", "spend_cap": 50.0},
+    )
+    assert set_resp.status_code == 200
+    body = set_resp.json()
+    assert body == {"tenant_id": "tenant-a", "mode": "payg", "spend_cap": 50.0, "currency": "USD"}
+
+    rule_resp = await client.post(
+        "/v1/admin/pricing-rules",
+        json={"resource_type": "cpu_second", "unit_cost": 0.0001},
+    )
+    assert rule_resp.status_code == 200
+    rule_body = rule_resp.json()
+    assert rule_body["resource_type"] == "cpu_second"
+    assert rule_body["unit_cost"] == 0.0001
+    assert rule_body["id"]
+
+
+async def test_admin_billing_endpoints_reject_non_admin(client) -> None:
+    _as_tenant_a()
+    resp = await client.patch("/v1/admin/tenants/tenant-a/billing", json={"mode": "credit"})
+    assert resp.status_code == 403
+
+
+async def test_admin_credit_adjustment_endpoint(client) -> None:
+    top_up = await client.post(
+        "/v1/admin/tenants/tenant-a/credit", json={"delta": 100.0, "reason": "initial grant"}
+    )
+    assert top_up.status_code == 200
+    assert top_up.json() == {"tenant_id": "tenant-a", "balance": 100.0}
+
+    deduction = await client.post("/v1/admin/tenants/tenant-a/credit", json={"delta": -25.0})
+    assert deduction.status_code == 200
+    assert deduction.json()["balance"] == 75.0
+
+
+async def test_admin_credit_adjustment_endpoint_rejects_non_admin(client) -> None:
+    _as_tenant_a()
+    resp = await client.post("/v1/admin/tenants/tenant-a/credit", json={"delta": 100.0})
+    assert resp.status_code == 403
+
+
+async def test_credit_request_workflow_end_to_end(client) -> None:
+    _as_tenant_a()
+    create_resp = await client.post(
+        "/v1/billing/credit-requests", json={"amount": 50.0, "reason": "ran out mid-demo"}
+    )
+    assert create_resp.status_code == 200
+    request_id = create_resp.json()["id"]
+    assert create_resp.json()["status"] == "pending"
+
+    own_list_resp = await client.get("/v1/billing/credit-requests")
+    assert len(own_list_resp.json()) == 1
+
+    # Approving requires an admin — the requester itself can't self-approve.
+    approve_as_tenant_resp = await client.patch(
+        f"/v1/admin/credit-requests/{request_id}", json={"approve": True}
+    )
+    assert approve_as_tenant_resp.status_code == 403
+
+    app.dependency_overrides[get_current_principal] = lambda: ADMIN
+    admin_list_resp = await client.get("/v1/admin/credit-requests", params={"status": "pending"})
+    assert len(admin_list_resp.json()) == 1
+
+    approve_resp = await client.patch(
+        f"/v1/admin/credit-requests/{request_id}", json={"approve": True, "note": "approved"}
+    )
+    assert approve_resp.status_code == 200
+    assert approve_resp.json()["status"] == "approved"
+
+    # The tenant defaults to credit mode (billing.default_mode) — approving should
+    # have topped up its wallet by the requested amount. A zero-delta adjustment is a
+    # side-effect-free way to read back the current balance through the existing
+    # endpoint rather than adding a GET-wallet route just for this test.
+    balance_resp = await client.post("/v1/admin/tenants/tenant-a/credit", json={"delta": 0.0})
+    assert balance_resp.json()["balance"] == 50.0
+
+
 async def test_execute_against_a_template(client, registry) -> None:
     registry.templates["lab@1.0"] = make_template(
         "lab", "1.0", base_ref="python@3.12.4", component_refs=[]

@@ -27,6 +27,13 @@ class QuotaExceededError(KubeSandboxError):
     """Tenant/user quota (concurrency, credits, storage) would be exceeded."""
 
 
+class BillingAuthorizationError(QuotaExceededError):
+    """Sandbox creation blocked: insufficient credit balance (credit mode) or the
+    configured spend cap would be exceeded (PAYG mode) — doc §13. A QuotaExceededError
+    subclass (doc §11 groups credit balance/spend cap with quotas), so it inherits the
+    existing 429 mapping in app/main.py with no new exception handler needed."""
+
+
 class ProvisionerError(KubeSandboxError):
     """The underlying provisioner (Docker/Kubernetes) failed to satisfy a request."""
 

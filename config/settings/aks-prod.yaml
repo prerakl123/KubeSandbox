@@ -71,6 +71,9 @@ limits:
 
 billing:
   default_mode: credit
+  # Same "requires operational setup first" caveat as local.yaml — REPLACE_ME once
+  # tenant wallets are funded and pricing_rules are configured for real.
+  enabled: false
 
 auth:
   disabled: false

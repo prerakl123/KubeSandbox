@@ -303,6 +303,28 @@ class Invoice(Base):
     external_ref: Mapped[str | None] = mapped_column(String(255), nullable=True)  # future payment-gateway id
 
 
+class CreditRequest(Base):
+    """A tenant's self-service ask for more credit (credit mode) or spend-cap
+    headroom (PAYG mode) — not in doc §13's original design, added on top of it so a
+    tenant that hits `BillingAuthorizationError` has a real path forward besides
+    asking an admin out of band. Approving one applies the amount immediately via
+    `BillingService.adjust_credit()`/`set_mode()` — see that service for the mode
+    dispatch."""
+
+    __tablename__ = "credit_requests"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    tenant_id: Mapped[str] = mapped_column(ForeignKey("tenants.id"))
+    user_id: Mapped[str | None] = mapped_column(ForeignKey("users.id"), nullable=True)
+    amount: Mapped[float] = mapped_column(Numeric(14, 6))
+    reason: Mapped[str] = mapped_column(Text)
+    status: Mapped[str] = mapped_column(String(16), default="pending")  # pending | approved | denied
+    review_note: Mapped[str | None] = mapped_column(Text, nullable=True)
+    reviewed_by: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    reviewed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
 # --- Audit ---------------------------------------------------------------------------
 
 class AuditLog(Base):

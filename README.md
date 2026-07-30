@@ -509,6 +509,79 @@ mounting were verified by isolating each piece (a plain volume create/delete, an
 manual container run with `no-new-privileges` omitted to confirm the mount+chown
 logic itself is correct) rather than end-to-end through the API on this machine.
 
+## Configuration reference
+
+Every tunable in this codebase is layered `code defaults <- config/settings/<env>.yaml
+<- env vars` (`app/core/config.py`) — nothing below requires a code change to retune,
+only a YAML edit or an env var. `APP_ENV` picks the YAML file (`local` or `aks-prod`,
+doc §7 — there is no third profile); every other env var is prefixed `KUBESANDBOX_`
+with `__` separating nested levels, e.g. `pool.enabled` -> `KUBESANDBOX_POOL__ENABLED`.
+Env vars always win over the YAML file, which always wins over the code default shown
+below.
+
+### Application settings (`config/settings/{local,aks-prod}.yaml`)
+
+| Setting | Env var | Local default | AKS-prod default | Description |
+|---|---|---|---|---|
+| `app_env` | `KUBESANDBOX_APP_ENV` | `local` | `aks-prod` | Selects the YAML profile itself (doc §7) — read before `Settings` is constructed, so it can't live inside the YAML it selects. |
+| `debug` | `KUBESANDBOX_DEBUG` | `true` | `false` | Verbose/pretty logging vs. structured JSON (`app/core/logging.py`). |
+| `database.dsn` | `KUBESANDBOX_DATABASE__DSN` | `postgresql+asyncpg://kubesandbox:kubesandbox@localhost:5432/kubesandbox` | `REPLACE_ME` (injected via env var/Key Vault at deploy time) | Async SQLAlchemy connection string; the only DB this app supports (doc §10.1). |
+| `database.pool_size` | `KUBESANDBOX_DATABASE__POOL_SIZE` | `10` | `10` | SQLAlchemy async engine connection-pool size. |
+| `redis.url` | `KUBESANDBOX_REDIS__URL` | `redis://localhost:6379/0` | `REPLACE_ME` | Session/attach registry, WS heartbeats, single-viewer lock (doc §10.1) — **not** the pool claim ledger, which is Postgres (Phase 7's own design decision). |
+| `object_storage.provider` | `KUBESANDBOX_OBJECT_STORAGE__PROVIDER` | `minio` | `azure_blob` | `minio` \| `azure_blob` \| `aws` \| `gcp` — the last two are deliberate fail-loud stubs (doc §9). |
+| `object_storage.endpoint` | `KUBESANDBOX_OBJECT_STORAGE__ENDPOINT` | `http://localhost:9000` | `https://kubesandboxprod.blob.core.windows.net` | Object-store endpoint (run logs overflow, build cache, workspace archives). |
+| `object_storage.access_key` | `KUBESANDBOX_OBJECT_STORAGE__ACCESS_KEY` | `kubesandbox` | `kubesandbox` (neither YAML overrides it; unused with `azure_blob`) | MinIO access key — only meaningful with `object_storage.provider: minio`. |
+| `object_storage.secret_key` | `KUBESANDBOX_OBJECT_STORAGE__SECRET_KEY` | `kubesandbox-secret` | `kubesandbox-secret` (same — unused with `azure_blob`) | MinIO secret key; should come from a real secret store outside `local`, never committed. |
+| `object_storage.bucket` | `KUBESANDBOX_OBJECT_STORAGE__BUCKET` | `kubesandbox` | `kubesandbox` | Bucket/container name. |
+| `image_registry.provider` | `KUBESANDBOX_IMAGE_REGISTRY__PROVIDER` | `local` | `acr` | `local` (self-hosted `registry:2`) \| `acr` \| `aws` \| `gcp` (stubs, doc §9). |
+| `image_registry.endpoint` | `KUBESANDBOX_IMAGE_REGISTRY__ENDPOINT` | `localhost:5000` | `kubesandboxprod.azurecr.io` | Registry host golden images are pushed to/pulled from. |
+| `secrets.provider` | `KUBESANDBOX_SECRETS__PROVIDER` | `dotenv` | `azure_keyvault` | Where control-plane secrets come from (doc §9's `SecretsProvider`). |
+| `secrets.vault_url` | `KUBESANDBOX_SECRETS__VAULT_URL` | `null` | `https://kubesandbox-prod.vault.azure.net/` | Azure Key Vault URL; only meaningful with `secrets.provider: azure_keyvault`. |
+| `provisioner.backend` | `KUBESANDBOX_PROVISIONER__BACKEND` | `docker` | `kubernetes` | Selects `DockerProvisioner` vs. `KubernetesProvisioner` (doc §4.2) — same service-layer code either way. |
+| `provisioner.runtime_class` | `KUBESANDBOX_PROVISIONER__RUNTIME_CLASS` | `null` | `gvisor` | Kubernetes-only `runtimeClassName` for kernel isolation (doc §6 Layer 2); ignored on `docker`. |
+| `provisioner.kubeconfig_path` | `KUBESANDBOX_PROVISIONER__KUBECONFIG_PATH` | `null` | `null` | Explicit kubeconfig file path; falls back to in-cluster service-account token, then default kubeconfig discovery. |
+| `provisioner.namespace_prefix` | `KUBESANDBOX_PROVISIONER__NAMESPACE_PREFIX` | `kubesandbox-sb-` | `kubesandbox-sb-` | Prefix for every per-sandbox (and per-workspace) Kubernetes namespace `KubernetesProvisioner` creates. |
+| `provisioner.heavy_node_selector` | `KUBESANDBOX_PROVISIONER__HEAVY_NODE_SELECTOR` | `{}` | `{kubesandbox.io/workload-class: REPLACE_ME_heavy}` | K8s `nodeSelector` for `heavy` weight-class pods (doc §4.3) — empty means no segregation. |
+| `provisioner.heavy_tolerations` | `KUBESANDBOX_PROVISIONER__HEAVY_TOLERATIONS` | `[]` | one entry (`kubesandbox.io/heavy=true:NoSchedule`) | Raw K8s `Toleration` dicts matching the heavy node pool's taint. |
+| `pool.enabled` | `KUBESANDBOX_POOL__ENABLED` | `false` | `true` | Master switch for warm-pool claim/release (doc §4.3) — opt-in, zero behavior change when off. |
+| `pool.light_pool_size` | `KUBESANDBOX_POOL__LIGHT_POOL_SIZE` | `0` | `10` | Target idle-pod count per `light`-weight image. |
+| `pool.standard_pool_size` | `KUBESANDBOX_POOL__STANDARD_POOL_SIZE` | `0` | `5` | Target idle-pod count per `standard`-weight image. |
+| `pool.heavy_pool_size` | `KUBESANDBOX_POOL__HEAVY_POOL_SIZE` | `0` | `2` | Target idle-pod count per `heavy`-weight image. |
+| `pool.heavy_max_concurrent` | `KUBESANDBOX_POOL__HEAVY_MAX_CONCURRENT` | `2` | `null` (unbounded) | `local`-only in-process semaphore capping concurrent `heavy` sandboxes (doc §7); `aks-prod` uses real node-pool segregation instead. |
+| `workspace.persistence_enabled` | `KUBESANDBOX_WORKSPACE__PERSISTENCE_ENABLED` | `false` | `true` | Master switch for persistent workspaces (doc §10.2) — opt-in. |
+| `workspace.default_quota_mb` | `KUBESANDBOX_WORKSPACE__DEFAULT_QUOTA_MB` | `10240` (10 GiB) | `10240` | Per-user workspace size quota; per-tenant overrides aren't wired yet (flagged in `docs/TASK_CHECKLIST.md`). |
+| `workspace.idle_retention_days` | `KUBESANDBOX_WORKSPACE__IDLE_RETENTION_DAYS` | `30` | `30` | Days idle since last activity before an `active` workspace is archived. |
+| `workspace.archive_grace_days` | `KUBESANDBOX_WORKSPACE__ARCHIVE_GRACE_DAYS` | `60` | `60` | Additional idle days (on top of the above, 90 total) before an `archived` workspace is purged for good. |
+| `workspace.max_lifetime_days` | `KUBESANDBOX_WORKSPACE__MAX_LIFETIME_DAYS` | `365` | `365` | Absolute age ceiling regardless of activity — follows the same archive-then-purge path once hit. |
+| `ttl.default_idle_seconds` | `KUBESANDBOX_TTL__DEFAULT_IDLE_SECONDS` | `900` (15m) | `900` | Idle-TTL default for an ad-hoc sandbox with no `SandboxTemplate.spec.ttl` to read one from. |
+| `ttl.default_max_seconds` | `KUBESANDBOX_TTL__DEFAULT_MAX_SECONDS` | `7200` (2h) | `7200` | Max-TTL default, same ad-hoc-only scope as above. |
+| `reconciler.interval_seconds` | `KUBESANDBOX_RECONCILER__INTERVAL_SECONDS` | `30` | `30` | Fixed tick interval for the standalone reconciler worker (doc §4.1). |
+| `reconciler.orphan_grace_seconds` | `KUBESANDBOX_RECONCILER__ORPHAN_GRACE_SECONDS` | `120` | `120` | Minimum age before an untracked native resource (container/namespace) is reaped as an orphan, so a mid-`acquire()` sandbox isn't mistaken for one. |
+| `limits.default_wall_clock_seconds` | `KUBESANDBOX_LIMITS__DEFAULT_WALL_CLOCK_SECONDS` | `60` | `60` | Fallback batch-run timeout when a component doesn't declare its own `access.limits.wallClockSeconds`. |
+| `limits.max_output_bytes` | `KUBESANDBOX_LIMITS__MAX_OUTPUT_BYTES` | `5,000,000` | `5,000,000` | Fallback stdout+stderr byte cap. |
+| `limits.max_processes` | `KUBESANDBOX_LIMITS__MAX_PROCESSES` | `128` | `128` | Fallback PID limit. |
+| `billing.default_mode` | `KUBESANDBOX_BILLING__DEFAULT_MODE` | `credit` | `credit` | Billing mode a brand-new tenant's `BillingAccount` is created with (doc §13) — `credit` \| `payg`; an admin can switch a specific tenant later via `PATCH /v1/admin/tenants/{id}/billing`. |
+| `billing.enabled` | `KUBESANDBOX_BILLING__ENABLED` | `false` | `false` | Master switch for the whole billing subsystem — pre-authorization, usage recording, and the reconciler's storage-billing job are all skipped entirely when off. Requires pricing rules configured and tenant wallets funded before flipping on (see below), or a fresh credit-mode tenant's zero balance blocks every sandbox creation outright. |
+| `auth.disabled` | `KUBESANDBOX_AUTH__DISABLED` | `true` | `false` | Local-dev-only bypass (auto-provisions a `local-dev` admin principal) — refused at startup outside `app_env: local`. |
+| `auth.jwt_secret` | `KUBESANDBOX_AUTH__JWT_SECRET` | `change-me-in-local-dev-only` | `change-me-in-local-dev-only` (neither YAML overrides it — **must** be overridden via a real secret before this matters) | Reserved for the not-yet-implemented JWT session path (doc §11) — OIDC/JWT session auth is a documented Phase 0 gap, so nothing reads this yet. |
+| `auth.oidc_issuer` | `KUBESANDBOX_AUTH__OIDC_ISSUER` | `null` | `https://login.microsoftonline.com/REPLACE_ME/v2.0` | Azure AD OIDC issuer URL; unused until JWT session auth is implemented. |
+
+### Per-tenant billing values (managed via Admin API, not static config)
+
+These aren't settings files/env vars — they're per-tenant database rows an admin
+tunes at runtime through the API, listed here for completeness since they're just as
+"admin-tunable" as anything above:
+
+| Value | How to tune | Schema default | Description |
+|---|---|---|---|
+| Billing mode | `PATCH /v1/admin/tenants/{id}/billing` (`{mode}`) | `billing.default_mode` on first use | Per-tenant override of `credit` vs. `payg`. |
+| Spend cap | `PATCH /v1/admin/tenants/{id}/billing` (`{spend_cap}`) | `null` (unconstrained) | PAYG-mode advisory ceiling; ignored in credit mode (the wallet balance is the cap there). |
+| Credit wallet balance | `POST /v1/admin/tenants/{id}/credit` (`{delta, reason?}`) | `0` | The only way to fund/correct a credit-mode tenant's wallet today (no payment-gateway integration, doc §13's own deliberate stub) — also reachable indirectly by approving a tenant's own request, see below. |
+| Pricing rules | `POST /v1/admin/pricing-rules` (`{resource_type, unit_cost, currency?, effective_from?}`) | none (unpriced resource types cost `0`, logged not raised) | Per-unit cost for `cpu_second` / `memory_gb_second` / `storage_gb_day` / `db_hour`; multiple rules per `resource_type` may coexist, the latest already-effective one always wins. |
+| Credit/overusage requests | `GET`/`PATCH /v1/admin/credit-requests[/{id}]` | — | Tenant-filed asks for more credit/spend-cap headroom (`POST /v1/billing/credit-requests`, self-service); approving applies the amount immediately. |
+| Catalog entitlements | `GET`/`PATCH /v1/admin/entitlements` | none visible until granted | Which components/templates a tenant/user scope may see and select (doc §3.6). |
+| Publish grants | `GET`/`PATCH /v1/admin/publish-grants` | `false` (no publish access) | Whether a tenant/user scope may publish its own private components/templates, per category. |
+
 ## Tests
 
 ```bash
