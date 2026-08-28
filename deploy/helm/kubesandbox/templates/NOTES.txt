@@ -1,0 +1,57 @@
+KubeSandbox control plane {{ .Chart.AppVersion }} installed as release {{ .Release.Name }}
+in namespace {{ .Release.Namespace }}.
+
+Components:
+  API           Deployment/{{ include "kubesandbox.fullname" . }}-api ({{ if .Values.autoscaling.enabled }}HPA {{ .Values.autoscaling.minReplicas }}-{{ .Values.autoscaling.maxReplicas }}{{ else }}{{ .Values.replicaCount }} replica(s), no HPA{{ end }})
+  Reconciler    {{ if .Values.reconciler.enabled }}Deployment/{{ include "kubesandbox.fullname" . }}-reconciler (1 replica — do not scale, see the chart's own notes){{ else }}DISABLED — TTL reaping, orphan GC, pool replenishment and workspace retention will not run{{ end }}
+  Migrations    {{ if .Values.migrations.enabled }}ran as a pre-upgrade hook Job{{ else }}DISABLED — run `alembic upgrade head` yourself before this release serves traffic{{ end }}
+
+Check it came up:
+  kubectl -n {{ .Release.Namespace }} rollout status deploy/{{ include "kubesandbox.fullname" . }}-api
+  kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "kubesandbox.fullname" . }} 8000:{{ .Values.service.port }}
+  curl localhost:8000/readyz   # 200 = Postgres and Redis both reachable from the pod
+
+{{- if not .Values.secrets.existingSecret }}
+{{- if not .Values.secrets.keyVault.enabled }}
+
+WARNING: no secret source is configured (`secrets.existingSecret` is empty and
+`secrets.keyVault.enabled` is false). The pods started with no DATABASE__DSN, REDIS__URL,
+or AUTH__JWT_SECRET, so they fall back to config/settings/aks-prod.yaml's REPLACE_ME
+values — /readyz will fail, and Settings refuses the placeholder JWT secret outside
+app_env=local, so the API will not boot at all. Set one of the two.
+{{- end }}
+{{- end }}
+
+{{- if not .Values.config.cors.enabled }}
+
+NOTE: CORS is disabled. A browser UI served from another origin cannot call this API at
+all — the browser rejects the preflight before it reaches the service. Set
+`config.cors.enabled: true` and list the UI's origin in `config.cors.allowOrigins`.
+{{- end }}
+
+{{- if not .Values.config.auth.oidcIssuer }}
+
+NOTE: no OIDC issuer configured. `POST /v1/auth/token` returns 503 and browser login is
+unavailable; only API keys (`X-API-Key`) authenticate. Mint one with
+`POST /v1/api-keys` once you can reach the API.
+{{- end }}
+
+{{- if contains "REPLACE_ME" .Values.image.repository }}
+
+WARNING: image.repository still contains REPLACE_ME — the pods cannot pull. Point it at
+your ACR (see deploy/azure/README.md for attaching the registry to the cluster).
+{{- end }}
+
+{{- if and .Values.ingress.enabled (not .Values.ingress.tls) }}
+
+WARNING: ingress is enabled with no TLS. Session tokens and API keys travel in headers,
+and the WebSocket attach handshake carries its credential in the query string — over
+plain HTTP those land in every intermediary's logs.
+{{- end }}
+
+Prod-hardening prerequisites this chart does NOT create (cluster/infra-level, see
+deploy/azure/README.md):
+  * the gVisor/Kata node pool that `provisioner.runtime_class: gvisor` requires
+  * the segregated node pool for `heavy` weight-class sandboxes (doc §4.3)
+  * the sandbox primitives (NetworkPolicy, ResourceQuota, LimitRange, RuntimeClass) —
+    those are Kustomize: `kubectl apply -k deploy/overlays/aks-prod`

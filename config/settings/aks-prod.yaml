@@ -29,11 +29,13 @@ provisioner:
   backend: kubernetes
   runtime_class: gvisor
   namespace_prefix: "kubesandbox-sb-"
-  # Real segregation is node-pool-level infra (roadmap Phase 9) — these two just wire
-  # the pod spec to whatever heavy-workload node pool/taint actually gets provisioned;
-  # REPLACE_ME until that node pool exists.
+  # Heavy-workload segregation (doc §4.3). These MUST match the label and taint
+  # deploy/azure/provision-nodepools.sh applies to the `heavy` node pool — they are two
+  # halves of one decision, and if they disagree heavy sandboxes either stop being
+  # segregated or stop scheduling at all, neither of which fails loudly. No longer
+  # REPLACE_ME: the provisioning script is now the authority for these exact values.
   heavy_node_selector:
-    kubesandbox.io/workload-class: "REPLACE_ME_heavy"
+    kubesandbox.io/workload-class: "heavy"
   heavy_tolerations:
     - key: "kubesandbox.io/heavy"
       operator: "Equal"
@@ -74,6 +76,19 @@ billing:
   # Same "requires operational setup first" caveat as local.yaml — REPLACE_ME once
   # tenant wallets are funded and pricing_rules are configured for real.
   enabled: false
+
+observability:
+  metrics_enabled: true
+  # REPLACE_ME: flip to true and point otlp_endpoint at the cluster's collector
+  # Service once one is deployed. Left false (with a null endpoint) rather than
+  # pre-filled, because ObservabilitySettings refuses tracing_enabled without an
+  # endpoint — so a half-configured profile fails at startup instead of silently
+  # dropping every span into a retry loop.
+  tracing_enabled: false
+  otlp_endpoint: null
+  service_name: kubesandbox
+  # Full sampling for the initial prod rollout; lower once span volume is a real cost.
+  trace_sample_ratio: 1.0
 
 auth:
   disabled: false

@@ -1,0 +1,31 @@
+# A separately installable package, on purpose (doc §17: "a thin client SDK").
+#
+# The workflow-builder pip-installs this to call the control plane; it must not
+# inherit the control plane's own dependency tree (fastapi, sqlalchemy, asyncpg,
+# kubernetes-asyncio, aiodocker, azure-*, opentelemetry-*) just to POST some JSON.
+# httpx is the only required runtime dependency; `websockets` is an extra, needed
+# solely for the interactive PTY path a batch-only caller never touches.
+#
+# `requires-python` is deliberately far lower than the control plane's own >=3.14:
+# a consumer application shouldn't be forced onto the newest interpreter just because
+# the service it calls runs on one. 3.11 is the floor because the SDK relies on
+# `datetime.fromisoformat` accepting a trailing "Z" and on `X | Y` unions at runtime.
+[project]
+name = "kubesandbox-sdk"
+version = "0.1.0"
+description = "Client SDK for the KubeSandbox control plane"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "httpx>=0.27",
+]
+
+[project.optional-dependencies]
+attach = ["websockets>=12"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["kubesandbox"]

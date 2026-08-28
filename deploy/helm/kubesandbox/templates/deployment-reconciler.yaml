@@ -1,0 +1,98 @@
+{{- if .Values.reconciler.enabled }}
+{{/*
+The reconciler worker (doc §4.1: "a background asyncio loop in a dedicated worker").
+
+Deliberately a separate Deployment from the API rather than a sidecar or an in-API task:
+its jobs are periodic and long-running (TTL reaping, orphan GC, pool replenishment,
+workspace retention sweeps, storage billing), and coupling them to the API would mean
+every HPA scale event multiplied them.
+
+Pinned at one replica, and there is no HPA for it — none of those jobs is safe to run
+concurrently with itself. Two replicas would both reap the same expired sandbox and both
+replenish the same pool. Doc §10.1 anticipates Redis reconciler locks for a
+multi-replica version; nothing implements them yet, so this stays singular.
+*/}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "kubesandbox.fullname" . }}-reconciler
+  labels:
+    {{- include "kubesandbox.labels" . | nindent 4 }}
+    app.kubernetes.io/component: reconciler
+spec:
+  replicas: {{ .Values.reconciler.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "kubesandbox.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: reconciler
+  strategy:
+    # Recreate, not RollingUpdate: with one replica, a rolling update would briefly run
+    # the old and new reconciler at once — exactly the concurrent-tick situation the
+    # single replica exists to prevent. A few seconds with no reconciler is harmless;
+    # its work is periodic and idempotent.
+    type: Recreate
+  template:
+    metadata:
+      labels:
+        {{- include "kubesandbox.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: reconciler
+        {{- if .Values.secrets.keyVault.enabled }}
+        azure.workload.identity/use: "true"
+        {{- end }}
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      serviceAccountName: {{ include "kubesandbox.serviceAccountName" . }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      # A tick may be mid-archive (streaming a workspace volume to cold storage) when
+      # the pod is asked to stop; cutting that off leaves a half-uploaded archive.
+      terminationGracePeriodSeconds: 120
+      containers:
+        - name: reconciler
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          # The module's own __main__ entrypoint (app/reconciler/loop.py), which runs the
+          # same startup validation and tracing setup as the API before looping.
+          command: ["uv", "run", "python", "-m", "app.reconciler.loop"]
+          env:
+            {{- include "kubesandbox.env" . | nindent 12 }}
+            {{- include "kubesandbox.secretEnv" . | nindent 12 }}
+          # No HTTP probes: this process serves no HTTP at all. A liveness probe would
+          # need an exec check against the loop's own state, and a wedged tick is
+          # already bounded by the loop's own per-tick exception handling — a probe here
+          # would add a failure mode rather than catch one.
+          resources:
+            {{- toYaml .Values.reconciler.resources | nindent 12 }}
+          volumeMounts:
+            {{- include "kubesandbox.scratchVolumeMounts" . | nindent 12 }}
+            {{- if .Values.secrets.keyVault.enabled }}
+            - name: keyvault
+              mountPath: /mnt/secrets-store
+              readOnly: true
+            {{- end }}
+      volumes:
+        {{- include "kubesandbox.scratchVolumes" . | nindent 8 }}
+        {{- if .Values.secrets.keyVault.enabled }}
+        - name: keyvault
+          csi:
+            driver: secrets-store.csi.k8s.io
+            readOnly: true
+            volumeAttributes:
+              secretProviderClass: {{ include "kubesandbox.fullname" . }}-keyvault
+        {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+{{- end }}

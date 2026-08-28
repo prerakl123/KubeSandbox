@@ -750,7 +750,41 @@ POST   /v1/admin/pricing-rules       configure unit pricing
 GET    /healthz  /readyz  /metrics
 ```
 
-A thin **client SDK** (`sdk/`, Python first) wraps these for the workflow-builder's code block.
+**Added in Phase 9/9b** beyond the illustrative list above — the surface a browser UI
+needs (see `docs/UI_INTEGRATION.md`), plus two endpoints listed here that had never
+actually been implemented:
+
+```
+GET    /v1/auth/config               public OIDC config for a frontend (unauthenticated)
+POST   /v1/auth/token                exchange an IdP token for a session JWT (§11)
+GET    /v1/me                        caller identity, role, and enabled features
+
+POST   /v1/execute?async=true        non-blocking variant (§5.1) — returns a run_id
+GET    /v1/runs/{run_id}             bundled run status/result — the §5.1 poll target
+GET    /v1/runs                      run history (paginated)
+GET    /v1/sandboxes                 list own/tenant sandboxes (paginated)
+GET    /v1/templates/{name}          template versions + resource/TTL shape
+GET    /v1/builds                    build history (paginated)
+
+POST/GET/DELETE /v1/api-keys         service-account key management (§11)
+GET    /v1/workspaces/me             persistent workspace quota/usage/state (§10.2)
+GET    /v1/billing/account           own billing mode, balance, month-to-date cost
+GET    /v1/billing/usage             own priced usage records
+
+GET    /v1/admin/pricing-rules       read back configured pricing
+GET    /v1/admin/tenants             list tenants (counts, billing position)
+GET    /v1/admin/users               list users
+PATCH  /v1/admin/users/{id}/role     the only way to grant `admin` (§11)
+```
+
+Collections that grow with use return `{items, total, limit, offset}`; registry listings
+stay bare arrays. Tenant isolation is reported as **404, never 403**, so ids can't be
+probed.
+
+A thin **client SDK** (`sdk/`, Python first) wraps these for the workflow-builder's code
+block — a separately installable `kubesandbox-sdk` package whose only required
+dependency is httpx, with sync and async clients, typed models, a status-code-to-exception
+mapping, and the PTY protocol behind an optional `[attach]` extra.
 
 ---
 
@@ -815,6 +849,13 @@ KubeSandbox/
 | **7 — Pooling & persistence** | Pool Manager (weight classes, claim/recycle), PVC workspaces w/ quota+retention, reconciler | Warm-pool hit rate measurable; idle TTL + archive/purge working |
 | **8 — Billing** | `BillingService`, credit + PAYG strategies, admin pricing/mode APIs | Sandbox creation blocked on insufficient credit; PAYG invoice draft generated |
 | **9 — Prod hardening** | gVisor/Kata prod pool + heavy-workload node pool, HPA/PDB, cloud-provider stubs verified fail-fast, SDK, docs | Prod-ready, workflow-builder integrated |
+| **9b — UI integration readiness** | CORS, OIDC/JWT session auth (§11), the read/list surface a frontend needs, `?async=true` + `GET /v1/runs/{id}` (§5.1/§17, previously unimplemented), API-key management, pagination | A browser UI can authenticate, enumerate, and drive the platform without backend changes |
+
+**Phase 9b was added after the original plan**, once UI development went on the roadmap:
+building the UI is a separate stage, but the backend contract it needs is not, and an
+audit turned up six blockers — two of them endpoints §17/§5.1 already specify. See
+`docs/TASK_CHECKLIST.md` for the item-by-item status and `docs/UI_INTEGRATION.md` for
+the contract itself.
 
 ---
 
@@ -826,4 +867,19 @@ quotas/retention, §12 egress-by-overlay, §13 billing). Nothing structurally un
 remains for v1; remaining unknowns are implementation-level (exact pricing numbers, node
 pool sizing, specific mirror URLs) and will surface naturally per-environment during
 Phase 6–9 rather than blocking the design.
+
+**Still open after Phase 9**, all cross-cutting rather than structural, and all recorded
+with their reasoning in `docs/TASK_CHECKLIST.md`:
+
+- **Rate limiting** per API key/user — nothing throttles any endpoint yet.
+- **`QuotaService`** — §11's concurrent-sandbox caps, cpu/mem quotas, and monthly-minute
+  quotas; only billing pre-authorization gates creation today.
+- **`AuditLog` writes** — the table has existed since Phase 0 and nothing writes to it,
+  so §6 Layer 5's "full audit log of every command/run" is not yet true.
+- **Full run logs in object storage** (§10.1) — `runs` keeps a 10 KB excerpt per stream
+  and nothing writes or serves the overflow.
+- **Admin bootstrap** — no IdP claim can grant the `admin` role (deliberately), and
+  promotion requires an existing admin, so the *first* admin needs a direct DB write.
+- **Async-run durability** — a control-plane restart leaves an in-flight `?async=true`
+  run marked `running` forever; nothing resumes or reaps it.
 ```

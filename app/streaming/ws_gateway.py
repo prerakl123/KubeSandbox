@@ -22,6 +22,7 @@ from fastapi import APIRouter, Depends, HTTPException, WebSocket, WebSocketDisco
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import Principal, get_redis_ws, get_sandbox_service_ws, get_session, get_ws_principal
+from app.core import metrics
 from app.core.errors import KubeSandboxError, SandboxNotFoundError
 from app.core.logging import get_logger
 from app.provisioners.base import PTYStream
@@ -99,9 +100,13 @@ async def attach(
         return
 
     heartbeat_task = asyncio.create_task(_heartbeat(r, sandbox_id, identity))
+    # Incremented only once the PTY is genuinely open (doc §14) — a rejected 409 or a
+    # failed open_pty() above never counted as a session, and both return before here.
+    metrics.attach_sessions_active.inc()
     try:
         await _pump(websocket, pty)
     finally:
+        metrics.attach_sessions_active.dec()
         heartbeat_task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await heartbeat_task

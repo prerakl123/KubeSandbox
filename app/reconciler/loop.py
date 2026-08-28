@@ -40,10 +40,11 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.cloud.storage import ObjectStorageProvider
-from app.core.bootstrap import build_object_storage_provider, build_provisioner
+from app.core.bootstrap import build_object_storage_provider, build_provisioner, validate_cloud_providers
 from app.core.config import Settings, get_settings
 from app.core.errors import ComponentNotFoundError, KubeSandboxError
 from app.core.logging import configure_logging, get_logger
+from app.core.tracing import configure_tracing
 from app.domain.billing import UsageEvent
 from app.domain.execution import SandboxHandle
 from app.extensions.loader import Registry, load_registry
@@ -350,6 +351,15 @@ class ReconcilerLoop:
 async def main() -> None:
     settings = get_settings()
     configure_logging(debug=settings.debug)
+    # Same startup contract as the API (doc §9): a reconciler pointed at an
+    # unimplemented cloud must die at boot, not on the first archive upload a tick
+    # attempts an hour later.
+    validate_cloud_providers(settings)
+    # A distinct service.name so reconciler spans (workspace archive, pool
+    # replenishment, TTL reaping) are separable from the API's in the trace backend —
+    # they share the same Postgres and the same provisioner, so without this they'd be
+    # indistinguishable.
+    configure_tracing(settings, service_name=f"{settings.observability.service_name}-reconciler")
     loop = await ReconcilerLoop.create(settings)
     try:
         await loop.run_forever()

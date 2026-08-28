@@ -116,6 +116,8 @@ def _half_close_stdin(stream: Stream) -> None:
 
 
 class DockerProvisioner:
+    backend_name = "docker"
+
     def __init__(self, docker: aiodocker.Docker | None = None) -> None:
         self._docker = docker or aiodocker.Docker()
         self._owns_docker = docker is None

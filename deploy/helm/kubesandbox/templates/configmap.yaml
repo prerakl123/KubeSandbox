@@ -1,0 +1,29 @@
+{{/*
+Exists so the API and reconciler Deployments have something to checksum-annotate, which
+is what makes `helm upgrade` actually roll the pods when configuration changes. The
+values are duplicated from the env block on purpose: a ConfigMap that isn't consumed as
+env would drift silently, and one consumed via envFrom loses the per-key `required`
+validation the helper does.
+*/}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "kubesandbox.fullname" . }}-config
+  labels:
+    {{- include "kubesandbox.labels" . | nindent 4 }}
+data:
+  APP_ENV: {{ .Values.config.appEnv | quote }}
+  LOG_LEVEL: {{ .Values.config.logLevel | quote }}
+  CORS_ENABLED: {{ .Values.config.cors.enabled | quote }}
+  CORS_ALLOW_ORIGINS: {{ toJson .Values.config.cors.allowOrigins | quote }}
+  OIDC_ISSUER: {{ .Values.config.auth.oidcIssuer | quote }}
+  OIDC_AUDIENCE: {{ .Values.config.auth.oidcAudience | quote }}
+  OIDC_CLIENT_ID: {{ .Values.config.auth.oidcClientId | quote }}
+  SESSION_TTL_SECONDS: {{ .Values.config.auth.sessionTtlSeconds | quote }}
+  METRICS_ENABLED: {{ .Values.config.observability.metricsEnabled | quote }}
+  TRACING_ENABLED: {{ .Values.config.observability.tracingEnabled | quote }}
+  OTLP_ENDPOINT: {{ .Values.config.observability.otlpEndpoint | quote }}
+  TRACE_SAMPLE_RATIO: {{ .Values.config.observability.traceSampleRatio | quote }}
+  POOL_ENABLED: {{ .Values.config.pool.enabled | quote }}
+  WORKSPACE_PERSISTENCE_ENABLED: {{ .Values.config.workspace.persistenceEnabled | quote }}
+  BILLING_ENABLED: {{ .Values.config.billing.enabled | quote }}

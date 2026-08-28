@@ -65,6 +65,17 @@ billing:
   # to actually exercise pre-authorization/usage-recording locally.
   enabled: false
 
+observability:
+  # Metrics cost nothing locally and make `GET /metrics` available for eyeballing
+  # during development. Tracing needs a real OTLP collector, which local doesn't run
+  # (docker-compose.yml has no collector service) — point otlp_endpoint at one and
+  # flip tracing_enabled if you want to try it.
+  metrics_enabled: true
+  tracing_enabled: false
+  otlp_endpoint: null
+  service_name: kubesandbox
+  trace_sample_ratio: 1.0
+
 auth:
   # Convenience only: lets /execute be exercised without an IdP during local dev.
   # app/core/config.py refuses this outside app_env=local.

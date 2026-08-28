@@ -1,0 +1,57 @@
+{{- if .Values.rbac.create }}
+{{/*
+Least-privilege RBAC for the control plane's own ServiceAccount (doc §6 Layer 6, §11) —
+identical in intent to deploy/manifests/base/rbac.yaml, templated here so the chart is
+installable on its own.
+
+Cluster-scoped because creating and deleting a Namespace is itself a cluster-scoped
+operation, which doc §4.1's namespace-per-sandbox model requires. Note what is *absent*:
+no `secrets` access, no `deployments`, no `nodes` write, no `pods/attach` (attach goes
+through pods/exec), and no `*` verb anywhere — this identity can manage sandbox
+workloads and nothing else in the cluster.
+*/}}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "kubesandbox.fullname" . }}
+  labels:
+    {{- include "kubesandbox.labels" . | nindent 4 }}
+rules:
+  - apiGroups: [""]
+    resources: ["namespaces"]
+    verbs: ["get", "list", "watch", "create", "delete"]
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch", "create", "delete"]
+  - apiGroups: [""]
+    resources: ["pods/exec"]
+    verbs: ["create"]
+  - apiGroups: [""]
+    resources: ["pods/log"]
+    verbs: ["get"]
+  - apiGroups: [""]
+    resources: ["resourcequotas", "limitranges"]
+    verbs: ["get", "list", "create", "delete"]
+  - apiGroups: [""]
+    # One PVC per persistent workspace's long-lived namespace (doc §10.2).
+    resources: ["persistentvolumeclaims"]
+    verbs: ["get", "list", "create", "delete"]
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["networkpolicies"]
+    verbs: ["get", "list", "create", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "kubesandbox.fullname" . }}
+  labels:
+    {{- include "kubesandbox.labels" . | nindent 4 }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "kubesandbox.serviceAccountName" . }}
+    namespace: {{ .Release.Namespace }}
+roleRef:
+  kind: ClusterRole
+  name: {{ include "kubesandbox.fullname" . }}
+  apiGroup: rbac.authorization.k8s.io
+{{- end }}

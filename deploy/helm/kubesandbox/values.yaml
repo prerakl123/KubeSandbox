@@ -1,0 +1,275 @@
+# Default values for the KubeSandbox control-plane chart.
+#
+# These defaults describe an `aks-prod` deployment, because that's the only environment
+# this chart is actually for — `local` runs the app natively against docker-compose (see
+# docker-compose.yml's own header) and never installs a chart. `values-local.yaml` exists
+# only for kind-based K8s-spec parity testing (doc §8.1).
+#
+# Every REPLACE_ME below is a real deployment decision, not a placeholder that happens
+# to work: the chart's NOTES.txt lists them back after install so a half-configured
+# release is obvious immediately.
+
+replicaCount: 2
+# Two, not one, so a rolling update or a node drain never takes the API to zero — which
+# is also the minimum at which the PodDisruptionBudget below can allow any voluntary
+# disruption at all.
+
+image:
+  repository: REPLACE_ME.azurecr.io/kubesandbox/control-plane
+  tag: "0.1.0"
+  # Never `latest` and never `Always`: doc §8's whole premise is immutable, fully-baked
+  # images, and a mutable tag would mean two replicas of "the same" release could be
+  # running different code after a restart.
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+# Empty on purpose for AKS: attach the ACR to the cluster's kubelet identity
+# (`az aks update --attach-acr`) instead of copying registry credentials into a Secret.
+# See deploy/azure/README.md.
+
+nameOverride: ""
+fullnameOverride: ""
+
+serviceAccount:
+  # The control plane needs a real ServiceAccount: it creates and deletes namespaces,
+  # pods, PVCs, and NetworkPolicies (see rbac below), and none of that works with the
+  # default SA.
+  create: true
+  name: ""
+  annotations: {}
+  # For Azure Workload Identity, annotate with the user-assigned managed identity's
+  # client id and add the `azure.workload.identity/use: "true"` pod label — that identity
+  # is what DefaultAzureCredential resolves to for Key Vault, Blob, and ACR
+  # (app/cloud/*.py). Example:
+  #   azure.workload.identity/client-id: REPLACE_ME
+
+rbac:
+  # Same rules as deploy/manifests/base/rbac.yaml, templated here so the chart is
+  # self-sufficient. Set false if you apply the Kustomize base's RBAC instead — running
+  # both is harmless (identical rules) but makes it ambiguous which one owns them.
+  create: true
+
+service:
+  type: ClusterIP
+  # ClusterIP, never LoadBalancer: doc §12 gives sandboxes no inbound exposure and puts
+  # all interaction behind the control plane, which itself belongs behind an ingress
+  # that can terminate TLS and authenticate. A LoadBalancer here would put the API on
+  # the public internet with no TLS.
+  port: 80
+  targetPort: 8000
+  annotations: {}
+
+ingress:
+  # Required in practice for the UI (doc §1's second consumer): a browser needs an
+  # HTTPS origin, and the WebSocket attach route needs an ingress that will proxy an
+  # upgrade. Disabled by default so an install can't silently expose the API.
+  enabled: false
+  className: nginx
+  annotations:
+    # WS attach (doc §5.2) holds a connection for the life of an interactive session;
+    # the default 60s proxy read timeout would kill an idle terminal every minute.
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
+    # Batch runs stream a request body and block until the run completes; the default
+    # 60s would 504 a run that is still legitimately executing.
+    nginx.ingress.kubernetes.io/proxy-body-size: "16m"
+  hosts:
+    - host: REPLACE_ME.example.com
+      paths:
+        - path: /
+          pathType: Prefix
+  tls:
+    - secretName: kubesandbox-tls
+      hosts:
+        - REPLACE_ME.example.com
+
+resources:
+  # The control plane is I/O-bound (it waits on the K8s API, Postgres, and exec
+  # streams), so CPU requests are modest and memory is the real constraint. Requests are
+  # what the HPA's utilization target is computed against, so they're set to a realistic
+  # steady state rather than a floor.
+  requests:
+    cpu: 200m
+    memory: 512Mi
+  limits:
+    # No CPU limit deliberately: a CPU limit on a latency-sensitive async service causes
+    # cgroup throttling that shows up as unexplained tail latency on every request. The
+    # request reserves capacity; the HPA handles growth.
+    memory: 1Gi
+
+autoscaling:
+  # Doc §7's own table: "HPA + PDB" in aks-prod, 1 replica in local.
+  enabled: true
+  minReplicas: 2
+  maxReplicas: 10
+  targetCPUUtilizationPercentage: 70
+  targetMemoryUtilizationPercentage: 80
+  behavior:
+    scaleDown:
+      # Interactive PTY sessions are pinned to the replica serving them (doc §2: exec
+      # streams connect directly from a replica to the pod), so scaling down evicts live
+      # terminals. A long stabilization window makes that rare rather than reactive.
+      stabilizationWindowSeconds: 600
+      policies:
+        - type: Percent
+          value: 25
+          periodSeconds: 120
+    scaleUp:
+      stabilizationWindowSeconds: 30
+      policies:
+        - type: Percent
+          value: 100
+          periodSeconds: 30
+
+podDisruptionBudget:
+  enabled: true
+  # minAvailable rather than maxUnavailable: it keeps the guarantee expressed as "how
+  # much capacity must survive", which is what a node drain during a cluster upgrade
+  # actually needs to respect.
+  minAvailable: 1
+
+reconciler:
+  # The reconciler is a separate Deployment, not a sidecar and not an in-API background
+  # task — doc §4.1 specifies "a dedicated worker" and being separate is what lets the
+  # API scale on request load while TTL reaping stays single-threaded.
+  enabled: true
+  # Exactly one. Its jobs (TTL reaping, orphan GC, pool replenishment, retention sweeps)
+  # are not distributed-safe: two replicas would both try to reap the same sandbox and
+  # replenish the same pool. Doc §10.1 lists Redis reconciler locks for a future
+  # multi-replica version; nothing implements them yet, so this stays at 1.
+  replicaCount: 1
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      memory: 512Mi
+
+migrations:
+  # Alembic `upgrade head` as a pre-install/pre-upgrade Helm hook, so the schema is
+  # current before any new pod serves a request. A hook Job rather than an init
+  # container on the Deployment: with N replicas, an init container runs the migration N
+  # times concurrently, and Alembic is not safe under that.
+  enabled: true
+  backoffLimit: 2
+
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 10001
+  runAsGroup: 10001
+  fsGroup: 10001
+  seccompProfile:
+    type: RuntimeDefault
+
+securityContext:
+  # Doc §6 Layer 1 applies to the control plane too, not just to sandboxes — it is the
+  # component holding the cluster credentials that can create pods.
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop: ["ALL"]
+
+nodeSelector: {}
+tolerations: []
+affinity:
+  # Spread replicas across nodes so a single node failure can't take out the whole
+  # control plane. `preferred` rather than `required` so a small cluster can still
+  # schedule all replicas.
+  podAntiAffinity:
+    preferredDuringSchedulingIgnoredDuringExecution:
+      - weight: 100
+        podAffinityTerm:
+          topologyKey: kubernetes.io/hostname
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: kubesandbox
+              app.kubernetes.io/component: api
+
+# --- Application configuration -------------------------------------------------------
+# Non-secret settings land in a ConfigMap as KUBESANDBOX_* env vars, which sit above
+# config/settings/<env>.yaml in the precedence chain (app/core/config.py). Secrets come
+# from `existingSecret` or the Key Vault CSI mount below — never from values.yaml, which
+# ends up in `helm get values` and in git.
+
+config:
+  appEnv: aks-prod
+  logLevel: info
+
+  # Cross-origin access for the UI (doc §1). CORS is off in the app by default and a
+  # browser UI cannot make a single call without it, so this is the setting to fill in
+  # first when the frontend appears.
+  cors:
+    enabled: false
+    allowOrigins:
+      - https://REPLACE_ME.example.com
+
+  auth:
+    # Doc §11's OIDC path. `oidcIssuer`/`oidcAudience` are what makes a browser login
+    # possible at all; without them POST /v1/auth/token answers 503 and only API keys
+    # work.
+    oidcIssuer: "https://login.microsoftonline.com/REPLACE_ME/v2.0"
+    oidcAudience: "REPLACE_ME"
+    oidcClientId: "REPLACE_ME"
+    sessionTtlSeconds: 3600
+
+  observability:
+    metricsEnabled: true
+    # Requires a collector in the cluster. Settings refuse tracingEnabled without an
+    # endpoint, so these two move together.
+    tracingEnabled: false
+    otlpEndpoint: ""
+    traceSampleRatio: "1.0"
+
+  # These four mirror config/settings/aks-prod.yaml. Set here too so a release can turn
+  # one on without rebuilding the image, and so `helm get values` shows what's actually
+  # enabled.
+  pool:
+    enabled: true
+  workspace:
+    persistenceEnabled: true
+  billing:
+    # Off until tenant wallets are funded and pricing rules exist, or every sandbox
+    # creation fails on a zero balance — see BillingSettings.enabled's own docstring.
+    enabled: false
+
+  # Any Settings field this chart doesn't model, as raw KUBESANDBOX_* env vars keyed by
+  # full name (`__` nests, per app/core/config.py). Prefer a modelled field above where
+  # one exists; this is for the long tail (ttl.*, limits.*, reconciler.*, pool sizes).
+  #   extraSettings:
+  #     KUBESANDBOX_LIMITS__DEFAULT_WALL_CLOCK_SECONDS: "120"
+  #     KUBESANDBOX_POOL__LIGHT_POOL_SIZE: "20"
+  extraSettings: {}
+
+secrets:
+  # Name of an existing Secret holding the values below as keys. Preferred over
+  # `keyVault` for a first deployment: fewer moving parts, and no CSI driver required.
+  # Expected keys: KUBESANDBOX_DATABASE__DSN, KUBESANDBOX_REDIS__URL,
+  # KUBESANDBOX_AUTH__JWT_SECRET.
+  existingSecret: ""
+
+  keyVault:
+    # Azure Key Vault via the Secrets Store CSI driver (doc §7: "Azure Key Vault (CSI)").
+    # Mutually exclusive with `existingSecret` in practice — set one.
+    enabled: false
+    name: REPLACE_ME
+    tenantId: REPLACE_ME
+    clientId: REPLACE_ME
+    # Each entry becomes both a CSI object and a synced Kubernetes Secret key.
+    secrets:
+      - vaultKey: kubesandbox-database-dsn
+        envVar: KUBESANDBOX_DATABASE__DSN
+      - vaultKey: kubesandbox-redis-url
+        envVar: KUBESANDBOX_REDIS__URL
+      - vaultKey: kubesandbox-jwt-secret
+        envVar: KUBESANDBOX_AUTH__JWT_SECRET
+
+serviceMonitor:
+  # Prometheus Operator scrape config for GET /metrics (doc §14). Off by default because
+  # applying it without the Operator's CRDs installed fails the whole release.
+  enabled: false
+  interval: 30s
+  labels: {}
+
+extraEnv: []
+# Escape hatch for a setting this chart doesn't model. Any KUBESANDBOX_* var works —
+# app/core/config.py reads the whole Settings tree from env with `__` nesting.

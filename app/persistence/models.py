@@ -51,7 +51,21 @@ class ApiKey(Base):
     tenant_id: Mapped[str] = mapped_column(ForeignKey("tenants.id"))
     key_hash: Mapped[str] = mapped_column(String(128), unique=True)
     label: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    prefix: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    """First few plaintext characters of the key, stored in the clear for display
+    (Phase 9's `POST/GET /v1/api-keys`). The full key is unrecoverable — only its hash
+    is kept (doc §11) — so a UI needs *something* to render in a list, and a caller
+    needs something to match against the key they saved. Deliberately short enough to
+    leak nothing useful against 256 bits of entropy. Nullable because keys created
+    before this column existed (by direct DB insert, the only way there was) have none."""
     revoked: Mapped[bool] = mapped_column(Boolean, default=False)
+    created_by_user_id: Mapped[str | None] = mapped_column(ForeignKey("users.id"), nullable=True)
+    """Who minted it. Nullable: a key minted by another *key* (role `service`) has no
+    user to attribute to, and neither do pre-Phase-9 rows."""
+    last_used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    """Updated by the auth path on use. The one piece of information that makes
+    "is this key still needed?" answerable — without it, revoking safely means guessing.
+    Written on a best-effort basis; see `app/api/deps.py::_principal_from_api_key`."""
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
@@ -148,6 +162,23 @@ class Run(Base):
     sandbox_id: Mapped[str | None] = mapped_column(ForeignKey("sandboxes.id"), nullable=True)
     tenant_id: Mapped[str] = mapped_column(ForeignKey("tenants.id"))
     command: Mapped[list] = mapped_column(JSON, default=list)
+    status: Mapped[str] = mapped_column(String(16), default="completed")
+    """pending | running | completed | failed — doc §5.1's `?async=true` poll contract
+    ("poll GET /v1/runs/{run_id} until status=completed").
+
+    Defaults to `completed` because every synchronous run writes its row only *after*
+    finishing, which is every run before Phase 9: a `runs` row has always meant "a run
+    that happened". Only the async path ever persists a row in a non-terminal state.
+    `failed` means the run never produced a result at all (provisioning blew up, the
+    control plane restarted mid-run) — a program exiting non-zero is a perfectly
+    `completed` run with a non-zero `exit_code`."""
+    component_ref: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    """Which component ("name@version") actually ran. Nullable for rows written before
+    this column existed; recorded now so a UI's run history can show the language
+    without re-resolving the sandbox's component list."""
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    """Why a `failed` run produced no result. Distinct from `stderr_excerpt`, which is
+    the user program's own output — this is the control plane's own failure."""
     exit_code: Mapped[int | None] = mapped_column(Integer, nullable=True)
     stdout_excerpt: Mapped[str | None] = mapped_column(Text, nullable=True)
     stderr_excerpt: Mapped[str | None] = mapped_column(Text, nullable=True)
@@ -156,6 +187,9 @@ class Run(Base):
     timed_out: Mapped[bool] = mapped_column(Boolean, default=False)
     duration_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    """When the run reached a terminal status. Null while pending/running. Only the
+    async path leaves a visible gap between `created_at` and this."""
 
 
 # --- Build system (doc §8, Phase 6) -------------------------------------------------

@@ -1,0 +1,20 @@
+# Control-plane chart (doc §15: "Control plane deployed via Helm (values per env);
+# sandbox primitives via Kustomize base+overlays").
+#
+# Scope boundary worth being explicit about: this chart deploys the *control plane* —
+# the API Deployment, the reconciler Deployment, their Service, HPA, PDB, config, and
+# RBAC. It deliberately does NOT template the sandbox primitives (NetworkPolicy,
+# ResourceQuota, LimitRange, RuntimeClass); those live in
+# deploy/manifests/base + deploy/overlays/{local,aks-prod} as a Kustomize tree, because
+# doc §12 makes the egress allowlist "entirely a deployment-overlay concern" and
+# splitting one owner's decision across two templating systems is how those drift.
+apiVersion: v2
+name: kubesandbox
+description: KubeSandbox control plane — API, reconciler, and their supporting resources
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+keywords:
+  - sandbox
+  - code-execution
+  - kubernetes

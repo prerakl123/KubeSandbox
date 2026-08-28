@@ -1,0 +1,52 @@
+{{- if .Values.ingress.enabled }}
+{{/*
+Ingress for the control plane. Off by default so an install can't accidentally publish
+the API.
+
+Two things a generic ingress template would get wrong here, both encoded in the default
+annotations in values.yaml:
+
+* **WebSocket attach** (doc §5.2) holds a connection open for a human's whole terminal
+  session. An ingress controller's default proxy read timeout (60s for nginx) closes an
+  idle terminal every minute.
+* **Blocking batch runs** (doc §5.1) hold a request open until the run completes. The
+  same default timeout would 504 a run that is still legitimately executing.
+
+TLS is not optional in practice: a UI session token and API keys both travel in headers
+here, and the WS handshake carries its credential in the query string (browsers can't
+set headers on an upgrade) — over plain HTTP that lands in every intermediary's logs.
+*/}}
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ include "kubesandbox.fullname" . }}
+  labels:
+    {{- include "kubesandbox.labels" . | nindent 4 }}
+  {{- with .Values.ingress.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  {{- with .Values.ingress.className }}
+  ingressClassName: {{ . }}
+  {{- end }}
+  {{- with .Values.ingress.tls }}
+  tls:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  rules:
+    {{- range .Values.ingress.hosts }}
+    - host: {{ .host | quote }}
+      http:
+        paths:
+          {{- range .paths }}
+          - path: {{ .path }}
+            pathType: {{ .pathType }}
+            backend:
+              service:
+                name: {{ include "kubesandbox.fullname" $ }}
+                port:
+                  number: {{ $.Values.service.port }}
+          {{- end }}
+    {{- end }}
+{{- end }}

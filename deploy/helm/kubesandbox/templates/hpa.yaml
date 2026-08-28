@@ -1,0 +1,45 @@
+{{- if .Values.autoscaling.enabled }}
+{{/*
+HPA for the API (doc §7's table, doc §15). Only the API — see
+deployment-reconciler.yaml for why the reconciler must not scale.
+
+Both CPU and memory targets: the control plane is I/O-bound, so CPU alone is a poor
+signal (a replica holding hundreds of idle attach streams uses little CPU but real
+memory for the connections and their buffers).
+*/}}
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: {{ include "kubesandbox.fullname" . }}-api
+  labels:
+    {{- include "kubesandbox.labels" . | nindent 4 }}
+    app.kubernetes.io/component: api
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: {{ include "kubesandbox.fullname" . }}-api
+  minReplicas: {{ .Values.autoscaling.minReplicas }}
+  maxReplicas: {{ .Values.autoscaling.maxReplicas }}
+  metrics:
+    {{- with .Values.autoscaling.targetCPUUtilizationPercentage }}
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: {{ . }}
+    {{- end }}
+    {{- with .Values.autoscaling.targetMemoryUtilizationPercentage }}
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          averageUtilization: {{ . }}
+    {{- end }}
+  {{- with .Values.autoscaling.behavior }}
+  behavior:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+{{- end }}

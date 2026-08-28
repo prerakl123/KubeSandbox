@@ -24,6 +24,7 @@ import aiodocker
 import httpx
 from azure.identity.aio import DefaultAzureCredential
 
+from app.cloud.base import ComingSoonProvider
 from app.core.config import ImageRegistrySettings
 from app.core.errors import BuildError
 
@@ -117,17 +118,21 @@ class ACRRegistryProvider:
         return f"{self._endpoint}/{ref}"
 
 
-class AWSImageRegistryProvider:
+class AWSImageRegistryProvider(ComingSoonProvider):
+    coming_soon = _UNSUPPORTED
+
     async def push(self, local_tag: str) -> str:
-        raise NotImplementedError(_UNSUPPORTED)
+        self._raise()
 
     async def resolve(self, ref: str) -> str:
-        raise NotImplementedError(_UNSUPPORTED)
+        self._raise()
 
 
-class GCPImageRegistryProvider:
+class GCPImageRegistryProvider(ComingSoonProvider):
+    coming_soon = _UNSUPPORTED
+
     async def push(self, local_tag: str) -> str:
-        raise NotImplementedError(_UNSUPPORTED)
+        self._raise()
 
     async def resolve(self, ref: str) -> str:
-        raise NotImplementedError(_UNSUPPORTED)
+        self._raise()

@@ -1,0 +1,77 @@
+{{- if .Values.migrations.enabled }}
+{{/*
+Alembic `upgrade head` as a pre-install/pre-upgrade hook.
+
+A Helm hook Job, not an init container: with N replicas, an init container runs the
+migration N times concurrently on every rollout, and Alembic holds no lock that makes
+that safe. As a hook it runs exactly once, and Helm blocks the rest of the release until
+it succeeds — so a new API pod never starts against a schema it expects columns from.
+
+`hook-failed` is intentionally absent from the delete policy: when a migration fails,
+its pod and logs are the only diagnostic, and deleting them is how you end up with a
+failed release and nothing to read.
+*/}}
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "kubesandbox.fullname" . }}-migrate-{{ .Release.Revision }}
+  labels:
+    {{- include "kubesandbox.labels" . | nindent 4 }}
+    app.kubernetes.io/component: migrate
+  annotations:
+    helm.sh/hook: pre-install,pre-upgrade
+    helm.sh/hook-weight: "-5"
+    helm.sh/hook-delete-policy: before-hook-creation
+spec:
+  backoffLimit: {{ .Values.migrations.backoffLimit }}
+  template:
+    metadata:
+      labels:
+        {{- include "kubesandbox.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: migrate
+        {{- if .Values.secrets.keyVault.enabled }}
+        azure.workload.identity/use: "true"
+        {{- end }}
+    spec:
+      restartPolicy: Never
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      serviceAccountName: {{ include "kubesandbox.serviceAccountName" . }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: migrate
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          command: ["uv", "run", "alembic", "upgrade", "head"]
+          env:
+            {{- include "kubesandbox.env" . | nindent 12 }}
+            {{- include "kubesandbox.secretEnv" . | nindent 12 }}
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              memory: 512Mi
+          volumeMounts:
+            {{- include "kubesandbox.scratchVolumeMounts" . | nindent 12 }}
+            {{- if .Values.secrets.keyVault.enabled }}
+            - name: keyvault
+              mountPath: /mnt/secrets-store
+              readOnly: true
+            {{- end }}
+      volumes:
+        {{- include "kubesandbox.scratchVolumes" . | nindent 8 }}
+        {{- if .Values.secrets.keyVault.enabled }}
+        - name: keyvault
+          csi:
+            driver: secrets-store.csi.k8s.io
+            readOnly: true
+            volumeAttributes:
+              secretProviderClass: {{ include "kubesandbox.fullname" . }}-keyvault
+        {{- end }}
+{{- end }}

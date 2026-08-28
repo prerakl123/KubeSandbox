@@ -33,6 +33,7 @@ from datetime import UTC, datetime
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core import metrics
 from app.core.errors import KubeSandboxError
 from app.core.logging import get_logger
 from app.domain.billing import AuthResult, BillingPeriod, UsageEstimate, UsageEvent
@@ -164,6 +165,13 @@ class CreditBillingStrategy:
                 balance_after=wallet.balance,
             )
         )
+        # Doc §14's "quota/credit usage". Recorded here rather than at the
+        # BillingService facade because this is where the priced `cost` actually
+        # exists — the facade only ever sees a `None` return. The balance gauge is
+        # deliberately last-write-wins per tenant rather than a counter: a balance is
+        # a level, and it moves in both directions (top-ups via adjust_credit()).
+        metrics.usage_cost_total.labels(resource_type=event.resource_type, mode="credit").inc(cost)
+        metrics.credit_balance.labels(tenant_id=tenant_id).set(wallet.balance)
 
     async def settle(self, tenant_id, period, *, session) -> Invoice:
         # Credit tenants already pay in real time via record_usage()'s wallet
@@ -197,6 +205,10 @@ class PayAsYouGoBillingStrategy:
         now = datetime.now(UTC)
         cost = event.quantity * await _latest_unit_cost(event.resource_type, session, now=now)
         await _record_usage_row(tenant_id, event, cost, session)
+        # No `credit_balance` counterpart here: a PAYG tenant has no wallet at all
+        # (see this class's own authorize() — spend cap only), so there is no level to
+        # report, only accumulated cost.
+        metrics.usage_cost_total.labels(resource_type=event.resource_type, mode="payg").inc(cost)
 
     async def settle(self, tenant_id, period, *, session) -> Invoice:
         return await _generate_invoice_draft(tenant_id, period, session)
@@ -216,9 +228,15 @@ class BillingService:
 
     async def authorize(self, tenant_id: str, estimate: UsageEstimate, *, session: AsyncSession) -> AuthResult:
         account = await _get_or_create_account(tenant_id, self._default_mode, session)
-        return await self._strategy_for(account.mode).authorize(
+        result = await self._strategy_for(account.mode).authorize(
             tenant_id, estimate, account=account, session=session
         )
+        if not result.authorized:
+            # Counted at the facade, not in either strategy: a denial is a denial
+            # regardless of which rule produced it (balance vs. spend cap), and the
+            # `mode` label already carries that distinction.
+            metrics.billing_denials_total.labels(mode=account.mode).inc()
+        return result
 
     async def record_usage(self, tenant_id: str, event: UsageEvent, *, session: AsyncSession) -> None:
         account = await _get_or_create_account(tenant_id, self._default_mode, session)
@@ -260,6 +278,7 @@ class BillingService:
         )
         await session.commit()
         await session.refresh(wallet)
+        metrics.credit_balance.labels(tenant_id=tenant_id).set(float(wallet.balance))
         return wallet
 
     async def request_credit(

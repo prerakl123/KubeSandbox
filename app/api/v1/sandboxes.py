@@ -2,12 +2,15 @@ from __future__ import annotations
 
 import posixpath
 from datetime import datetime
+from typing import Annotated
 
 from fastapi import APIRouter, Body, Depends, HTTPException, Path, Query, Response, status
 from pydantic import BaseModel, Field
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import Principal, get_current_principal, get_sandbox_service
+from app.api.pagination import Page, PageParamsDep, paginate
 from app.domain.execution import BatchRunResult
 from app.persistence.db import get_session
 from app.persistence.models import Sandbox
@@ -134,6 +137,54 @@ async def create_sandbox(
         session=session,
     )
     return _summarize(row)
+
+
+@router.get(
+    "",
+    response_model=Page[SandboxResponse],
+    summary="List sandboxes",
+    description=(
+        "This tenant's sandboxes, newest first — the view a UI's dashboard renders, and "
+        "the only way to find a sandbox whose id a client has lost. Not in doc §17's "
+        "illustrative surface, which lists only create/status/destroy; without it a "
+        "leaked sandbox is invisible until its TTL reaps it.\n\n"
+        "Reports each sandbox's **last-known** state from the database rather than "
+        "asking the provisioner about every row — a list of 50 sandboxes must not fan "
+        "out into 50 provisioner calls. `GET /v1/sandboxes/{id}` is the live-status "
+        "endpoint, and it self-heals a stale row when it finds one."
+    ),
+)
+async def list_sandboxes(
+    params: PageParamsDep,
+    state: Annotated[
+        str | None,
+        Query(
+            description="Filter to one state (e.g. 'active'). Omit for all states, "
+            "including terminated ones — a UI needs history, not just live sandboxes."
+        ),
+    ] = None,
+    mine: Annotated[
+        bool,
+        Query(
+            description="Only sandboxes created by the calling user. Ignored for a "
+            "service-account (API-key) caller, which has no user identity to filter by."
+        ),
+    ] = False,
+    principal: Principal = Depends(get_current_principal),
+    session: AsyncSession = Depends(get_session),
+) -> Page[SandboxResponse]:
+    statement = select(Sandbox).where(Sandbox.tenant_id == principal.tenant_id)
+    if state is not None:
+        statement = statement.where(Sandbox.state == state)
+    if mine and principal.user_id is not None:
+        statement = statement.where(Sandbox.user_id == principal.user_id)
+    # `id` as a tiebreaker keeps paging deterministic when several sandboxes share a
+    # `created_at` at the database's timestamp resolution.
+    statement = statement.order_by(Sandbox.created_at.desc(), Sandbox.id.desc())
+    rows, total = await paginate(session, statement, params)
+    return Page[SandboxResponse](
+        items=[_summarize(r) for r in rows], total=total, limit=params.limit, offset=params.offset
+    )
 
 
 @router.get(

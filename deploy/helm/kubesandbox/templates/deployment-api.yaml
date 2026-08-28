@@ -1,0 +1,137 @@
+{{/*
+The API Deployment. Scales on request load via the HPA; every replica can serve any
+session because exec/attach streams connect directly from a replica to the sandbox pod
+(doc §2) — there are no sticky sessions to preserve, which is what makes horizontal
+scaling viable here at all.
+*/}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "kubesandbox.fullname" . }}-api
+  labels:
+    {{- include "kubesandbox.labels" . | nindent 4 }}
+    app.kubernetes.io/component: api
+spec:
+  {{- if not .Values.autoscaling.enabled }}
+  replicas: {{ .Values.replicaCount }}
+  {{- end }}
+  {{- /* When the HPA owns replicas, omitting the field here is deliberate: setting it
+         too makes every `helm upgrade` reset the replica count to the chart's value and
+         undo whatever the HPA had scaled to. */}}
+  selector:
+    matchLabels:
+      {{- include "kubesandbox.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: api
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+      {{- /* maxUnavailable 0: a rollout must not reduce capacity below what the PDB
+             guarantees, and an in-flight batch run on a terminating pod has no way to
+             be handed off. New pods come up first. */}}
+  template:
+    metadata:
+      labels:
+        {{- include "kubesandbox.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: api
+        {{- if .Values.secrets.keyVault.enabled }}
+        azure.workload.identity/use: "true"
+        {{- end }}
+      annotations:
+        # Roll the pods when non-secret config changes. Without this, a `helm upgrade`
+        # that only edits the ConfigMap leaves every replica running the old settings
+        # until something unrelated restarts them.
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        {{- if .Values.config.observability.metricsEnabled }}
+        prometheus.io/scrape: "true"
+        prometheus.io/port: {{ .Values.service.targetPort | quote }}
+        prometheus.io/path: "/metrics"
+        {{- end }}
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      serviceAccountName: {{ include "kubesandbox.serviceAccountName" . }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      # Long enough for an in-flight batch run to finish rather than being cut off
+      # mid-execution: the default 30s is shorter than the 60s wall-clock cap a run is
+      # allowed (limits.default_wall_clock_seconds).
+      terminationGracePeriodSeconds: 90
+      containers:
+        - name: api
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.service.targetPort }}
+              protocol: TCP
+          env:
+            {{- include "kubesandbox.env" . | nindent 12 }}
+            {{- include "kubesandbox.secretEnv" . | nindent 12 }}
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 20
+            timeoutSeconds: 3
+            failureThreshold: 3
+            # /healthz never touches Postgres or Redis on purpose (see its docstring):
+            # a database blip must not restart every replica simultaneously.
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+            # /readyz *does* check Postgres and Redis, which is exactly the difference:
+            # a replica that can't reach them should stop receiving traffic without
+            # being killed.
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 5
+            failureThreshold: 24
+            # Up to 2 minutes to boot. Startup loads and validates the whole component
+            # registry from disk and rehydrates built-image refs from Postgres (see
+            # app/main.py's lifespan), which is slower than a bare web app — a
+            # too-tight liveness probe would kill it mid-boot in a loop.
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          volumeMounts:
+            {{- include "kubesandbox.scratchVolumeMounts" . | nindent 12 }}
+            {{- if .Values.secrets.keyVault.enabled }}
+            - name: keyvault
+              mountPath: /mnt/secrets-store
+              readOnly: true
+            {{- end }}
+      volumes:
+        {{- include "kubesandbox.scratchVolumes" . | nindent 8 }}
+        {{- if .Values.secrets.keyVault.enabled }}
+        - name: keyvault
+          csi:
+            driver: secrets-store.csi.k8s.io
+            readOnly: true
+            volumeAttributes:
+              secretProviderClass: {{ include "kubesandbox.fullname" . }}-keyvault
+        {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

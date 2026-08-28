@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 from datetime import datetime
+from typing import Annotated
 
 from fastapi import APIRouter, BackgroundTasks, Depends, Path, Query
 from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import Principal, get_build_manager, get_current_principal, get_registry
+from app.api.pagination import Page, PageParamsDep, paginate
 from app.core.errors import ComponentNotFoundError
 from app.extensions.loader import Registry
 from app.persistence.db import get_session
@@ -88,6 +90,33 @@ async def trigger_build(
     if is_new:
         background_tasks.add_task(build_manager.run_build, build_row.id)
     return _summarize(build_row)
+
+
+@router.get(
+    "/builds",
+    response_model=Page[BuildResponse],
+    summary="List builds",
+    description=(
+        "Build history, newest first — what a UI's build page renders. Scoped exactly "
+        "like `GET /v1/builds/{id}`: an admin sees every build, anyone else sees public "
+        "builds plus their own tenant's private ones."
+    ),
+)
+async def list_builds(
+    params: PageParamsDep,
+    build_status: Annotated[
+        str | None,
+        Query(alias="status", description="pending | running | succeeded | failed."),
+    ] = None,
+    principal: Principal = Depends(get_current_principal),
+    session: AsyncSession = Depends(get_session),
+    build_manager: BuildManager = Depends(get_build_manager),
+) -> Page[BuildResponse]:
+    statement = build_manager.build_list_statement(principal, build_status=build_status)
+    rows, total = await paginate(session, statement, params)
+    return Page[BuildResponse](
+        items=[_summarize(r) for r in rows], total=total, limit=params.limit, offset=params.offset
+    )
 
 
 @router.get(

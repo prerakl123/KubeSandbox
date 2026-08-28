@@ -1,0 +1,24 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "kubesandbox.fullname" . }}
+  labels:
+    {{- include "kubesandbox.labels" . | nindent 4 }}
+    app.kubernetes.io/component: api
+  {{- with .Values.service.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ .Values.service.type }}
+  ports:
+    - port: {{ .Values.service.port }}
+      targetPort: http
+      protocol: TCP
+      name: http
+  selector:
+    {{- include "kubesandbox.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: api
+    {{- /* Selects only the API pods, never the reconciler — it shares the same
+           `name`/`instance` labels and serves no HTTP, so without the component label
+           a share of requests would be routed to a pod with nothing listening. */}}

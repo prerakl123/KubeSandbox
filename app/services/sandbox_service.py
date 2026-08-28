@@ -28,15 +28,25 @@ Two ways to resolve a spec either way: a single ad-hoc language component (Phase
 or a SandboxTemplate composed from base + multiple components (Phase 2, doc §3.4) —
 see template_render.render_template for how the latter merges component specs into
 one runnable SandboxSpec.
+
+Observability (Phase 9, doc §14): this is where doc §14's `sandboxes_active`/
+`provision_latency`/`run_duration`/`pool_hit_rate` are actually recorded, and where the
+manual `API -> provisioner` trace spans are opened — see `app/core/metrics.py` and
+`app/core/tracing.py`. Instrumentation is unconditional and non-failing by design: the
+metric objects are always live (an in-process counter add is nothing), and `span()`
+degrades to a no-op tracer when tracing is off, so no call site below needs a branch
+and a broken collector can never fail a real sandbox.
 """
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from app.core import metrics
 from app.core.errors import (
     BillingAuthorizationError,
     ComponentNotFoundError,
@@ -45,6 +55,7 @@ from app.core.errors import (
     TemplateNotFoundError,
 )
 from app.core.logging import get_logger
+from app.core.tracing import span
 from app.domain.execution import (
     BatchCommand,
     BatchRunResult,
@@ -126,6 +137,7 @@ class SandboxService:
         heavy_tolerations: list[dict[str, str]] | None = None,
         workspace_service: WorkspaceService | None = None,
         billing_service: BillingService | None = None,
+        session_factory: async_sessionmaker[AsyncSession] | None = None,
     ) -> None:
         self._registry = registry
         self._provisioner = provisioner
@@ -137,6 +149,12 @@ class SandboxService:
         self._heavy_tolerations = heavy_tolerations or []
         self._workspace_service = workspace_service
         self._billing_service = billing_service
+        self._session_factory = session_factory
+        """Only the `?async=true` path needs this (doc §5.1, Phase 9): its work runs
+        after the triggering request — and its request-scoped session — has already
+        returned, so it must open its own, exactly as `BuildManager` does. Every
+        synchronous method here still takes a caller-supplied session and this stays
+        `None` for them."""
 
     def _resolve_component(self, language: str, version: str | None) -> Component:
         try:
@@ -266,15 +284,93 @@ class SandboxService:
         if not auth.authorized:
             raise BillingAuthorizationError(auth.reason or "billing authorization denied")
 
+    async def _acquire_instrumented(self, spec: SandboxSpec, *, source: str) -> SandboxHandle:
+        """`provisioner.acquire()` wrapped in doc §14's `provision_latency` histogram
+        and a manual `API -> provisioner` trace span.
+
+        `source` distinguishes a fresh create from a pool claim in both the histogram
+        label and the span name — the whole point of measuring provisioning is being
+        able to see the two apart, since doc §4.3's warm pools exist precisely to move
+        requests from one to the other.
+        """
+        weight_class = spec.weight_class.value
+        backend = self._provisioner.backend_name
+        started = time.perf_counter()
+        try:
+            with span(
+                f"sandbox.acquire.{source}",
+                **{
+                    "kubesandbox.backend": backend,
+                    "kubesandbox.weight_class": weight_class,
+                    "kubesandbox.image": spec.image,
+                    "kubesandbox.persistent": spec.workspace_id is not None,
+                },
+            ):
+                handle = await self._provisioner.acquire(spec)
+        except Exception:
+            metrics.provision_failures_total.labels(backend=backend, weight_class=weight_class).inc()
+            raise
+        metrics.provision_latency_seconds.labels(
+            backend=backend, weight_class=weight_class, source=source
+        ).observe(time.perf_counter() - started)
+        return handle
+
+    async def _run_instrumented(
+        self, handle: SandboxHandle, command: BatchCommand, component: Component
+    ) -> BatchRunResult:
+        """`provisioner.exec_batch()` wrapped in doc §14's `run_duration` histogram, a
+        `runs_total` counter, and a trace span.
+
+        The duration recorded is the provisioner's own `duration_ms` (what the sandbox
+        actually spent running), not this method's wall clock — the two differ by
+        exec-stream setup, and `duration_ms` is the number already reported to the
+        caller in `BatchRunResult`, so the metric and the API response can't disagree.
+        The `language` label is the component *name* without its version: a per-version
+        label would multiply series every time a component is published, and "how slow
+        is Python" is the question this answers.
+        """
+        language = component.metadata.name
+        with span(
+            "sandbox.exec_batch",
+            **{
+                "kubesandbox.backend": handle.backend,
+                "kubesandbox.component": component.key,
+                "kubesandbox.sandbox_id": handle.sandbox_id,
+                "kubesandbox.timeout_seconds": command.timeout_seconds,
+            },
+        ):
+            result = await self._provisioner.exec_batch(handle, command)
+
+        outcome = metrics.run_outcome(
+            exit_code=result.exit_code, timed_out=result.timed_out, truncated=result.truncated
+        )
+        metrics.run_duration_seconds.labels(language=language, outcome=outcome).observe(
+            result.duration_ms / 1000
+        )
+        metrics.runs_total.labels(language=language, outcome=outcome).inc()
+        return result
+
     async def _acquire_for_execute(self, spec: SandboxSpec, session: AsyncSession) -> SandboxHandle:
         """Warm-pool claim first (doc §4.3), falling back to a fresh
         `provisioner.acquire()` on a pool miss or when pooling isn't wired up
         (`pool_manager is None`) — identical to pre-Phase-7 behavior either way."""
         if self._pool_manager is not None:
+            weight_class = spec.weight_class.value
+            started = time.perf_counter()
             claimed = await self._pool_manager.try_claim(spec, session=session)
+            # Only counted when pooling is actually enabled: a deployment with
+            # `pool.enabled: false` has no pool to hit or miss, and counting every
+            # acquire as a "miss" there would make the derived hit rate read 0% for a
+            # feature that simply isn't turned on.
+            metrics.pool_claims_total.labels(
+                weight_class=weight_class, result="hit" if claimed is not None else "miss"
+            ).inc()
             if claimed is not None:
+                metrics.provision_latency_seconds.labels(
+                    backend=self._provisioner.backend_name, weight_class=weight_class, source="pool"
+                ).observe(time.perf_counter() - started)
                 return claimed
-        return await self._provisioner.acquire(spec)
+        return await self._acquire_instrumented(spec, source="fresh")
 
     @staticmethod
     def _is_clean_run(result: BatchRunResult) -> bool:
@@ -392,6 +488,154 @@ class SandboxService:
             raise KubeSandboxError(f"sandbox {row.id} has no known runnable component")
         return self._registry.resolve_component_ref(row.component_refs[0])
 
+    async def _persist_run_result(
+        self,
+        result: BatchRunResult,
+        *,
+        existing_run_id: str | None,
+        sandbox_id: str,
+        tenant_id: str,
+        command: list[str],
+        component_ref: str,
+        session: AsyncSession,
+    ) -> Run:
+        """Write (or complete) the `runs` row for a finished batch run.
+
+        Output is stored as a 10 KB excerpt per stream, unchanged from Phase 1 — doc
+        §10.1 puts full logs in the object store, and nothing writes them there yet.
+        """
+        fields = {
+            "sandbox_id": sandbox_id,
+            "tenant_id": tenant_id,
+            "command": command,
+            "component_ref": component_ref,
+            "status": "completed",
+            "exit_code": result.exit_code,
+            "stdout_excerpt": result.stdout[:10_000],
+            "stderr_excerpt": result.stderr[:10_000],
+            "variables": result.variables,
+            "truncated": result.truncated,
+            "timed_out": result.timed_out,
+            "duration_ms": result.duration_ms,
+            "finished_at": datetime.now(UTC),
+        }
+        if existing_run_id is None:
+            run_row = Run(**fields)
+            session.add(run_row)
+            return run_row
+
+        run_row = await session.get(Run, existing_run_id)
+        if run_row is None:
+            # Can't happen via the API (the row is committed before the background task
+            # is scheduled), but a missing row must not silently discard a completed
+            # run's result — a fresh row keeps the record even if the poll id is lost.
+            run_row = Run(id=existing_run_id, **fields)
+            session.add(run_row)
+            return run_row
+        for key, value in fields.items():
+            setattr(run_row, key, value)
+        return run_row
+
+    async def start_async_run(
+        self,
+        *,
+        language: str,
+        version: str | None,
+        template: str | None,
+        tenant_id: str,
+        session: AsyncSession,
+    ) -> Run:
+        """Persist a `pending` Run row and return it, for doc §5.1's `?async=true`.
+
+        Resolves the spec first and lets a resolution failure propagate, so an unknown
+        language or a bad template still fails the *triggering* request with a real
+        404/400 — pushing that into the background would turn every typo into a
+        successful 202 followed by a mysteriously failed run.
+        """
+        if self._session_factory is None:
+            # Checked here, not in run_async: by the time the background task runs, the
+            # 202 has already been sent and there is no caller left to tell. A
+            # misconfigured service must fail the triggering request instead of
+            # accepting a run it can never execute.
+            raise KubeSandboxError(
+                "async runs are not available: SandboxService was built without a session_factory"
+            )
+        resolved = self._resolve_spec(language=language, version=version, template=template)
+        run_row = Run(
+            tenant_id=tenant_id,
+            status="pending",
+            component_ref=resolved.component.key,
+            command=[],
+            # `sandbox_id` stays null until the run actually acquires one: no sandbox
+            # exists yet, and the column is nullable precisely for this.
+        )
+        session.add(run_row)
+        await session.commit()
+        await session.refresh(run_row)
+        return run_row
+
+    async def run_async(
+        self,
+        run_id: str,
+        *,
+        language: str,
+        code: str,
+        version: str | None,
+        stdin: str,
+        template: str | None,
+        tenant_id: str,
+        user_id: str | None,
+    ) -> None:
+        """Background body of `POST /v1/execute?async=true`.
+
+        Opens its own session (the triggering request's is long gone) and drives the
+        same `execute()` as the synchronous path, then leaves the row terminal either
+        way. Never raises: it runs as a fire-and-forget background task with no caller
+        to catch anything, so a failure has to be *recorded* on the row — otherwise a
+        poller waits forever on a `pending` run that will never move.
+
+        Honest limitation: a control-plane restart mid-run leaves the row `running`
+        forever. Nothing resumes it (the same gap `BuildManager`'s own background
+        builds have) — see the Phase 9 scope boundaries in docs/TASK_CHECKLIST.md.
+        """
+        if self._session_factory is None:
+            # Unreachable via the API — start_async_run refuses first, before any 202 is
+            # sent. Logged rather than raised because this method is a fire-and-forget
+            # background task with no caller to catch anything.
+            logger.error("async_run_without_session_factory", run_id=run_id)
+            return
+
+        async with self._session_factory() as session:
+            run_row = await session.get(Run, run_id)
+            if run_row is not None:
+                run_row.status = "running"
+                await session.commit()
+            try:
+                await self.execute(
+                    language=language,
+                    code=code,
+                    version=version,
+                    stdin=stdin,
+                    template=template,
+                    tenant_id=tenant_id,
+                    user_id=user_id,
+                    session=session,
+                    existing_run_id=run_id,
+                )
+            except Exception as exc:  # noqa: BLE001 — must be recorded, not propagated
+                logger.warning("async_run_failed", run_id=run_id, error=str(exc))
+                await session.rollback()
+                # A fresh session: the one above may be in a failed transaction state
+                # after the rollback, and marking the row `failed` is the one write
+                # that absolutely has to land.
+                async with self._session_factory() as failure_session:
+                    failed = await failure_session.get(Run, run_id)
+                    if failed is not None:
+                        failed.status = "failed"
+                        failed.error = str(exc)
+                        failed.finished_at = datetime.now(UTC)
+                        await failure_session.commit()
+
     async def execute(
         self,
         *,
@@ -403,7 +647,14 @@ class SandboxService:
         tenant_id: str,
         user_id: str | None,
         session: AsyncSession,
+        existing_run_id: str | None = None,
     ) -> BatchRunResult:
+        """`existing_run_id` reuses an already-persisted `pending` Run row instead of
+        creating a new one — the `?async=true` path (doc §5.1) needs the row to exist
+        *before* the run starts, so the caller has an id to poll. Everything else about
+        the execution is identical, which is the point: pooling, sidecar provisioning,
+        teardown, and billing all stay on one code path rather than being duplicated
+        for the async variant."""
         resolved = self._resolve_spec(language=language, version=version, template=template)
         batch_command = self._build_batch_command(resolved.component, code, stdin)
         idle_ttl_seconds, max_ttl_seconds = self._resolve_ttl_seconds(resolved)
@@ -419,6 +670,10 @@ class SandboxService:
         # scoped to execute()'s fully self-contained lifetime).
         async with self._weight_class_scheduler.slot(resolved.spec.weight_class):
             handle = await self._acquire_for_execute(resolved.spec, session)
+            active_gauge = metrics.sandboxes_active.labels(
+                backend=handle.backend, weight_class=resolved.spec.weight_class.value
+            )
+            active_gauge.inc()
 
             sandbox_row = Sandbox(
                 id=handle.sandbox_id,
@@ -441,7 +696,7 @@ class SandboxService:
             result: BatchRunResult | None = None
             try:
                 await self._provision_sidecars(handle, resolved.sidecar_components, resolved.sidecar_credentials)
-                result = await self._provisioner.exec_batch(handle, batch_command)
+                result = await self._run_instrumented(handle, batch_command, resolved.component)
             finally:
                 # Graceful eradication (doc §4.1): always tear down or release the
                 # ephemeral sandbox, whether sidecar provisioning or the run itself
@@ -449,20 +704,20 @@ class SandboxService:
                 # goes back to the warm pool (doc §4.3); everything else is destroyed.
                 await self._teardown_sidecars(handle, resolved.sidecar_components)
                 await self._release_or_destroy(handle, resolved.spec, result, session)
+                # Decremented here, in the same `finally` that guarantees the sandbox is
+                # gone — not after it, so an exception on the run path can't leak a
+                # permanently-incremented gauge for a sandbox that no longer exists.
+                active_gauge.dec()
 
-        run_row = Run(
+        run_row = await self._persist_run_result(
+            result,
+            existing_run_id=existing_run_id,
             sandbox_id=handle.sandbox_id,
             tenant_id=tenant_id,
             command=batch_command.command,
-            exit_code=result.exit_code,
-            stdout_excerpt=result.stdout[:10_000],
-            stderr_excerpt=result.stderr[:10_000],
-            variables=result.variables,
-            truncated=result.truncated,
-            timed_out=result.timed_out,
-            duration_ms=result.duration_ms,
+            component_ref=resolved.component.key,
+            session=session,
         )
-        session.add(run_row)
         sandbox_row.state = "terminated"
 
         if self._billing_service is not None:
@@ -558,6 +813,13 @@ class SandboxService:
         session.add(sandbox_row)
         await session.commit()
         await session.refresh(sandbox_row)
+        # Incremented only after the commit that makes this sandbox reachable by id:
+        # every path that decrements it goes through destroy_sandbox(), which needs a
+        # persisted row to find. Incrementing before the commit would leak the gauge
+        # if the commit itself failed.
+        metrics.sandboxes_active.labels(
+            backend=handle.backend, weight_class=resolved.spec.weight_class.value
+        ).inc()
         return sandbox_row
 
     async def get_sandbox(self, sandbox_id: str, tenant_id: str, session: AsyncSession) -> Sandbox:
@@ -623,6 +885,15 @@ class SandboxService:
         row.state = "terminated"
         row.terminated_at = now
         await session.commit()
+        # Mirrors create_sandbox()'s increment. Guarded by the `state == "terminated"`
+        # early return above, so a repeated destroy of the same sandbox (idempotent by
+        # contract) can't drive the gauge negative. It still under-counts across a
+        # restart — a sandbox created by a previous process and destroyed by this one
+        # decrements a gauge that was never incremented here; prometheus_client clamps
+        # nothing, so that shows up as a negative value. See app/core/metrics.py's
+        # module docstring for why this is a per-process in-flight gauge, not the
+        # authoritative live-sandbox count.
+        metrics.sandboxes_active.labels(backend=row.backend, weight_class=row.weight_class).dec()
 
     async def open_pty(self, sandbox_id: str, tenant_id: str, session: AsyncSession) -> PTYStream:
         """Interactive attach (doc §5.2, Phase 4) — the WS gateway's only touchpoint
@@ -693,23 +964,21 @@ class SandboxService:
         batch_command = self._build_batch_command(component, code, stdin)
         handle = self._handle_from_row(row)
 
-        result = await self._provisioner.exec_batch(handle, batch_command)
+        result = await self._run_instrumented(handle, batch_command, component)
 
         row.last_active_at = datetime.now(UTC)
         await self._touch_workspace(row, session)
-        session.add(
-            Run(
-                sandbox_id=row.id,
-                tenant_id=tenant_id,
-                command=batch_command.command,
-                exit_code=result.exit_code,
-                stdout_excerpt=result.stdout[:10_000],
-                stderr_excerpt=result.stderr[:10_000],
-                variables=result.variables,
-                truncated=result.truncated,
-                timed_out=result.timed_out,
-                duration_ms=result.duration_ms,
-            )
+        # Same `runs` row shape as execute()'s, via the same helper — so a UI's run
+        # history can't tell a run against a warm sandbox apart from a one-shot one by
+        # some field being populated in one path and not the other.
+        await self._persist_run_result(
+            result,
+            existing_run_id=None,
+            sandbox_id=row.id,
+            tenant_id=tenant_id,
+            command=batch_command.command,
+            component_ref=component.key,
+            session=session,
         )
         await session.commit()
         return result

@@ -162,6 +162,8 @@ def _max_single_container_resources(spec: SandboxSpec) -> tuple[str, str]:
 
 
 class KubernetesProvisioner:
+    backend_name = "kubernetes"
+
     def __init__(
         self,
         configuration: client.Configuration,

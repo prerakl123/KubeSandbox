@@ -8,11 +8,18 @@ dependencies = [
     "alembic>=1.18.5",
     "asyncpg>=0.31.0",
     "azure-identity>=1.25.3",
+    "azure-keyvault-secrets>=4.11.2",
     "azure-storage-blob>=12.30.0",
     "fastapi>=0.139.2",
     "httpx>=0.28.1",
     "jsonschema>=4.26.0",
     "kubernetes-asyncio>=32.0.0",
+    "opentelemetry-exporter-otlp-proto-grpc>=1.44.0",
+    "opentelemetry-instrumentation-fastapi>=0.65b0",
+    "opentelemetry-instrumentation-httpx>=0.65b0",
+    "opentelemetry-instrumentation-sqlalchemy>=0.65b0",
+    "opentelemetry-sdk>=1.44.0",
+    "prometheus-client>=0.26.0",
     "pydantic>=2",
     "pydantic-settings>=2.14.2",
     "pyjwt>=2.13.0",
@@ -34,3 +41,8 @@ dev = [
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
+# `sdk/` is a separately installable package (see sdk/pyproject.toml), not part of the
+# control-plane distribution — this puts it on the path for tests/unit/test_sdk.py
+# without installing it into this project's environment, which would defeat the point
+# of keeping its dependency footprint independent.
+pythonpath = ["sdk"]

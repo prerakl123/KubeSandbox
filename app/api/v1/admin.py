@@ -1,15 +1,18 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Literal
+from typing import Annotated, Literal
 
-from fastapi import APIRouter, Depends, Path, Query
+from fastapi import APIRouter, Depends, HTTPException, Path, Query, status
 from pydantic import BaseModel, Field
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import Principal, get_billing_service, get_entitlement_service, require_admin
+from app.api.pagination import Page, PageParamsDep, paginate
 from app.api.v1.billing import CreditRequestOut, credit_request_to_out
 from app.persistence.db import get_session
+from app.persistence.models import BillingAccount, CreditWallet, PricingRule, Sandbox, Tenant, User
 from app.services.billing_service import BillingService
 from app.services.entitlement_service import EntitlementService
 
@@ -237,6 +240,49 @@ async def adjust_tenant_credit(
     return CreditWalletOut(tenant_id=wallet.tenant_id, balance=wallet.balance)
 
 
+@router.get(
+    "/pricing-rules",
+    response_model=list[PricingRuleOut],
+    summary="List pricing rules",
+    description=(
+        "Every configured rule, newest `effective_from` first. Rules are append-only "
+        "(doc §10.1 — multiple rules per resource type coexist so a rate change can be "
+        "scheduled), which means the *current* price for a resource type is the newest "
+        "rule whose `effective_from` has passed — a POST-only endpoint left an admin no "
+        "way to see what pricing is actually in force. Admin-only."
+    ),
+)
+async def list_pricing_rules(
+    resource_type: Annotated[
+        str | None,
+        Query(description="Filter to one resource type, e.g. 'cpu_second'."),
+    ] = None,
+    _: Principal = Depends(require_admin),
+    session: AsyncSession = Depends(get_session),
+) -> list[PricingRuleOut]:
+    statement = select(PricingRule)
+    if resource_type is not None:
+        statement = statement.where(PricingRule.resource_type == resource_type)
+    rows = (
+        (await session.execute(statement.order_by(PricingRule.effective_from.desc(), PricingRule.id.desc())))
+        .scalars()
+        .all()
+    )
+    # Not paginated: pricing rules are a handful of operator-authored rows per resource
+    # type, bounded by admin action rather than traffic — the same reason the registry
+    # listings aren't paginated either (see app/api/pagination.py).
+    return [
+        PricingRuleOut(
+            id=r.id,
+            resource_type=r.resource_type,
+            unit_cost=float(r.unit_cost),
+            currency=r.currency,
+            effective_from=r.effective_from,
+        )
+        for r in rows
+    ]
+
+
 @router.post(
     "/pricing-rules",
     response_model=PricingRuleOut,
@@ -321,3 +367,177 @@ async def review_credit_request(
         session=session,
     )
     return credit_request_to_out(row)
+
+
+# --- Tenant / user administration (Phase 9) ------------------------------------------
+# Neither existed before: doc §17's admin surface covers entitlements, publish grants,
+# billing mode, and pricing, all of which take a `tenant_id` an admin was expected to
+# already know. An admin UI has to be able to *find* a tenant before it can configure
+# one, and had no way to.
+
+
+class TenantOut(BaseModel):
+    id: str
+    name: str = Field(
+        description="Operator-chosen name, or 'oidc:<directory-id>' for a tenant "
+        "provisioned automatically on a user's first OIDC login (doc §11)."
+    )
+    created_at: datetime
+    user_count: int
+    active_sandbox_count: int = Field(
+        description="Sandboxes not in a terminated state — the number that matters for "
+        "'is this tenant actually using the platform', and for spotting a tenant leaking "
+        "sandboxes before its TTLs reap them."
+    )
+    billing_mode: str | None = Field(description="Null until the tenant has a BillingAccount row.")
+    credit_balance: float | None = Field(description="Credit-mode tenants only.")
+
+
+class UserOut(BaseModel):
+    id: str
+    tenant_id: str
+    email: str
+    role: str = Field(description="admin | operator | user (doc §11's RBAC).")
+    created_at: datetime
+
+
+class SetUserRoleIn(BaseModel):
+    role: Literal["admin", "operator", "user"] = Field(
+        description="New role. Promotion to admin is deliberately an explicit admin "
+        "action — no OIDC claim can grant it (see AuthService)."
+    )
+
+
+@router.get(
+    "/tenants",
+    response_model=Page[TenantOut],
+    summary="List tenants",
+    description=(
+        "Every tenant, newest first, with the counts and billing position an admin needs "
+        "to decide what to configure. Admin-only, and deliberately not entitlement- "
+        "filtered — doc §3.6: admin endpoints bypass entitlement filtering entirely."
+    ),
+)
+async def list_tenants(
+    params: PageParamsDep,
+    name: Annotated[str | None, Query(description="Case-insensitive substring match on name.")] = None,
+    _: Principal = Depends(require_admin),
+    session: AsyncSession = Depends(get_session),
+) -> Page[TenantOut]:
+    statement = select(Tenant)
+    if name:
+        statement = statement.where(Tenant.name.ilike(f"%{name}%"))
+    statement = statement.order_by(Tenant.created_at.desc(), Tenant.id.desc())
+    rows, total = await paginate(session, statement, params)
+
+    # Per-page aggregate lookups rather than N queries per row: `limit` is capped at
+    # 200, so these are three bounded queries regardless of page size, where a
+    # per-tenant count would be 3xN.
+    tenant_ids = [t.id for t in rows]
+    users_by_tenant: dict[str, int] = {}
+    sandboxes_by_tenant: dict[str, int] = {}
+    accounts: dict[str, str] = {}
+    balances: dict[str, float] = {}
+    if tenant_ids:
+        for tenant_id, count in (
+            await session.execute(
+                select(User.tenant_id, func.count())
+                .where(User.tenant_id.in_(tenant_ids))
+                .group_by(User.tenant_id)
+            )
+        ).all():
+            users_by_tenant[tenant_id] = int(count)
+        for tenant_id, count in (
+            await session.execute(
+                select(Sandbox.tenant_id, func.count())
+                .where(Sandbox.tenant_id.in_(tenant_ids), Sandbox.state != "terminated")
+                .group_by(Sandbox.tenant_id)
+            )
+        ).all():
+            sandboxes_by_tenant[tenant_id] = int(count)
+        for account in (
+            await session.execute(select(BillingAccount).where(BillingAccount.tenant_id.in_(tenant_ids)))
+        ).scalars():
+            accounts[account.tenant_id] = account.mode
+        for wallet in (
+            await session.execute(select(CreditWallet).where(CreditWallet.tenant_id.in_(tenant_ids)))
+        ).scalars():
+            balances[wallet.tenant_id] = float(wallet.balance)
+
+    return Page[TenantOut](
+        items=[
+            TenantOut(
+                id=t.id,
+                name=t.name,
+                created_at=t.created_at,
+                user_count=users_by_tenant.get(t.id, 0),
+                active_sandbox_count=sandboxes_by_tenant.get(t.id, 0),
+                billing_mode=accounts.get(t.id),
+                credit_balance=balances.get(t.id),
+            )
+            for t in rows
+        ],
+        total=total,
+        limit=params.limit,
+        offset=params.offset,
+    )
+
+
+@router.get(
+    "/users",
+    response_model=Page[UserOut],
+    summary="List users",
+    description="Every user, newest first, optionally scoped to one tenant. Admin-only.",
+)
+async def list_users(
+    params: PageParamsDep,
+    tenant_id: Annotated[str | None, Query(description="Only users in this tenant.")] = None,
+    email: Annotated[str | None, Query(description="Case-insensitive substring match on email.")] = None,
+    _: Principal = Depends(require_admin),
+    session: AsyncSession = Depends(get_session),
+) -> Page[UserOut]:
+    statement = select(User)
+    if tenant_id is not None:
+        statement = statement.where(User.tenant_id == tenant_id)
+    if email:
+        statement = statement.where(User.email.ilike(f"%{email}%"))
+    statement = statement.order_by(User.created_at.desc(), User.id.desc())
+    rows, total = await paginate(session, statement, params)
+    return Page[UserOut](
+        items=[
+            UserOut(id=u.id, tenant_id=u.tenant_id, email=u.email, role=u.role, created_at=u.created_at)
+            for u in rows
+        ],
+        total=total,
+        limit=params.limit,
+        offset=params.offset,
+    )
+
+
+@router.patch(
+    "/users/{user_id}/role",
+    response_model=UserOut,
+    summary="Change a user's role",
+    description=(
+        "The only way to promote someone to `admin` (doc §11's RBAC). Deliberately an "
+        "explicit admin action rather than something derived from an IdP claim — "
+        "`AuthService` never grants a role from a token, so without this endpoint the "
+        "first admin can only be created by a direct DB write."
+    ),
+    responses={404: {"description": "No such user."}},
+)
+async def set_user_role(
+    body: SetUserRoleIn,
+    user_id: str = Path(description="User id, as returned by GET /v1/admin/users."),
+    _: Principal = Depends(require_admin),
+    session: AsyncSession = Depends(get_session),
+) -> UserOut:
+    user = await session.get(User, user_id)
+    if user is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, f"no such user: {user_id}")
+    user.role = body.role
+    await session.commit()
+    await session.refresh(user)
+    return UserOut(
+        id=user.id, tenant_id=user.tenant_id, email=user.email, role=user.role, created_at=user.created_at
+    )

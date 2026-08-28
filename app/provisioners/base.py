@@ -50,6 +50,14 @@ class PTYStream(Protocol):
 
 
 class Provisioner(Protocol):
+    backend_name: str
+    """"docker" | "kubernetes" — the same value each implementation stamps onto the
+    `SandboxHandle.backend` it returns, but readable *before* a handle exists. Added in
+    Phase 9 for doc §14's `provision_latency`/`sandboxes_active` metrics, which need a
+    `backend` label on the failure path too, where there is no handle to read it from.
+    A plain class attribute rather than a property: it's a fixed per-implementation
+    constant, never derived from instance state."""
+
     async def acquire(self, spec: SandboxSpec) -> SandboxHandle:
         """Claim a pooled sandbox or create one from scratch and wait for readiness."""
         ...

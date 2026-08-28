@@ -1,16 +1,29 @@
 """FastAPI dependency providers: auth principal, registry, provisioner, SandboxService.
 
-Auth is a Phase 1 skeleton: hashed API keys only. OIDC/JWT user sessions (doc §11) are
-a later phase — nothing here blocks adding them alongside API keys.
+Two credential types are accepted, in this order (doc §11):
+
+1. `Authorization: Bearer <session-jwt>` — a standalone human user / the UI, holding a
+   short-lived KubeSandbox session token issued by `POST /v1/auth/token` after an OIDC
+   login. Verified locally (signature only, no I/O), so it costs less than the API-key
+   path despite carrying more information.
+2. `X-API-Key: <key>` — a service account / the workflow-builder. Hashed lookup against
+   `api_keys`.
+
+Bearer is checked first because it's the cheaper of the two and the one a UI sends on
+every request; a caller presenting both gets the bearer identity. `auth.disabled`
+(local only, refused elsewhere by `Settings`) short-circuits both.
 """
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
+from datetime import UTC, datetime, timedelta
 
 import redis.asyncio as redis
 from fastapi import Depends, Header, HTTPException, Request, WebSocket, status
 from sqlalchemy import select
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.cloud.registry import ImageRegistryProvider
@@ -21,6 +34,7 @@ from app.extensions.loader import Registry
 from app.persistence.db import get_session, get_session_factory
 from app.persistence.models import ApiKey, Tenant, User
 from app.provisioners.base import Provisioner
+from app.services.auth_service import AuthenticationFailed, AuthService
 from app.services.billing_service import BillingService
 from app.services.build_manager import BuildManager
 from app.services.entitlement_service import EntitlementService
@@ -52,6 +66,30 @@ _LOCAL_DEV_TENANT_NAME = "local-dev"
 _LOCAL_DEV_USER_EMAIL = "local-dev@kubesandbox.local"
 
 
+_LAST_USED_WRITE_INTERVAL = timedelta(minutes=1)
+"""Coalescing window for `api_keys.last_used_at` writes — see `_principal_from_api_key`.
+A minute's resolution is plenty for "is this key still in use?" and turns a per-request
+UPDATE into an occasional one."""
+
+
+def _is_stale(last_used_at: datetime | None, now: datetime) -> bool:
+    """Whether `last_used_at` is old enough to be worth rewriting.
+
+    The tz normalization is not cosmetic: a `DateTime(timezone=True)` column comes back
+    *aware* from Postgres but *naive* from SQLite (which has no native timestamptz), and
+    subtracting the two raises `TypeError`. Since this runs on the authentication path,
+    an unguarded comparison would turn a perfectly valid API key into a 500 on any
+    backend that returns naive values — and the surrounding `suppress(SQLAlchemyError)`
+    would not catch a TypeError. Assuming UTC for a naive value is correct here: every
+    write to this column is `datetime.now(UTC)`.
+    """
+    if last_used_at is None:
+        return True
+    if last_used_at.tzinfo is None:
+        last_used_at = last_used_at.replace(tzinfo=UTC)
+    return (now - last_used_at) > _LAST_USED_WRITE_INTERVAL
+
+
 def _hash_api_key(raw_key: str) -> str:
     return hashlib.sha256(raw_key.encode()).hexdigest()
 
@@ -76,17 +114,18 @@ async def _get_or_create_local_dev_principal(session: AsyncSession) -> Principal
     return Principal(tenant_id=tenant.id, user_id=user.id, role=user.role)
 
 
-async def _resolve_principal(session: AsyncSession, api_key: str | None) -> Principal:
-    settings = get_settings()
+def _bearer_token(authorization: str | None) -> str | None:
+    """Extract the token from an `Authorization: Bearer <token>` header, case-insensitively
+    on the scheme (RFC 6750 says the scheme is case-insensitive, and real clients differ)."""
+    if not authorization:
+        return None
+    scheme, _, token = authorization.partition(" ")
+    if scheme.lower() != "bearer" or not token.strip():
+        return None
+    return token.strip()
 
-    if settings.auth.disabled:
-        principal = await _get_or_create_local_dev_principal(session)
-        await session.commit()
-        return principal
 
-    if not api_key:
-        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "missing API key")
-
+async def _principal_from_api_key(session: AsyncSession, api_key: str) -> Principal:
     row = (
         await session.execute(
             select(ApiKey).where(ApiKey.key_hash == _hash_api_key(api_key), ApiKey.revoked.is_(False))
@@ -95,25 +134,77 @@ async def _resolve_principal(session: AsyncSession, api_key: str | None) -> Prin
     if row is None:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "invalid or revoked API key")
 
+    # Best-effort `last_used_at` bookkeeping (Phase 9): it's what makes "can I safely
+    # revoke this key?" answerable in the UI. Only written when the stamp is more than
+    # a minute stale, so a workflow-builder hammering /v1/execute doesn't turn every
+    # request into a write — and wrapped in a suppress because a failed bookkeeping
+    # write must never turn a valid credential into a 500.
+    now = datetime.now(UTC)
+    if _is_stale(row.last_used_at, now):
+        with contextlib.suppress(SQLAlchemyError):
+            row.last_used_at = now
+            await session.commit()
+
+    # `user_id=None` and `role="service"` on purpose: an API key belongs to a tenant,
+    # not a person (doc §11's "service accounts"), so anything user-scoped — a
+    # persistent workspace, a credit request's requester — has no user to attribute to.
     return Principal(tenant_id=row.tenant_id, user_id=None, role="service")
+
+
+async def _resolve_principal(
+    session: AsyncSession, api_key: str | None, bearer: str | None = None
+) -> Principal:
+    settings = get_settings()
+
+    if settings.auth.disabled:
+        principal = await _get_or_create_local_dev_principal(session)
+        await session.commit()
+        return principal
+
+    if bearer:
+        try:
+            return AuthService(settings.auth).verify_session_token(bearer)
+        except AuthenticationFailed as exc:
+            raise HTTPException(status.HTTP_401_UNAUTHORIZED, str(exc)) from exc
+
+    if api_key:
+        return await _principal_from_api_key(session, api_key)
+
+    raise HTTPException(
+        status.HTTP_401_UNAUTHORIZED,
+        "missing credentials: send 'Authorization: Bearer <session token>' or 'X-API-Key: <key>'",
+    )
 
 
 async def get_current_principal(
     session: AsyncSession = Depends(get_session),
     x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+    authorization: str | None = Header(default=None),
 ) -> Principal:
-    return await _resolve_principal(session, x_api_key)
+    return await _resolve_principal(session, x_api_key, _bearer_token(authorization))
 
 
 async def get_ws_principal(
     websocket: WebSocket,
     session: AsyncSession = Depends(get_session),
 ) -> Principal:
-    """WS counterpart to get_current_principal: browsers can't set custom headers on a
-    WebSocket handshake, so the API key travels as a `?api_key=` query param instead
-    (doc §5.2's WS attach contract). Shares `_resolve_principal` so `auth.disabled`
-    local-dev behavior and API-key hashing/lookup never drift between the two."""
-    return await _resolve_principal(session, websocket.query_params.get("api_key"))
+    """WS counterpart to get_current_principal.
+
+    Browsers can't set headers on a WebSocket handshake, so the credential travels in
+    the query string (doc §5.2's WS attach contract): `?access_token=` for a UI session
+    token, or `?api_key=` for a service account. A session token is much the better
+    thing to put in a URL — it expires in an hour, where an API key doesn't — which is
+    the other reason `/v1/auth/token` issues our own token rather than the API
+    validating the IdP's on every call.
+
+    Shares `_resolve_principal` so `auth.disabled` behavior, bearer precedence, and
+    API-key hashing can never drift between the HTTP and WS paths.
+    """
+    params = websocket.query_params
+    # Also accepts a real Authorization header, for non-browser WS clients (the SDK's
+    # own attach helper, `websocat`) that can set one.
+    bearer = params.get("access_token") or _bearer_token(websocket.headers.get("authorization"))
+    return await _resolve_principal(session, params.get("api_key"), bearer)
 
 
 async def require_admin(principal: Principal = Depends(get_current_principal)) -> Principal:
@@ -144,6 +235,10 @@ def get_provisioner_ws(websocket: WebSocket) -> Provisioner:
     return websocket.app.state.provisioner
 
 
+def get_auth_service() -> AuthService:
+    return AuthService(get_settings().auth)
+
+
 def get_billing_service() -> BillingService:
     return BillingService(default_mode=get_settings().billing.default_mode)
 
@@ -168,6 +263,10 @@ def _build_sandbox_service(registry: Registry, provisioner: Provisioner) -> Sand
         heavy_tolerations=settings.provisioner.heavy_tolerations,
         workspace_service=workspace_service,
         billing_service=billing_service,
+        # Needed only by the `?async=true` path, whose work outlives the request that
+        # triggered it and so can't use the request-scoped session (the same reason
+        # BuildManager takes one).
+        session_factory=get_session_factory(),
     )
 
 

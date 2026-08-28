@@ -1,0 +1,28 @@
+{{- if .Values.serviceMonitor.enabled }}
+{{/*
+Prometheus Operator scrape config for GET /metrics (doc §14). Gated because applying a
+ServiceMonitor without the Operator's CRDs present fails the entire release, and this
+chart shouldn't require the Operator.
+
+Without the Operator, the pod annotations on the API Deployment
+(prometheus.io/scrape|port|path) cover a plain Prometheus scrape config instead.
+*/}}
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: {{ include "kubesandbox.fullname" . }}
+  labels:
+    {{- include "kubesandbox.labels" . | nindent 4 }}
+    {{- with .Values.serviceMonitor.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  selector:
+    matchLabels:
+      {{- include "kubesandbox.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: api
+  endpoints:
+    - port: http
+      path: /metrics
+      interval: {{ .Values.serviceMonitor.interval }}
+{{- end }}

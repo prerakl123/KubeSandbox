@@ -60,8 +60,20 @@ class ImageRegistrySettings(BaseModel):
 
 
 class SecretsSettings(BaseModel):
-    provider: Literal["dotenv", "azure_keyvault"] = "dotenv"
+    # "aws"/"gcp" are selectable for the same reason ObjectStorageSettings above lists
+    # them — so a deployment pointed at an unimplemented cloud fails loudly at startup
+    # (doc §9) instead of at the first secret lookup.
+    provider: Literal["dotenv", "azure_keyvault", "aws", "gcp"] = "dotenv"
     vault_url: str | None = None
+
+    @model_validator(mode="after")
+    def _keyvault_needs_a_vault_url(self) -> "SecretsSettings":
+        # AzureKeyVaultSecretsProvider can't be constructed meaningfully without one,
+        # and catching it here (while parsing Settings) is strictly earlier than
+        # catching it in the provider's own __init__.
+        if self.provider == "azure_keyvault" and not self.vault_url:
+            raise ValueError("secrets.vault_url is required when secrets.provider == 'azure_keyvault'")
+        return self
 
 
 class ProvisionerSettings(BaseModel):
@@ -149,12 +161,123 @@ class BillingSettings(BaseModel):
     fresh credit-mode tenant's zero balance blocks every sandbox creation outright."""
 
 
+class ObservabilitySettings(BaseModel):
+    """Prometheus metrics + OpenTelemetry tracing (doc §14, §20 Phase 9).
+
+    Metrics default to *on* everywhere: `prometheus_client` collects in-process with no
+    external dependency, `GET /metrics` is a plain scrape endpoint, and a control plane
+    that can't report `sandboxes_active`/`provision_latency` is exactly what doc §14
+    says it must be able to report. Tracing defaults to *off* because it's the opposite
+    shape — an OTLP exporter needs a real collector endpoint to ship spans to, and
+    pointing it at a non-existent one just produces a background retry loop and noise.
+    """
+
+    metrics_enabled: bool = True
+    tracing_enabled: bool = False
+    otlp_endpoint: str | None = None
+    """gRPC OTLP collector address (e.g. "http://otel-collector:4317"). Required when
+    `tracing_enabled` — validated below rather than defaulted, since a silently-wrong
+    default endpoint is worse than a startup failure."""
+    service_name: str = "kubesandbox"
+    """Reported as OTel's `service.name` resource attribute; the reconciler worker
+    overrides it to "kubesandbox-reconciler" so its spans are separable from the API's."""
+    trace_sample_ratio: float = Field(default=1.0, ge=0.0, le=1.0)
+    """Parent-based ratio sampler. 1.0 (all spans) is right for `local` and for
+    aks-prod's initial rollout; lower it once span volume becomes a cost concern."""
+
+    @model_validator(mode="after")
+    def _tracing_needs_an_endpoint(self) -> "ObservabilitySettings":
+        if self.tracing_enabled and not self.otlp_endpoint:
+            raise ValueError(
+                "observability.otlp_endpoint is required when observability.tracing_enabled is true"
+            )
+        return self
+
+
+class CorsSettings(BaseModel):
+    """Browser access for the standalone-user UI (doc §1's second consumer).
+
+    A cross-origin frontend cannot make a single call without this — not a nice-to-have
+    but the first hard blocker any UI hits. Deliberately an explicit allowlist with no
+    wildcard default: `allow_credentials=True` plus `allow_origins=["*"]` is rejected
+    by every browser anyway, and a permissive default in a service that hands out
+    sandbox sessions is the wrong way round.
+    """
+
+    enabled: bool = False
+    allow_origins: list[str] = Field(default_factory=list)
+    """Exact origins, scheme included (e.g. "https://kubesandbox.example.com"). No
+    trailing slash — browsers send the origin without one and a mismatch fails silently
+    from the caller's point of view."""
+    allow_credentials: bool = True
+    """Needed only if the UI ever relies on cookies. The auth design here is
+    `Authorization: Bearer`, which does not, but leaving this on costs nothing and
+    keeps a cookie-based variant open."""
+    allow_methods: list[str] = Field(default_factory=lambda: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"])
+    allow_headers: list[str] = Field(default_factory=lambda: ["Authorization", "Content-Type", "X-API-Key"])
+    expose_headers: list[str] = Field(default_factory=list)
+    max_age: int = 600
+
+    @model_validator(mode="after")
+    def _enabled_needs_origins(self) -> "CorsSettings":
+        if self.enabled and not self.allow_origins:
+            raise ValueError("cors.allow_origins must list at least one origin when cors.enabled is true")
+        if "*" in self.allow_origins and self.allow_credentials:
+            # Browsers reject this combination outright; failing here makes that
+            # obvious at startup instead of as an unexplained CORS error in a console.
+            raise ValueError("cors.allow_origins cannot contain '*' while cors.allow_credentials is true")
+        return self
+
+
 class AuthSettings(BaseModel):
+    """Two authentication paths coexist (doc §11), and a caller may use either:
+
+    * **Service accounts / the workflow-builder** — a hashed API key in `X-API-Key`.
+      Long-lived, minted per tenant (`POST /v1/api-keys`).
+    * **Standalone human users / the UI** — OIDC (Azure AD) exchanged once for a
+      short-lived KubeSandbox session JWT, then sent as `Authorization: Bearer`. The
+      exchange is `POST /v1/auth/token`; see `app/services/auth_service.py` for why the
+      session token is issued locally rather than the IdP's own token being validated
+      on every request.
+    """
+
     # Convenience-only escape hatch for local dev so /execute is reachable without
     # standing up an IdP first. Guarded below: forbidden outside "local".
     disabled: bool = False
     jwt_secret: str = "change-me-in-local-dev-only"
+    """HS256 signing key for KubeSandbox's *own* session tokens (never for validating
+    the IdP's — those are RS256, verified against the issuer's JWKS). Must come from
+    Key Vault / a K8s Secret in `aks-prod`; the default here is a local-dev placeholder
+    and the validator below refuses it outside `local`."""
+    session_ttl_seconds: int = 3_600
+    """Doc §11's "short-lived JWT session". One hour: long enough that a UI isn't
+    re-exchanging constantly, short enough that a leaked token expires on its own. A UI
+    re-runs the OIDC exchange to renew — there is deliberately no refresh-token flow,
+    since the IdP already holds the long-lived session."""
     oidc_issuer: str | None = None
+    """e.g. "https://login.microsoftonline.com/<aad-tenant>/v2.0". Discovery
+    (`/.well-known/openid-configuration`) resolves the JWKS URI from this."""
+    oidc_audience: str | None = None
+    """The app registration's client id. Validated as the token's `aud` — without this
+    check, a token minted for *any* other application in the same AAD tenant would be
+    accepted here."""
+    oidc_client_id: str | None = None
+    """Published to the UI by `GET /v1/auth/config` so the frontend's MSAL setup isn't
+    hardcoded per environment. Usually the same value as `oidc_audience`; kept separate
+    because they legitimately differ when the API is a distinct app registration from
+    the SPA."""
+    oidc_jwks_url: str | None = None
+    """Optional explicit override, skipping OIDC discovery. Useful for an IdP with a
+    non-standard discovery document, or to avoid one network round trip at first use."""
+    oidc_tenant_claim: str = "tid"
+    """Which claim identifies the caller's tenant. `tid` (the AAD directory id) is the
+    right default; a deployment that maps several KubeSandbox tenants onto one AAD
+    directory should point this at a custom claim emitted by the IdP instead."""
+    oidc_email_claim: str = "preferred_username"
+    """AAD v2.0 puts the sign-in name here; `email` is only present when the optional
+    claim is configured on the app registration. `AuthService` falls back through
+    `email` and `sub` if this claim is absent, so a misconfigured app registration
+    degrades to a stable-but-ugly identity rather than a hard failure."""
 
 
 class Settings(BaseSettings):
@@ -173,7 +296,9 @@ class Settings(BaseSettings):
     reconciler: ReconcilerSettings = Field(default_factory=ReconcilerSettings)
     limits: ExecutionLimits = Field(default_factory=ExecutionLimits)
     billing: BillingSettings = Field(default_factory=BillingSettings)
+    observability: ObservabilitySettings = Field(default_factory=ObservabilitySettings)
     auth: AuthSettings = Field(default_factory=AuthSettings)
+    cors: CorsSettings = Field(default_factory=CorsSettings)
 
     model_config = SettingsConfigDict(
         env_prefix="KUBESANDBOX_",
@@ -186,6 +311,26 @@ class Settings(BaseSettings):
     def _guard_auth_disabled_outside_local(self) -> "Settings":
         if self.app_env != "local" and self.auth.disabled:
             raise ValueError("auth.disabled may only be true when app_env == 'local'")
+        return self
+
+    @model_validator(mode="after")
+    def _guard_placeholder_jwt_secret_outside_local(self) -> "Settings":
+        # The committed default is a placeholder; shipping it to prod would let anyone
+        # who has read this repo mint a valid admin session token. Same class of guard
+        # as `auth.disabled` above, and for the same reason: a config mistake here is
+        # a full authentication bypass, so it must be impossible to deploy quietly.
+        if self.app_env == "local":
+            return self
+        if self.auth.jwt_secret == AuthSettings.model_fields["jwt_secret"].default:
+            raise ValueError(
+                "auth.jwt_secret must be overridden outside app_env='local' "
+                "(inject it from Key Vault / a Kubernetes Secret)"
+            )
+        # RFC 7518 §3.2's floor for HS256, which PyJWT itself warns about below 32
+        # bytes: an HMAC key shorter than the digest is brute-forcible offline, and
+        # this key is what mints session tokens.
+        if len(self.auth.jwt_secret.encode()) < 32:
+            raise ValueError("auth.jwt_secret must be at least 32 bytes (RFC 7518 §3.2 for HS256)")
         return self
 
     @classmethod

@@ -1,0 +1,95 @@
+# `local` overrides — for a kind cluster only.
+#
+# To be clear about what this is for: local development does NOT use this chart. The app
+# runs natively against docker-compose (see docker-compose.yml's header), because the
+# Docker provisioner needs the host's Docker socket. This file exists for the one local
+# scenario that does involve Kubernetes: doc §8.1's optional kind cluster, used to check
+# that the manifests this chart renders are actually valid against a real API server
+# before anything touches Azure.
+#
+# Usage:
+#   kind create cluster --config deploy/kind/kind-config.yaml
+#   kind load docker-image kubesandbox/control-plane:0.1.0
+#   helm install ks deploy/helm/kubesandbox -f deploy/helm/kubesandbox/values-local.yaml
+
+replicaCount: 1
+
+image:
+  repository: kubesandbox/control-plane
+  tag: "0.1.0"
+  # kind has no registry; `kind load docker-image` puts the image on the node directly,
+  # so any pull attempt would fail.
+  pullPolicy: Never
+
+autoscaling:
+  # Doc §7's table: local is 1 replica. An HPA over a single-replica deployment on a
+  # one-node kind cluster has nothing to scale onto.
+  enabled: false
+
+podDisruptionBudget:
+  # A PDB needs somewhere to move a pod to; a single-node kind cluster has nowhere, so
+  # this would just block `kubectl drain` forever.
+  enabled: false
+
+reconciler:
+  enabled: true
+  replicaCount: 1
+
+ingress:
+  # `kubectl port-forward` is enough here, and kind has no ingress controller by default.
+  enabled: false
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 256Mi
+  limits:
+    memory: 512Mi
+
+affinity: {}
+# Anti-affinity across hostnames is meaningless on one node.
+
+config:
+  # NOTE: even here `app_env` stays aks-prod, because it selects the *provisioner*
+  # (kubernetes vs docker) — a chart-installed pod has no Docker socket, so the local
+  # profile's docker backend could not work. Doc §7's two profiles are about
+  # provisioner/infra, not about which machine you're sitting at.
+  appEnv: aks-prod
+  logLevel: debug
+  cors:
+    enabled: true
+    allowOrigins:
+      - http://localhost:3000
+      - http://localhost:5173
+  auth:
+    # No IdP in a kind cluster: browser login is unavailable, API keys still work.
+    oidcIssuer: ""
+    oidcAudience: ""
+    oidcClientId: ""
+    sessionTtlSeconds: 3600
+  observability:
+    metricsEnabled: true
+    tracingEnabled: false
+    otlpEndpoint: ""
+    traceSampleRatio: "1.0"
+  pool:
+    enabled: false
+  workspace:
+    persistenceEnabled: false
+  billing:
+    enabled: false
+
+secrets:
+  # Create it first, pointing at Postgres/Redis reachable from inside the cluster:
+  #   kubectl create secret generic kubesandbox-local-secrets \
+  #     --from-literal=KUBESANDBOX_DATABASE__DSN='postgresql+asyncpg://...' \
+  #     --from-literal=KUBESANDBOX_REDIS__URL='redis://...' \
+  #     --from-literal=KUBESANDBOX_AUTH__JWT_SECRET="$(openssl rand -base64 48)"
+  # The JWT secret must be 32+ bytes: Settings refuses anything shorter outside
+  # app_env=local, and this profile runs as aks-prod.
+  existingSecret: kubesandbox-local-secrets
+  keyVault:
+    enabled: false
+
+serviceMonitor:
+  enabled: false

@@ -1,0 +1,23 @@
+{{- if .Values.podDisruptionBudget.enabled }}
+{{/*
+PodDisruptionBudget for the API (doc §7, §15). Guards *voluntary* disruption — node
+drains during a cluster upgrade, cluster autoscaler consolidation — not crashes.
+
+Reconciler has none deliberately: it runs a single replica, so any PDB over it would
+either permit nothing (blocking every node drain indefinitely) or permit everything.
+Its work is periodic and idempotent, so a brief gap during a drain costs a delayed tick.
+*/}}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "kubesandbox.fullname" . }}-api
+  labels:
+    {{- include "kubesandbox.labels" . | nindent 4 }}
+    app.kubernetes.io/component: api
+spec:
+  minAvailable: {{ .Values.podDisruptionBudget.minAvailable }}
+  selector:
+    matchLabels:
+      {{- include "kubesandbox.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: api
+{{- end }}

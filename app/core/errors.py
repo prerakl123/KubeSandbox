@@ -52,3 +52,16 @@ class BuildError(KubeSandboxError):
 
 class BuildNotFoundError(KubeSandboxError):
     """Referenced build id does not exist."""
+
+
+class ConfigurationError(KubeSandboxError):
+    """A setting is internally inconsistent or selects an unimplemented backend —
+    raised at startup/config-validation time, never mid-request (doc §9's own
+    "stubs fail loudly and immediately" contract)."""
+
+
+class SecretNotFoundError(KubeSandboxError):
+    """A SecretsProvider was asked for a secret name that doesn't exist in the
+    configured backend (doc §9). A domain error rather than a bare KeyError so a
+    caller can distinguish "not configured" from a real transport failure, which
+    propagates as whatever the backend client itself raised."""

@@ -18,9 +18,10 @@ component, so there's no dotted-path plugin loading here.
 
 from __future__ import annotations
 
+import time
 from datetime import UTC, datetime
 
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.build.strategies.compose import ComposeBuildStrategy
@@ -29,6 +30,7 @@ from app.build.strategies.helm import HelmChartStrategy
 from app.build.strategies.pipeline import PipelineBuildStrategy
 from app.cloud.registry import ImageRegistryProvider
 from app.cloud.storage import ObjectStorageProvider
+from app.core import metrics
 from app.core.errors import BuildNotFoundError, ComponentNotFoundError, EntitlementError
 from app.core.logging import get_logger
 from app.domain.auth import Principal
@@ -131,6 +133,25 @@ class BuildManager:
                 raise BuildNotFoundError(build_id)  # 404, not 403 — don't leak existence
         return row
 
+    def build_list_statement(self, principal: Principal, *, build_status: str | None = None):
+        """Tenant-scoped SELECT for `GET /v1/builds` (Phase 9), returned as a statement
+        rather than rows so the API layer can paginate it with the shared helper.
+
+        Scoping mirrors `get_build` exactly: an admin sees every build; anyone else sees
+        public builds (`tenant_id is null` — the shared catalog they can already read via
+        `GET /v1/components`) plus their own tenant's private ones. Keeping the two in
+        one class is the point — a list endpoint that leaked what the detail endpoint
+        404s on would be the obvious way to get this wrong.
+        """
+        statement = select(Build)
+        if not self._entitlements.is_admin(principal):
+            statement = statement.where(
+                or_(Build.tenant_id.is_(None), Build.tenant_id == principal.tenant_id)
+            )
+        if build_status is not None:
+            statement = statement.where(Build.status == build_status)
+        return statement.order_by(Build.created_at.desc(), Build.id.desc())
+
     @staticmethod
     def _registry_key_for_build(build_row: Build) -> str:
         key = f"{build_row.component_name}@{build_row.component_version}"
@@ -166,6 +187,10 @@ class BuildManager:
             build_row.started_at = datetime.now(UTC)
             await session.commit()
             logger.info("build_started", build_id=build_id, component=component_key)
+            # perf_counter, not the started_at/finished_at delta: those are wall-clock
+            # timestamps persisted for the API's benefit, and a clock adjustment
+            # mid-build would corrupt the histogram. Doc §14's `build_duration`.
+            build_started = time.perf_counter()
 
             log: list[str] = []
             ctx = BuildContext(
@@ -193,6 +218,9 @@ class BuildManager:
             finally:
                 build_row.log_excerpt = "\n".join(log)[-_LOG_EXCERPT_LIMIT:]
                 build_row.finished_at = datetime.now(UTC)
+                metrics.build_duration_seconds.labels(
+                    strategy=component.spec.source.type, outcome=build_row.status
+                ).observe(time.perf_counter() - build_started)
                 await session.commit()
 
     async def hydrate_built_images(self, session: AsyncSession) -> None:

@@ -1,13 +1,22 @@
 # KubeSandbox — Exhaustive Task Checklist
 
 Every task implied by `docs/ARCHITECTURE_AND_PLAN.md`, broken out phase by phase (§20),
-with an honest per-item completion status as of 2026-07-29. This is a granular expansion
+with an honest per-item completion status as of 2026-08-28. This is a granular expansion
 of the roadmap table, not a re-statement of it — each phase's one-line "deliverable"
 below is exploded into the actual concrete pieces of work it implies across the rest of
 the doc (§3–§19).
 
-**Summary: 90 / 103 items complete:**
-- Phase 0 (20/21)
+Where a phase's work could not be exercised against real infrastructure, that is stated
+per item rather than glossed — see each phase's own "Live verification" section. Phase 9
+in particular has an unusually wide gap (no reachable Postgres, no `helm`, no Azure this
+session) and a short list of required follow-up commands.
+
+**Summary: 103 / 103 roadmap items complete, plus a Phase 9b that wasn't in the
+original plan:**
+- Phase 0 (21/21) — its last open item, OIDC/JWT session auth, was closed by Phase 9b
+- Phase 9 (7/7) + Phase 9b (UI integration readiness, added mid-session by explicit
+request) + 2 of 5 cross-cutting items
+- 480 unit tests passing, up from 284 at the end of Phase 8
 - Phase 1 (21/21, fully live-verified)
 Phase 1 is no longer just "built" — it has been driven end-to-end against real Docker,
 real Postgres, and the actual golden image, via `POST /v1/execute` returning correct
@@ -107,7 +116,7 @@ on both passes.
 
 ---
 
-## Phase 0 — Foundations (20/21)
+## Phase 0 — Foundations (21/21)
 
 - [x] Repo scaffold matching the intended layout (doc §18)
 - [x] `pyproject.toml` + `uv`-managed dependencies (fastapi, uvicorn, pydantic(-settings),
@@ -143,9 +152,13 @@ on both passes.
       + `Dockerfile` (Debian-slim, uid 10001, bash/coreutils/git), plus the first real
       `SandboxTemplate` YAML (`templates/base-dev-lab.yaml`), added alongside Phase 2's
       template-composition work since a template needs *some* base to point at
-- [ ] OIDC/JWT session auth for standalone human users (doc §11) — `pyjwt` is an
-      installed dependency but there is no JWT-issuing or JWT-validating code anywhere;
-      only the hashed-API-key path (service accounts) is implemented
+- [x] OIDC/JWT session auth for standalone human users (doc §11) — **closed in Phase
+      9b**, which needed it to make a browser UI possible at all:
+      `app/services/auth_service.py` validates an IdP token against the issuer's JWKS
+      and exchanges it for a KubeSandbox HS256 session token
+      (`POST /v1/auth/token`), accepted as `Authorization: Bearer` on every route and as
+      `?access_token=` on the WS attach handshake. See Phase 9b for the full design and
+      for what remains unverified (no real IdP was available this session).
 
 ---
 
@@ -1740,29 +1753,412 @@ into what's reachable without starting a hardened sandbox container, and what is
 
 ---
 
-## Phase 9 — Prod hardening (0/7)
+## Phase 9 — Prod hardening (7/7 implemented and unit-tested — 480 tests passing —
+with live verification blocked on this session's environment: no `helm` binary, no
+reachable Postgres, no Azure. See "Live verification" below for exactly what was and
+wasn't confirmed.)
 
-- [ ] gVisor/Kata prod node pool provisioning (cluster/infra-level, outside this repo's
-      code, but referenced by `aks-prod.yaml`)
-- [ ] Heavy-workload segregated node pool
-- [ ] HPA/PDB manifests
-- [ ] `app/cloud/` implementations — `SecretsProvider`, `ObjectStorageProvider`,
-      `ImageRegistryProvider` (Azure real + AWS/GCP "Coming Soon" stubs per doc §9) —
-      the directory exists with only an empty `__init__.py`; none of these interfaces
-      or implementations have any code yet
-- [ ] `sdk/` — client SDK for the workflow-builder (directory exists, empty)
-- [ ] `deploy/helm/kubesandbox/` — control-plane Helm chart (directory exists, empty)
-- [ ] Prometheus `/metrics` + OpenTelemetry tracing
+Phase 9 grew mid-session by explicit request: after the original seven items were
+under way, the user said UI development is going on the roadmap and asked that this
+phase leave the backend ready for frontend integration, then to "add relevant task
+items for UI integration related hardening" and "verify listing endpoints, crud, etc."
+That second body of work is its own section below ("Phase 9b"), because it is
+materially larger than the seven roadmap items and closes gaps that predate this phase.
+
+- [x] gVisor/Kata prod node pool provisioning — `deploy/azure/provision-nodepools.sh`
+      + `deploy/azure/README.md`. Idempotent `az aks nodepool add` for a
+      `KataMshvVmIsolation` pool (Azure exposes gVisor/Kata through Pod Sandboxing, not
+      a raw `runsc` install, and it constrains VM size to nested-virtualization-capable
+      SKUs). Autoscale floor deliberately **1**, not 0: this pool hosts every sandbox,
+      so scaling to zero makes the first request after an idle period wait minutes for
+      a node — against a call doc §5.1 bounds at 60s. Still cluster/infra-level and
+      still outside the app's code, exactly as the roadmap scoped it; what's new is
+      that it's a committed, reviewable script instead of tribal knowledge.
+- [x] Heavy-workload segregated node pool — same script. Labelled
+      `kubesandbox.io/workload-class=heavy`, tainted
+      `kubesandbox.io/heavy=true:NoSchedule`, autoscale floor **0** (heavy sandboxes are
+      rare and the VMs expensive; the taint is what makes zero safe, since nothing else
+      can land there to hold the pool up). `config/settings/aks-prod.yaml`'s
+      `heavy_node_selector` REPLACE_ME is now the real label, and
+      `test_the_nodepool_script_matches_the_prod_config` asserts the two agree — they
+      are one decision written in two places, and if they diverge heavy sandboxes either
+      stop being segregated or stop scheduling, neither of which fails loudly.
+- [x] HPA/PDB manifests — inside the Helm chart (below), not standalone:
+      `templates/hpa.yaml` (autoscaling/v2, CPU **and** memory targets — the control
+      plane is I/O-bound, so a replica holding hundreds of idle attach streams shows
+      little CPU and real memory; `scaleDown.stabilizationWindowSeconds: 600` because
+      scaling down evicts live terminals, doc §2) and `templates/pdb.yaml`
+      (`minAvailable`, API only). No PDB or HPA over the reconciler, deliberately — see
+      the chart's own notes and `test_no_hpa_targets_the_reconciler`.
+- [x] `app/cloud/` implementations — the checklist entry was stale: `storage.py` and
+      `registry.py` were pulled forward into Phase 6 (two build strategies needed them).
+      What Phase 9 actually added is the missing third concern plus the fail-fast
+      machinery the doc promised and nothing had ever exercised:
+      - `app/cloud/secrets.py` — `SecretsProvider` Protocol, `DotenvSecretsProvider`
+        (real, `local`'s backend: process env first, then a repo-root `.env`, with the
+        same `-`/`.` -> `_` upper-cased normalization Key Vault effectively forces, so a
+        secret name resolves identically in both environments),
+        `AzureKeyVaultSecretsProvider` (real, `azure-keyvault-secrets` +
+        `DefaultAzureCredential`, azure imports deliberately inside `get()` so `local`
+        never pays for them), and AWS/GCP stubs.
+      - `app/cloud/base.py` — `ComingSoonProvider` marker base + 
+        `assert_cloud_provider_usable()`. The existing AWS/GCP stubs were refactored onto
+        it, which gives the startup check a type-level seam instead of string-matching an
+        exception message.
+      - `bootstrap.validate_cloud_providers()`, called first thing in both the API
+        lifespan and the reconciler's `main()`. Doc §9 requires an unimplemented cloud
+        selection to be "caught at startup/config-validation time, not mid-request";
+        before this, the stubs had never been proven to raise at all, which is the only
+        thing separating a stub from a silent no-op.
+- [x] `sdk/` — a separately installable `kubesandbox-sdk` package (its own
+      `pyproject.toml`, `requires-python >=3.11`, **httpx as the only required
+      dependency**) so a workflow-builder never inherits fastapi/sqlalchemy/
+      kubernetes-asyncio/azure-*/opentelemetry just to POST JSON. `KubeSandboxClient`
+      (sync — doc §17's stated consumer, since a workflow step blocks) and
+      `AsyncKubeSandboxClient`, both over shared request semantics in `_transport.py`;
+      typed dataclass models; a full status-code -> exception mapping; and
+      `attach.py` behind an optional `[attach]` extra for the PTY protocol. Admin
+      endpoints and manifest publishing are deliberately **not** exposed — see the
+      README's "what this SDK does not cover".
+- [x] `deploy/helm/kubesandbox/` — control-plane chart: API Deployment, reconciler
+      Deployment, Service, HPA, PDB, ConfigMap, ServiceAccount + least-privilege
+      ClusterRole, Key Vault CSI `SecretProviderClass`, Ingress, ServiceMonitor, an
+      Alembic `upgrade head` **pre-install/pre-upgrade hook Job** (a hook, not an init
+      container: with N replicas an init container runs the migration N times
+      concurrently and Alembic is not safe under that), `values-local.yaml` for kind,
+      and a `NOTES.txt` that warns about every still-unconfigured setting — including
+      the two that block a UI outright.
+- [x] Prometheus `/metrics` + OpenTelemetry tracing — `app/core/metrics.py` (every doc
+      §14 metric), `app/api/v1/metrics.py` (`GET /metrics`, registered only when
+      `observability.metrics_enabled`), `app/core/tracing.py` (OTLP exporter,
+      FastAPI/httpx/SQLAlchemy auto-instrumentation, plus manual spans at the
+      provisioner boundary — the one hop nothing auto-instruments, and on the Docker
+      backend the *only* view into provisioning). Instrumentation is live in
+      `SandboxService`, `PoolManager`'s claim path, `BuildManager`, `BillingService`,
+      and the WS gateway.
+
+### Two deliberate deviations from doc §14's literal metric list
+
+Both because the Prometheus data model wants them this way, and both documented in
+`app/core/metrics.py`'s module docstring:
+
+- **`pool_hit_rate`** is a pair of counters (`kubesandbox_pool_claims_total{result=
+  "hit"|"miss"}`), not a pre-computed ratio gauge. A ratio computed in-process is wrong
+  the moment the process restarts or a second replica exists; the rate is derived at
+  query time. The claim counter is also only incremented when pooling is actually
+  enabled — counting every acquire as a "miss" with `pool.enabled: false` would make the
+  derived rate read 0% for a feature that simply isn't on.
+- **`sandboxes_active`** is a per-replica, in-process gauge of sandboxes *this process*
+  holds in flight, not the cluster-wide count of live sandbox rows. The authoritative
+  count lives in Postgres and outlives any control-plane process; exporting it would
+  need either a DB-querying collector on every scrape or a push from the reconciler (a
+  separate process with no HTTP server of its own). It resets to 0 on a replica restart
+  — correct for "in flight here", wrong for "live in the data plane" — and a sandbox
+  created by a previous process and destroyed by this one drives it negative.
+  Reconciler-reaped sandboxes are the concrete case where the two genuinely differ.
+
+### Prerequisites this phase needed but the checklist didn't spell out
+
+- `Provisioner.backend_name` (`app/provisioners/base.py` + both implementations +
+  `FakeProvisioner`) — the same value each stamps onto `SandboxHandle.backend`, but
+  readable *before* a handle exists, which the `provision_latency` failure path needs.
+- `ObservabilitySettings` / `CorsSettings` (`app/core/config.py`), plus new validators:
+  tracing refuses to enable without an OTLP endpoint, CORS refuses to enable with no
+  origins or with `*` alongside credentials (browsers reject that combination outright),
+  Key Vault refuses without a vault URL.
+- `ConfigurationError` / `SecretNotFoundError` (`app/core/errors.py`).
+- Six new dependencies: `azure-keyvault-secrets`, `prometheus-client`,
+  `opentelemetry-sdk`, `opentelemetry-exporter-otlp-proto-grpc`, and the
+  fastapi/httpx/sqlalchemy OTel instrumentations.
 
 ---
 
-## Cross-cutting — not owned by a single phase (0/5)
+## Phase 9b — UI integration readiness (added mid-session by explicit request)
+
+Not in the original roadmap. The user put UI development on the roadmap during this
+session and asked that the backend be left ready for frontend integration before the
+phase closed. An audit against "what does a browser UI actually need" turned up six
+blockers, two of which are endpoints **doc §17/§5.1 specify and nothing had ever
+implemented** — and which other documents in this repo already referenced as if they
+existed.
+
+### The two hard blockers a UI hits before anything else
+
+- [x] **CORS** (`CorsSettings`, `app/main.py::_configure_cors`) — without it a
+      cross-origin frontend cannot make a single call: the browser rejects the preflight
+      before it reaches FastAPI, so nothing appears in server logs either. Off by
+      default with an explicit allowlist (no wildcard default on a service that hands
+      out sandbox sessions).
+- [x] **OIDC/JWT session auth** (`app/services/auth_service.py`,
+      `app/api/v1/auth.py`) — **this also closes the one open Phase 0 item**, doc §11's
+      "OIDC (Azure AD) -> short-lived JWT session", which had no JWT-issuing or
+      -validating code anywhere. The IdP's token is validated **once** against the
+      issuer's JWKS at `POST /v1/auth/token` and exchanged for a KubeSandbox HS256
+      session token carrying tenant/user/role — so `get_current_principal` becomes a
+      local signature check with no database round trip, and the WS attach path (which
+      must carry its credential in the query string, since browsers can't set headers on
+      a handshake) carries a 1-hour token instead of a long-lived API key.
+      `get_ws_principal` accepts `?access_token=` alongside `?api_key=`.
+
+### Endpoints doc §17/§5.1 specify that had never been built
+
+- [x] `GET /v1/runs/{run_id}` + `GET /v1/runs` (`app/api/v1/runs.py`) — doc §17 lists the
+      first by name as the poll target, and Phase 6's own checklist notes already
+      referenced "`/v1/execute`'s `?async=true` + `GET /v1/runs/{run_id}` pair" as
+      though it existed. It didn't. The list endpoint isn't in doc §17 at all and is
+      here because a "recent runs" view is the most obvious screen in a code-sandbox
+      product and the data was already being persisted with nothing able to read it.
+- [x] `POST /v1/execute?async=true` — doc §5.1's non-blocking variant, also never
+      built. Returns `202 {run_id, status: "pending"}`; the spec is resolved *before*
+      anything is scheduled, so a typo'd language still fails the triggering request
+      with a real 404 rather than returning a cheerful 202 and failing invisibly later.
+      Implemented by giving `execute()` an optional `existing_run_id` so the async path
+      reuses one code path for pooling, sidecars, teardown, and billing rather than
+      duplicating them.
+
+### Read/list surface a UI cannot render without
+
+- [x] `GET /v1/me` — identity, role, and **which optional subsystems are enabled here**.
+      Every one of `persistent_workspaces`/`billing`/`pooling` is opt-in config, and a UI
+      rendering a control for a disabled feature produces buttons that only ever 400.
+- [x] `GET /v1/auth/config` — issuer/client-id/scopes so the SPA isn't hardcoding
+      per-environment values. Unauthenticated by necessity (it's what you call before
+      you have a credential) and returns nothing secret.
+- [x] `GET /v1/sandboxes` — the list. Only create/get-by-id/delete existed, so a UI had
+      no way to render "my sandboxes" and a leaked sandbox was invisible until its TTL
+      reaped it. Reports last-known DB state rather than fanning out 50 provisioner
+      calls; `GET /v1/sandboxes/{id}` remains the live-status endpoint.
+- [x] `GET /v1/templates/{name}` — single-template detail with the resource/TTL/workspace
+      shape. `GET /v1/components/{name}` existed; its template counterpart didn't, and a
+      user choosing between templates is choosing CPU, memory, TTL, and persistence.
+- [x] `GET /v1/builds` — build history list (only the by-id poll target existed).
+- [x] `GET /v1/workspaces/me` — quota, usage, retention state. Nothing read a `Workspace`
+      row back before this, so the whole persistent-workspace feature was invisible to a
+      user until it silently stopped working. Returns three distinguishable states
+      ("off here" / "none yet" / here it is) rather than collapsing two of them into a 404.
+- [x] `GET /v1/billing/account` + `GET /v1/billing/usage` — doc §13 describes every
+      mechanism that *consumes* a balance and nothing that reads one back, so a user hit
+      with a 429 for "insufficient credit" had no way to see their own balance. Read-only;
+      changing mode/cap/balance stays admin-only.
+- [x] `GET /v1/admin/pricing-rules` — was POST-only, so an admin UI could not show what
+      pricing was actually in force (rules are append-only, so "current" means "newest
+      effective rule").
+- [x] `GET /v1/admin/tenants` + `GET /v1/admin/users` + `PATCH /v1/admin/users/{id}/role`
+      — every existing admin endpoint took a `tenant_id` the admin was assumed to already
+      know. The role PATCH is also the only way to create an admin: `AuthService` never
+      grants a role from a token claim, deliberately.
+
+### Cross-cutting items closed on the way
+
+- [x] **API-key issuance/revocation** (`app/api/v1/api_keys.py`) — was a cross-cutting
+      open item: the table and hashed-lookup auth worked, but nothing could create or
+      revoke a key except a direct DB insert. `POST/GET/DELETE /v1/api-keys`; 256 bits of
+      entropy; plaintext returned exactly once and unrecoverable after. Also the bridge
+      between doc §1's two consumers — a human signs into the UI with OIDC, then mints
+      the key their workflow-builder uses, revocable without touching their identity.
+- [x] **Pagination** (`app/api/pagination.py`) — a shared `Page` envelope
+      (`items`/`total`/`limit`/`offset`) and `limit` capped at 200, applied to every
+      collection that grows with *use*. Registry listings stay bare arrays: bounded by
+      the git-committed registry, and changing their shape would break the SDK and
+      existing tests for no gain. Ordering is newest-first with an `id` tiebreaker, so
+      paging can't skip or repeat a row when two share a timestamp.
+- [x] **A real `/readyz`** — it had been a Phase 0 stub returning `{"status": "ok"}`
+      unconditionally, with its own docstring admitting real DB/Redis pings were still
+      to come. Now probes Postgres and Redis concurrently (3s each, so two can't stack
+      past the probe's own timeout) and answers 503 with a per-dependency breakdown.
+      `/healthz` still deliberately checks nothing — conflating them is how a brief
+      database blip restarts every replica at once.
+
+### Schema changes (Alembic `9a1c4e77b210`)
+
+Additive only, all nullable-or-defaulted, so it applies to a populated database and
+rolls back cleanly:
+
+- `api_keys`: `prefix` (something to display in a listing and match against a saved
+  key), `created_by_user_id`, `last_used_at` (the one signal that makes "is this key
+  still needed?" answerable before revoking; written on a coalesced best-effort basis).
+- `runs`: `status` (server default `'completed'` — before this phase a `runs` row was
+  only ever written *after* a run finished, so every historical row genuinely is one),
+  `component_ref`, `error` (a control-plane failure that produced no result, distinct
+  from the program's own stderr), `finished_at`.
+
+**Hand-written rather than autogenerated**, unlike every migration before it: this
+session had no reachable Postgres, and `alembic revision --autogenerate` against a
+throwaway SQLite database hung partway through replaying the existing history. Every
+operation is a plain `add_column`/`drop_column` pair — exactly what autogenerate would
+have emitted — but it has **not** been applied to a real database yet. See "Live
+verification" below.
+
+### Documentation
+
+- [x] `docs/UI_INTEGRATION.md` — the contract a frontend team works from: the two
+      settings that block a UI outright, the login sequence, the PTY frame protocol and
+      its three sharp edges, an endpoint map by screen, pagination and error semantics,
+      and a "what the backend does *not* provide" section so the UI isn't designed
+      around something that doesn't exist.
+- [x] `sdk/README.md` — extended for the new surface.
+- [x] `deploy/azure/README.md` — cluster prerequisites, in order, with the AAD app
+      registrations honestly flagged as not automated.
+
+---
+
+## Bugs found and fixed during Phase 9
+
+1. **`await self._json(...)["run_id"]` subscripted the coroutine, not its result** —
+   `TypeError: 'coroutine' object is not subscriptable`, plus a "coroutine was never
+   awaited" warning. Introduced by mechanically deriving the async client's new methods
+   from the sync ones: the transformation is exact for one-liners, and this was the one
+   line where `await` precedence made it wrong. Caught by
+   `test_async_execute_then_wait_for_run`, and the reason
+   `test_sync_and_async_clients_expose_the_same_surface` now exists.
+2. **`last_used_at` bookkeeping could 500 a valid API key** — a
+   `DateTime(timezone=True)` column comes back *aware* from Postgres but *naive* from
+   SQLite, and `now - row.last_used_at` across the two raises `TypeError`. Because the
+   comparison sat outside the surrounding `suppress(SQLAlchemyError)`, that would have
+   turned a perfectly valid credential into a 500 on any backend returning naive values.
+   Fixed with `deps._is_stale()`, which normalizes before comparing (every write to the
+   column is `datetime.now(UTC)`, so assuming UTC is correct). Regression-tested both
+   ways round.
+3. **`FeatureFlags.interactive_attach` was a required field the server never supplied**
+   — `GET /v1/me` raised a `ValidationError` on every call. A `Field(description=...)`
+   with no `default` is required in pydantic; the description read like a constant and
+   hid it.
+4. **`start_async_run` accepted a run it could never execute** — with no
+   `session_factory` wired, the 202 was already sent by the time the background task
+   raised, producing `RuntimeError: Caught handled exception, but response already
+   started` and a run stuck `pending` forever. Moved the guard to the *triggering*
+   request, where there is still a caller to tell.
+5. **`provision-nodepools.sh` was written into `deploy/helm/kubesandbox/templates/`** —
+   a stale shell CWD from an earlier command. Inside a Helm chart's `templates/`, so
+   `helm template` would have tried to render a bash script as a Go template. Caught by
+   `test_the_nodepool_script_matches_the_prod_config` failing with `FileNotFoundError`,
+   which is exactly the accident a path-asserting test is for.
+6. **`_helpers.tpl` referenced `.Values.config.extraSettings`, absent from
+   `values.yaml`** — guarded by `| default dict` so it *worked*, but an undeclared
+   values path is invisible to anyone reading the chart. Declared it with an example.
+   This is the failure mode `test_every_values_reference_exists_in_values_yaml` exists
+   for: Go templates render a missing key as the empty string, so a typo produces a
+   valid manifest with a silently wrong value.
+
+---
+
+## Live verification (Phase 9) — what was and wasn't confirmed
+
+This session had **no reachable Postgres, no `helm` binary, and no Azure credentials**,
+so the split is unusually wide. Being explicit rather than implying more than was done:
+
+**Verified directly:**
+- **`GET /metrics` end to end** over a real ASGI transport: 200, correct
+  `text/plain; version=1.0.0` content type, and `kubesandbox_sandboxes_active` /
+  `kubesandbox_runs_total` present with the expected label sets after being incremented.
+- **Session-token security properties**, each confirmed to be rejected: a token signed
+  with another secret, an `alg: none` token (algorithm confusion — the attack pinning
+  `algorithms=["HS256"]` prevents), an expired token, a token missing `tid`/`role`/`exp`,
+  and a token for another audience or issuer. Also that all failures return one
+  indistinguishable message, so the error can't be used as an oracle.
+- **The prod config guards**, in a real subprocess: `aks-prod` refuses the committed
+  placeholder `jwt_secret`, refuses one shorter than 32 bytes (RFC 7518 §3.2), refuses
+  `cors.enabled` with no origins, refuses `*` + credentials, refuses `tracing_enabled`
+  with no endpoint, refuses `azure_keyvault` with no vault URL.
+- **Doc §9's fail-fast contract**, which had never been exercised: every AWS/GCP stub
+  raises rather than no-oping, and `validate_cloud_providers` turns each into a startup
+  `ConfigurationError` naming the offending setting.
+- **The whole `?async=true` -> poll -> bundled result cycle**, over the real routers.
+- **Every v1 route requires a credential** — swept from the live OpenAPI spec rather
+  than a hand-written list, so an endpoint added later can't quietly ship
+  unauthenticated.
+- **Tenant scoping on every new list/read endpoint**, against a two-tenant fixture (a
+  single-tenant fixture cannot tell correct scoping from no scoping).
+- **The Helm chart, statically**: every `.Values` path exists, every control block is
+  closed, and the invariants its comments claim actually hold in the templates.
+- Full unit suite: **480 passing** (up from Phase 8's 284 — 196 new tests across
+  `test_sdk.py`, `test_cloud_secrets.py`, `test_auth_service.py`, `test_auth_deps.py`,
+  `test_ui_api_surface.py`, `test_helm_chart.py`, and additions to `test_config.py`).
+
+**NOT verified live, and why:**
+- **Alembic `9a1c4e77b210` has never been applied to a real database.** No Postgres was
+  reachable this session (`docker compose up` was requested from the user and the infra
+  did not come up before the session ended). Every prior migration in this repo was
+  verified to upgrade *and* downgrade cleanly; this one has not been. **It is the single
+  highest-priority follow-up** — see below.
+- **`helm lint` / `helm template` never ran** — no `helm` binary. The static test module
+  covers the failure modes it could, and found two real problems doing so, but a
+  successful render is not the same as a passing regex.
+- **OIDC login against a real IdP.** No Azure AD tenant or app registration available.
+  Everything on this side of the boundary is tested (claim mapping, provisioning, role
+  rules, session tokens); the JWKS fetch and RS256 verification against a live issuer
+  are not. Same standing flag `ACRRegistryProvider` and `AzureBlobStorageProvider`
+  already carry.
+- **`AzureKeyVaultSecretsProvider`** — real code, no credentials to run it against.
+- **Node pool provisioning** — no AKS cluster. The script is idempotent and guarded but
+  unrun.
+- **OTLP tracing against a real collector** — none deployed. The config gate and the
+  no-op-when-disabled path are tested; span export is not.
+- **The `docker run --security-opt no-new-privileges` AppArmor limitation** from Phases
+  6-8 was not re-checked this session, so whether sandbox execution works on this host
+  is unknown.
+
+### Required follow-up before this is deployable
+
+```bash
+docker compose up -d postgres redis minio registry
+uv run alembic upgrade head          # apply 9a1c4e77b210
+uv run alembic downgrade -1          # confirm it rolls back cleanly
+uv run alembic upgrade head          # and re-applies
+```
+
+```bash
+helm lint deploy/helm/kubesandbox
+helm template ks deploy/helm/kubesandbox --set secrets.existingSecret=x | kubectl apply --dry-run=client -f -
+helm template ks deploy/helm/kubesandbox -f deploy/helm/kubesandbox/values-local.yaml | kubectl apply --dry-run=client -f -
+```
+
+---
+
+## Known scope boundaries (Phase 9)
+
+- **No rate limiting.** Still open, still cross-cutting. Nothing throttles any endpoint,
+  including `POST /v1/billing/credit-requests` and `POST /v1/api-keys` — a tenant can
+  file unlimited requests or mint unlimited keys. Flagged in `docs/UI_INTEGRATION.md` so
+  a UI doesn't assume server-side protection.
+- **`QuotaService` is not implemented.** Doc §11's concurrent-sandbox caps, cpu/mem
+  quotas, and monthly-minute quotas don't exist; only billing pre-authorization gates
+  creation. A UI therefore cannot show a sandbox quota, because none is enforced.
+- **No `AuditLog` writes.** The table has existed since Phase 0 and nothing writes to
+  it, so there is no activity feed for a UI to render.
+- **Async runs are not durable.** A control-plane restart mid-run leaves that row
+  `running` forever; nothing resumes or reaps it. The same gap `BuildManager`'s
+  background builds already have — the reconciler would be the natural owner of a sweep.
+- **No full run logs.** `GET /v1/runs/{id}` returns the persisted 10 KB excerpt per
+  stream. Doc §10.1 puts overflow in object storage; nothing writes or serves it.
+- **Offset pagination**, so a row can shift between pages if the set changes mid-paging,
+  and deep offsets get slow. Acceptable for tenant-scoped views of thousands of rows.
+- **No push/subscribe for anything but PTY attach.** No SSE, no change feed — a UI
+  dashboard must poll.
+- **The first admin still requires a direct DB write** (or running locally with
+  `auth.disabled`). `AuthService` deliberately never grants a role from a token claim,
+  and `PATCH /v1/admin/users/{id}/role` requires an existing admin — so the bootstrap is
+  a genuine chicken-and-egg. Documented rather than solved; an env-var-driven
+  "bootstrap admin email" would be the obvious fix and is not implemented.
+- **`sandboxes_active` and `pool_hit_rate` deviate from doc §14's literal shape** — see
+  the reasoning above; both are deliberate.
+- **Metrics are per-replica, single-worker.** The Helm chart runs one uvicorn worker per
+  pod and scales via HPA replicas; a multi-worker pod would need
+  `PROMETHEUS_MULTIPROC_DIR` and a shared-mmap registry.
+- **AAD app registrations are not automated** (`deploy/azure/README.md` says so
+  plainly) — they depend on choices this repo has no view into.
+
+---
+
+## Cross-cutting — not owned by a single phase (2/5)
 
 - [ ] `AuditLog` writes — the table exists from Phase 0; no service writes an entry for
       any action yet (`SandboxService` currently only writes `Sandbox`/`Run` rows)
 - [ ] `QuotaService` — concurrent-sandbox caps, cpu/mem quotas, monthly-minute quotas
 - [ ] Rate limiting per API key/user
-- [ ] API-key issuance/management endpoints — the `ApiKey` table and hashed-lookup auth
-      dependency exist and work, but nothing can create or revoke a key except a
-      direct DB insert
-- [ ] `GET /metrics`
+- [x] API-key issuance/management endpoints — **closed in Phase 9b**:
+      `POST/GET/DELETE /v1/api-keys` (`app/api/v1/api_keys.py`), plus `prefix` /
+      `created_by_user_id` / `last_used_at` columns so a listing is renderable and
+      "is this key still in use?" is answerable before revoking.
+- [x] `GET /metrics` — **closed in Phase 9**: `app/api/v1/metrics.py`, gated on
+      `observability.metrics_enabled`, verified live over a real ASGI transport.

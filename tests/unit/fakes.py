@@ -45,6 +45,10 @@ class FakeProvisioner:
     """Records every call so tests can assert on provisioner interactions (e.g. that
     destroy() always runs) without needing a real Docker daemon."""
 
+    backend_name = "fake"
+    """Matches the `backend="fake"` stamped on the handles below — SandboxService reads
+    this for its doc §14 metric labels before a handle exists (Phase 9)."""
+
     def __init__(
         self,
         *,

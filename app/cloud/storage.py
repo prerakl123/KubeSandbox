@@ -4,8 +4,9 @@ Pulled forward from its natural home (roadmap Phase 9) because two Phase 6 build
 strategies have a genuine, immediate need for it: PipelineBuildStrategy's step cache
 and HelmChartStrategy's rendered-manifest artifact storage (see
 docs/TASK_CHECKLIST.md's Phase 6 section) — not built speculatively ahead of a real
-caller. SecretsProvider/ImageRegistryProvider are separate cloud/ concerns; nothing in
-this phase needs SecretsProvider, so it stays untouched.
+caller. SecretsProvider/ImageRegistryProvider are separate cloud/ concerns —
+`registry.py` came along in the same phase for the same reason; `secrets.py` had no
+caller until Phase 9 and was built then (see its own module docstring).
 
 `MinIOStorageProvider` is the only one of these actually exercised against a live
 backend this phase — the `minio` service in docker-compose.yml has been running since
@@ -26,6 +27,7 @@ from azure.identity.aio import DefaultAzureCredential
 from azure.storage.blob.aio import BlobServiceClient
 from botocore.exceptions import ClientError
 
+from app.cloud.base import ComingSoonProvider
 from app.core.config import ObjectStorageSettings
 
 _UNSUPPORTED = "S3/GCS support coming soon"
@@ -136,23 +138,27 @@ class AzureBlobStorageProvider:
                     await blob.delete_blob()
 
 
-class AWSObjectStorageProvider:
+class AWSObjectStorageProvider(ComingSoonProvider):
+    coming_soon = _UNSUPPORTED
+
     async def put(self, key: str, data: bytes) -> None:
-        raise NotImplementedError(_UNSUPPORTED)
+        self._raise()
 
     async def get(self, key: str) -> bytes:
-        raise NotImplementedError(_UNSUPPORTED)
+        self._raise()
 
     async def delete(self, key: str) -> None:
-        raise NotImplementedError(_UNSUPPORTED)
+        self._raise()
 
 
-class GCPObjectStorageProvider:
+class GCPObjectStorageProvider(ComingSoonProvider):
+    coming_soon = _UNSUPPORTED
+
     async def put(self, key: str, data: bytes) -> None:
-        raise NotImplementedError(_UNSUPPORTED)
+        self._raise()
 
     async def get(self, key: str) -> bytes:
-        raise NotImplementedError(_UNSUPPORTED)
+        self._raise()
 
     async def delete(self, key: str) -> None:
-        raise NotImplementedError(_UNSUPPORTED)
+        self._raise()
