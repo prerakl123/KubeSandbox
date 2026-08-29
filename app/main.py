@@ -42,8 +42,10 @@ from app.core.tracing import configure_tracing, instrument_app
 from app.extensions.loader import load_registry
 from app.persistence.db import get_session_factory
 from app.persistence.redis import build_redis_client
+from app.services.audit_service import AuditService
 from app.services.build_manager import BuildManager
 from app.services.entitlement_service import EntitlementService
+from app.services.rate_limiter import RateLimiter
 from app.streaming.ws_gateway import router as ws_router
 
 logger = get_logger(__name__)
@@ -186,6 +188,21 @@ async def lifespan(app: FastAPI):
     app.state.image_registry_provider = build_image_registry_provider(settings)
     app.state.object_storage_provider = build_object_storage_provider(settings)
     app.state.secrets_provider = build_secrets_provider(settings)
+    # Both hold long-lived collaborators (a session factory, a Redis client) rather than
+    # per-request state, so they're built once here — see their own docstrings.
+    app.state.audit_service = AuditService(
+        enabled=settings.audit.enabled, session_factory=get_session_factory()
+    )
+    app.state.rate_limiter = RateLimiter(app.state.redis, enabled=settings.rate_limit.enabled)
+    logger.info(
+        "subsystems",
+        audit=settings.audit.enabled,
+        rate_limit=settings.rate_limit.enabled,
+        quota=settings.quota.enabled,
+        billing=settings.billing.enabled,
+        pool=settings.pool.enabled,
+        persistence=settings.workspace.persistence_enabled,
+    )
 
     # Rehydrate Registry.built_images from the latest successful Build row per
     # component (doc §8, Phase 6) — otherwise a control-plane restart would forget

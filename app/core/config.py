@@ -92,6 +92,25 @@ class ProvisionerSettings(BaseModel):
     """Each entry is a raw K8s Toleration dict (`key`/`operator`/`value`/`effect`) —
     passed straight through to `V1Toleration(**entry)`."""
 
+    seccomp_profile: str = "builtin"
+    """Docker-backend syscall filter (doc §6 Layer 1). `builtin` is Docker's own curated
+    profile — roughly 44 blocked syscalls including `mount`, `ptrace`, `kexec_load`, and
+    `bpf`. Named explicitly rather than left to the daemon's default so a daemon started
+    with `--seccomp-profile=unconfined` fails loudly here instead of quietly running an
+    unfiltered sandbox. A path to a custom profile JSON also works, if one is shipped to
+    the host. Kubernetes uses `RuntimeDefault` via the pod securityContext instead and
+    ignores this."""
+
+    apparmor_profile: str | None = "docker-default"
+    """Docker-backend mandatory access control (doc §6 Layer 1's AppArmor/SELinux).
+
+    `None` omits the option entirely, which is the setting an SELinux host needs: naming
+    an AppArmor profile on a host with no AppArmor makes every container create fail, and
+    RHEL-family hosts use SELinux (already applied by the daemon via its own labelling,
+    not through this option). Explicit by default because the alternative — relying on
+    Docker to apply `docker-default` on its own — silently drops the layer on a host
+    where it isn't there, and doc §6 counts it as a layer."""
+
 
 class PoolSettings(BaseModel):
     """Warm-pool sizing per weight class (doc §4.3). Disabled by default in local."""
@@ -159,6 +178,79 @@ class BillingSettings(BaseModel):
     both `local.yaml` and `aks-prod.yaml` — flipping it on for real requires funding
     tenant wallets and configuring `pricing_rules` first (doc §13's admin APIs), or a
     fresh credit-mode tenant's zero balance blocks every sandbox creation outright."""
+
+
+class QuotaSettings(BaseModel):
+    """Default per-tenant ceilings (doc §11, doc §10.1's `quotas` table).
+
+    `enabled` gates enforcement the same way `billing.enabled` and
+    `workspace.persistence_enabled` do. Unlike those, the defaults below are **set rather
+    than null** even though enforcement is off: the numbers are what a tenant's quota row
+    materializes with the moment an operator flips this on, and shipping nulls would mean
+    turning quotas on enforces nothing until every dimension is configured by hand.
+
+    A null dimension means "no limit". Only concurrency and monthly minutes have defaults
+    — cpu/memory ceilings depend enormously on cluster size, and a guessed number there
+    would either be instantly breached or meaningless.
+    """
+
+    enabled: bool = False
+    default_max_concurrent_sandboxes: int | None = 10
+    default_max_cpu_millicores: int | None = None
+    default_max_memory_mb: int | None = None
+    default_max_monthly_minutes: int | None = 10_000
+
+
+class RateLimitSettings(BaseModel):
+    """Per-identity request budgets (doc §11's "rate limiting per key/user").
+
+    Off by default, like every other opt-in subsystem — turning throttling on for an
+    existing deployment can break a client that was previously unbounded, and that should
+    be a deliberate act.
+
+    Three buckets rather than one global budget, because the costs differ by orders of
+    magnitude: `execute` provisions a container, `mutation` writes, and `read` is a
+    SELECT. One shared number would have to be set low enough for the expensive path,
+    which would then throttle a UI doing ordinary reads.
+    """
+
+    enabled: bool = False
+    execute_per_minute: int = 30
+    """`POST /v1/execute`, `POST /v1/sandboxes`, `POST .../runs` — anything that
+    provisions or runs. 30/min is roughly one every two seconds, generous for a human and
+    a real ceiling for a runaway script."""
+    mutation_per_minute: int = 120
+    """Other writes: files, key management, credit requests."""
+    read_per_minute: int = 600
+    """GETs. 10/second per identity — a UI polling a few endpoints won't notice, a scraper
+    will."""
+
+    @model_validator(mode="after")
+    def _positive_budgets(self) -> "RateLimitSettings":
+        for name in ("execute_per_minute", "mutation_per_minute", "read_per_minute"):
+            if getattr(self, name) < 1:
+                # A zero would silently reject every request rather than disabling the
+                # limit, which is what someone setting 0 almost certainly intends.
+                raise ValueError(f"rate_limit.{name} must be >= 1 (set enabled: false to disable)")
+        return self
+
+
+class AuditSettings(BaseModel):
+    """Audit trail (doc §6 Layer 5).
+
+    **On by default**, unlike every other subsystem added in this pass. Doc §6 lists the
+    audit log as a security layer, not a feature, and a deployment that silently isn't
+    recording who ran what is in a worse position than one that knows it isn't. The cost
+    is one INSERT per audited action, in a transaction that is already committing.
+    """
+
+    enabled: bool = True
+    retention_days: int | None = 365
+    """How long entries are kept before the reconciler prunes them. `None` disables
+    pruning entirely (keep forever). A year by default: long enough to investigate an
+    incident found late, short enough that the table doesn't grow without bound. Note that
+    doc §6's intent is that the *shipped* copy (stdout -> log aggregator) is the tamper-
+    resistant record; this table is the queryable one."""
 
 
 class ObservabilitySettings(BaseModel):
@@ -273,6 +365,29 @@ class AuthSettings(BaseModel):
     """Which claim identifies the caller's tenant. `tid` (the AAD directory id) is the
     right default; a deployment that maps several KubeSandbox tenants onto one AAD
     directory should point this at a custom claim emitted by the IdP instead."""
+    bootstrap_admin_emails: list[str] = Field(default_factory=list)
+    """Emails promoted to `admin` on OIDC login (doc §11's RBAC bootstrap).
+
+    Solves a genuine chicken-and-egg: `AuthService` deliberately never grants a role
+    from a token claim, and `PATCH /v1/admin/users/{id}/role` requires an *existing*
+    admin — so without this the first admin needs a direct database write.
+
+    The privilege this confers is narrower than it looks. Listing an address does not
+    create an account or grant anything by itself: someone must still authenticate
+    against the real IdP *as that address*. An attacker therefore needs both the ability
+    to edit this config and control of that mailbox in the directory — and anyone who can
+    edit the deployment's config already owns the deployment.
+
+    Evaluated on every login, not just the first, so adding an address later works
+    without a redeploy dance. Deliberately **never demotes**: removing an address leaves
+    an existing admin alone, because an admin promoted in-app through the proper endpoint
+    must not be silently revoked by unrelated config drift. Demote via
+    `PATCH /v1/admin/users/{id}/role`.
+
+    Compared as a case-insensitive exact match — email casing is not meaningfully
+    case-sensitive in practice, and an IdP may not preserve the casing a human typed
+    here."""
+
     oidc_email_claim: str = "preferred_username"
     """AAD v2.0 puts the sign-in name here; `email` is only present when the optional
     claim is configured on the app registration. `AuthService` falls back through
@@ -296,6 +411,9 @@ class Settings(BaseSettings):
     reconciler: ReconcilerSettings = Field(default_factory=ReconcilerSettings)
     limits: ExecutionLimits = Field(default_factory=ExecutionLimits)
     billing: BillingSettings = Field(default_factory=BillingSettings)
+    quota: QuotaSettings = Field(default_factory=QuotaSettings)
+    rate_limit: RateLimitSettings = Field(default_factory=RateLimitSettings)
+    audit: AuditSettings = Field(default_factory=AuditSettings)
     observability: ObservabilitySettings = Field(default_factory=ObservabilitySettings)
     auth: AuthSettings = Field(default_factory=AuthSettings)
     cors: CorsSettings = Field(default_factory=CorsSettings)

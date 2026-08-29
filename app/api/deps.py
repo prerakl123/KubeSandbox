@@ -29,16 +29,20 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.cloud.registry import ImageRegistryProvider
 from app.cloud.storage import ObjectStorageProvider
 from app.core.config import get_settings
+from app.core.timeutil import elapsed_seconds
 from app.domain.auth import Principal
 from app.extensions.loader import Registry
 from app.persistence.db import get_session, get_session_factory
 from app.persistence.models import ApiKey, Tenant, User
 from app.provisioners.base import Provisioner
+from app.services.audit_service import AuditService
 from app.services.auth_service import AuthenticationFailed, AuthService
 from app.services.billing_service import BillingService
 from app.services.build_manager import BuildManager
 from app.services.entitlement_service import EntitlementService
 from app.services.pool_manager import PoolManager
+from app.services.quota_service import QuotaService
+from app.services.rate_limiter import RateLimiter
 from app.services.registry_service import RegistryService
 from app.services.sandbox_service import SandboxService
 from app.services.template_service import TemplateService
@@ -85,9 +89,7 @@ def _is_stale(last_used_at: datetime | None, now: datetime) -> bool:
     """
     if last_used_at is None:
         return True
-    if last_used_at.tzinfo is None:
-        last_used_at = last_used_at.replace(tzinfo=UTC)
-    return (now - last_used_at) > _LAST_USED_WRITE_INTERVAL
+    return elapsed_seconds(last_used_at, now) > _LAST_USED_WRITE_INTERVAL.total_seconds()
 
 
 def _hash_api_key(raw_key: str) -> str:
@@ -243,7 +245,47 @@ def get_billing_service() -> BillingService:
     return BillingService(default_mode=get_settings().billing.default_mode)
 
 
-def _build_sandbox_service(registry: Registry, provisioner: Provisioner) -> SandboxService:
+def get_quota_service() -> QuotaService:
+    settings = get_settings().quota
+    return QuotaService(
+        default_max_concurrent_sandboxes=settings.default_max_concurrent_sandboxes,
+        default_max_cpu_millicores=settings.default_max_cpu_millicores,
+        default_max_memory_mb=settings.default_max_memory_mb,
+        default_max_monthly_minutes=settings.default_max_monthly_minutes,
+    )
+
+
+def get_audit_service(request: Request) -> AuditService:
+    """Built once in the lifespan and held on app.state — it owns a session factory for
+    `record_standalone()`, and constructing one per request would be pointless churn.
+
+    Falls back to an equivalent instance when app.state is unpopulated (a TestClient
+    constructed without entering the lifespan). The fallback is deliberately *functional*
+    rather than disabled: silently stopping audit writes because a lookup missed would
+    defeat the point of doc §6 Layer 5, and a working fallback costs one object.
+    """
+    existing = getattr(request.app.state, "audit_service", None)
+    if existing is not None:
+        return existing
+    settings = get_settings()
+    return AuditService(enabled=settings.audit.enabled, session_factory=get_session_factory())
+
+
+def get_rate_limiter(request: Request) -> RateLimiter:
+    """Falls back to a *disabled* limiter when app.state is unpopulated — the opposite
+    choice from audit above, and for a stated reason: a limiter needs the Redis client the
+    lifespan built, and without one there is nothing to count in. Disabled means "allow",
+    which matches `RateLimiter`'s own documented fail-open policy for a Redis outage, so
+    the fallback behaves identically to the real thing losing Redis."""
+    existing = getattr(request.app.state, "rate_limiter", None)
+    if existing is not None:
+        return existing
+    return RateLimiter(None, enabled=False)
+
+
+def _build_sandbox_service(
+    registry: Registry, provisioner: Provisioner, audit_service: AuditService | None = None
+) -> SandboxService:
     settings = get_settings()
     pool_manager = PoolManager(provisioner) if settings.pool.enabled else None
     workspace_service = (
@@ -252,6 +294,7 @@ def _build_sandbox_service(registry: Registry, provisioner: Provisioner) -> Sand
         else None
     )
     billing_service = get_billing_service() if settings.billing.enabled else None
+    quota_service = get_quota_service() if settings.quota.enabled else None
     return SandboxService(
         registry,
         provisioner,
@@ -263,6 +306,8 @@ def _build_sandbox_service(registry: Registry, provisioner: Provisioner) -> Sand
         heavy_tolerations=settings.provisioner.heavy_tolerations,
         workspace_service=workspace_service,
         billing_service=billing_service,
+        quota_service=quota_service,
+        audit_service=audit_service,
         # Needed only by the `?async=true` path, whose work outlives the request that
         # triggered it and so can't use the request-scoped session (the same reason
         # BuildManager takes one).
@@ -273,12 +318,17 @@ def _build_sandbox_service(registry: Registry, provisioner: Provisioner) -> Sand
 def get_sandbox_service(
     registry: Registry = Depends(get_registry),
     provisioner: Provisioner = Depends(get_provisioner),
+    audit_service: AuditService = Depends(get_audit_service),
 ) -> SandboxService:
-    return _build_sandbox_service(registry, provisioner)
+    return _build_sandbox_service(registry, provisioner, audit_service)
 
 
 def get_sandbox_service_ws(websocket: WebSocket) -> SandboxService:
-    return _build_sandbox_service(websocket.app.state.registry, websocket.app.state.provisioner)
+    return _build_sandbox_service(
+        websocket.app.state.registry,
+        websocket.app.state.provisioner,
+        getattr(websocket.app.state, "audit_service", None),
+    )
 
 
 def get_entitlement_service(session: AsyncSession = Depends(get_session)) -> EntitlementService:

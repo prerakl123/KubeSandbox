@@ -26,10 +26,13 @@ from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.deps import Principal, get_current_principal
+from app.api.deps import Principal, get_audit_service, get_current_principal
 from app.api.pagination import Page, PageParamsDep, paginate
+from app.api.ratelimit_deps import rate_limit_mutation
 from app.persistence.db import get_session
 from app.persistence.models import ApiKey
+from app.services import audit_service as audit
+from app.services.audit_service import AuditService
 
 router = APIRouter(prefix="/v1/api-keys", tags=["API keys"])
 
@@ -108,11 +111,13 @@ def _summarize(row: ApiKey) -> ApiKeySummary:
         "with role `service`, never as the person who minted it, so it can never be "
         "used to reach admin endpoints."
     ),
+    dependencies=[Depends(rate_limit_mutation)],
 )
 async def create_api_key(
     body: CreateApiKeyRequest,
     principal: Principal = Depends(get_current_principal),
     session: AsyncSession = Depends(get_session),
+    audit_svc: AuditService = Depends(get_audit_service),
 ) -> CreateApiKeyResponse:
     raw_key = f"{_KEY_PREFIX}{secrets.token_urlsafe(_KEY_ENTROPY_BYTES)}"
     row = ApiKey(
@@ -125,6 +130,17 @@ async def create_api_key(
         created_by_user_id=principal.user_id,
     )
     session.add(row)
+    await session.flush()  # populates row.id for the audit entry below
+    # Minting a long-lived credential is one of the most security-relevant actions
+    # available to a non-admin, and the `prefix` is what ties an audit entry to a key
+    # later — the key itself is never recorded anywhere.
+    audit_svc.record(
+        session,
+        action=audit.APIKEY_CREATE,
+        principal=principal,
+        target=row.id,
+        detail={"label": row.label, "prefix": row.prefix},
+    )
     await session.commit()
     await session.refresh(row)
     summary = _summarize(row)
@@ -172,6 +188,7 @@ async def revoke_api_key(
     key_id: str = Path(description="Key id, as returned by POST /v1/api-keys."),
     principal: Principal = Depends(get_current_principal),
     session: AsyncSession = Depends(get_session),
+    audit_svc: AuditService = Depends(get_audit_service),
 ) -> None:
     row = await session.get(ApiKey, key_id)
     # A key belonging to another tenant reports 404, not 403 — the same rule
@@ -180,4 +197,11 @@ async def revoke_api_key(
         raise HTTPException(status.HTTP_404_NOT_FOUND, "no such API key")
     if not row.revoked:
         row.revoked = True
+        audit_svc.record(
+            session,
+            action=audit.APIKEY_REVOKE,
+            principal=principal,
+            target=row.id,
+            detail={"label": row.label, "prefix": row.prefix},
+        )
         await session.commit()

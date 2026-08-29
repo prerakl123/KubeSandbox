@@ -11,6 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import Principal, get_current_principal, get_sandbox_service
 from app.api.pagination import Page, PageParamsDep, paginate
+from app.api.ratelimit_deps import rate_limit_execute, rate_limit_mutation
 from app.domain.execution import BatchRunResult
 from app.persistence.db import get_session
 from app.persistence.models import Sandbox
@@ -120,6 +121,8 @@ class RunRequest(BaseModel):
         "batch commands against it via `POST .../runs`, or attaches an interactive "
         "PTY session via `WS .../attach`."
     ),
+    responses={429: {"description": "Rate limit exceeded; see Retry-After."}},
+    dependencies=[Depends(rate_limit_execute)],
 )
 async def create_sandbox(
     body: CreateSandboxRequest,
@@ -228,6 +231,8 @@ async def destroy_sandbox(
         "existing warm sandbox instead of a fresh ephemeral one. Never destroys the "
         "sandbox, win or lose."
     ),
+    responses={429: {"description": "Rate limit exceeded; see Retry-After."}},
+    dependencies=[Depends(rate_limit_execute)],
 )
 async def run_in_sandbox(
     body: RunRequest,
@@ -284,6 +289,7 @@ async def download_file(
         "same one batch execution's `files` argument uses); a non-UTF-8 upload is "
         "rejected with a clear 400 rather than silently corrupted."
     ),
+    dependencies=[Depends(rate_limit_mutation)],
 )
 async def upload_file(
     path: str = _FILE_PATH_QUERY,

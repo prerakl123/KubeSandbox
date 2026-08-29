@@ -28,6 +28,11 @@ secrets:
 provisioner:
   backend: kubernetes
   runtime_class: gvisor
+  # Docker-backend only — aks-prod uses the Kubernetes provisioner, which applies
+  # seccomp/AppArmor through the pod securityContext instead (RuntimeDefault for both).
+  # Kept here so the two profiles are documented in one place per environment.
+  seccomp_profile: builtin
+  apparmor_profile: docker-default
   namespace_prefix: "kubesandbox-sb-"
   # Heavy-workload segregation (doc §4.3). These MUST match the label and taint
   # deploy/azure/provision-nodepools.sh applies to the `heavy` node pool — they are two
@@ -76,6 +81,35 @@ billing:
   # Same "requires operational setup first" caveat as local.yaml — REPLACE_ME once
   # tenant wallets are funded and pricing_rules are configured for real.
   enabled: false
+
+quota:
+  # REPLACE_ME: flip to true once the per-tenant numbers below are right for the cluster
+  # size. Left false so an upgrade can't start refusing sandboxes for tenants who were
+  # previously unbounded — turning it on is a deliberate act with a blast radius.
+  enabled: false
+  default_max_concurrent_sandboxes: 10
+  # cpu/memory ceilings depend entirely on cluster capacity; a guessed number is either
+  # instantly breached or meaningless, so these stay unset (null = no limit).
+  default_max_cpu_millicores: null
+  default_max_memory_mb: null
+  default_max_monthly_minutes: 10000
+
+rate_limit:
+  # REPLACE_ME: flip to true. Left false for the same reason as quotas — an existing
+  # client that was never throttled can break the moment it is. Requires Redis, which
+  # aks-prod has.
+  enabled: false
+  execute_per_minute: 30
+  mutation_per_minute: 120
+  read_per_minute: 600
+
+audit:
+  enabled: true
+  # A year. Note doc §6's intent is that the tamper-resistant record is the *shipped*
+  # copy (structured logs collected off-host, see deploy/azure/README.md) — this table is
+  # the queryable one, and anyone who can reach this database can edit it. If log
+  # shipping isn't configured, lengthen this or set it to null (keep forever).
+  retention_days: 365
 
 observability:
   metrics_enabled: true

@@ -14,9 +14,10 @@ session) and a short list of required follow-up commands.
 **Summary: 103 / 103 roadmap items complete, plus a Phase 9b that wasn't in the
 original plan:**
 - Phase 0 (21/21) — its last open item, OIDC/JWT session auth, was closed by Phase 9b
-- Phase 9 (7/7) + Phase 9b (UI integration readiness, added mid-session by explicit
-request) + 2 of 5 cross-cutting items
-- 480 unit tests passing, up from 284 at the end of Phase 8
+- Phase 9 (7/7) + Phase 9b (UI integration readiness) + a follow-up hardening pass
+- 557 unit tests passing, up from 284 at the end of Phase 8
+- All 5 cross-cutting items now closed, plus an admin-bootstrap mechanism and a
+13-point sandbox-hardening audit (`docs/SECURITY_HARDENING.md`)
 - Phase 1 (21/21, fully live-verified)
 Phase 1 is no longer just "built" — it has been driven end-to-end against real Docker,
 real Postgres, and the actual golden image, via `POST /v1/execute` returning correct
@@ -2150,15 +2151,237 @@ helm template ks deploy/helm/kubesandbox -f deploy/helm/kubesandbox/values-local
 
 ---
 
-## Cross-cutting — not owned by a single phase (2/5)
+## Cross-cutting — not owned by a single phase (5/5)
 
-- [ ] `AuditLog` writes — the table exists from Phase 0; no service writes an entry for
-      any action yet (`SandboxService` currently only writes `Sandbox`/`Run` rows)
-- [ ] `QuotaService` — concurrent-sandbox caps, cpu/mem quotas, monthly-minute quotas
-- [ ] Rate limiting per API key/user
+All five closed. The three that remained after Phase 9b were done in a follow-up
+hardening pass, together with the admin-bootstrap gap and the sandbox-hardening audit
+below — 557 unit tests passing (up from 480).
+
+- [x] `AuditLog` writes — **closed**. `app/services/audit_service.py` + a closed
+      `subject.verb` action vocabulary, wired into sandbox create/destroy/run/attach,
+      auth login and login-failure, API-key create/revoke, admin role/billing/credit/
+      quota mutations, and every quota/billing/rate-limit **denial**. Readable via
+      `GET /v1/admin/audit-logs` (admin-only, filterable by tenant/actor/action/target,
+      paginated); pruned by a new reconciler job against `audit.retention_days`.
+
+      Two design decisions worth recording. **Entries join the caller's transaction**
+      (`session.add`, never its own commit) so an action that rolls back leaves no entry
+      claiming it happened and an action that commits cannot commit without its entry —
+      the usual "best-effort, never fail the request" pattern is wrong here, because an
+      audit trail with silent holes is worse than none since it looks complete. Only
+      events with no surrounding transaction (a login, a rejected credential) use a
+      separate best-effort write. And **no code, stdin, stdout, or credentials are ever
+      recorded** — identifiers, counts, and outcomes only; an audit log that accumulates
+      user source becomes both a compliance liability and the most attractive table in
+      the database. A test asserts submitted code never appears in an entry.
+
+      On by default (`audit.enabled: true`), unlike every other subsystem added in these
+      passes: doc §6 counts the audit log as a security *layer*, and a deployment that
+      silently isn't recording actions is worse off than one that knows it isn't.
+- [x] `QuotaService` — **closed**. `app/services/quota_service.py` +
+      a new `quotas` table (doc §10.1 listed it; **it had never been created**).
+      Concurrency, cpu-millicore, memory, and monthly-minute ceilings per tenant, checked
+      before `acquire()` alongside billing pre-authorization, with
+      `GET`/`PATCH /v1/admin/tenants/{id}/quota` and a self-service `GET /v1/me/quota`.
+
+      Quotas and billing answer different questions, which is why both exist: billing asks
+      whether a tenant can *afford* something (consumable, and a funded tenant continues
+      indefinitely), quotas whether it should be *allowed* that much at once (a ceiling
+      that binds regardless of funding). Since `billing.enabled` is false by default,
+      before this **nothing at all** bounded a tenant's concurrency.
+- [x] Rate limiting per API key/user — **closed**. `app/services/rate_limiter.py`:
+      Redis-backed sliding window (a sorted set, so a caller can't send 2x the limit
+      across a fixed-window boundary), three route classes with separate budgets
+      (`execute`/`mutation`/`read` — one shared number would have to be set low enough
+      for the expensive path), applied as per-route dependencies rather than global
+      middleware so a route's cost is a visible property of the route rather than
+      inferred from its path. Rejections carry `Retry-After` plus RFC 9331 `RateLimit-*`
+      headers, and `RateLimit-Remaining` is set on *successful* responses too — a client
+      that only learns its budget by being rejected can't avoid being rejected.
+
+      Keyed on the **user** (or tenant for a service account), not per API key: any
+      authenticated caller can mint more keys via `POST /v1/api-keys`, so a per-key budget
+      would be trivially bypassable. **Fails open** on a Redis outage, deliberately —
+      nothing here is a security boundary, and turning a Redis outage into a total API
+      outage converts a degradation into an incident.
 - [x] API-key issuance/management endpoints — **closed in Phase 9b**:
       `POST/GET/DELETE /v1/api-keys` (`app/api/v1/api_keys.py`), plus `prefix` /
       `created_by_user_id` / `last_used_at` columns so a listing is renderable and
       "is this key still in use?" is answerable before revoking.
 - [x] `GET /metrics` — **closed in Phase 9**: `app/api/v1/metrics.py`, gated on
       `observability.metrics_enabled`, verified live over a real ASGI transport.
+
+---
+
+## Follow-up pass — admin bootstrap, cross-cutting, and hardening
+
+Four asks, after Phase 9b: close the first-admin chicken-and-egg, implement the
+cross-cutting items above, root-cause the host's Docker problem, and audit the codebase
+against a standard 13-point sandbox-hardening list.
+
+### Admin bootstrap (the "seeding" question)
+
+Two mechanisms, because they cover different situations and neither alone is enough:
+
+- [x] `auth.bootstrap_admin_emails` — an operator-configured allowlist, promoted to
+      `admin` on OIDC login. The privilege it confers is narrower than it looks: listing
+      an address creates nothing and grants nothing by itself, since someone must still
+      authenticate against the real IdP *as that address*. An attacker needs both
+      config-edit access and control of that mailbox — and anyone who can edit the
+      deployment's config already owns the deployment.
+
+      Evaluated on **every** login so adding an address later works without a redeploy
+      dance, and deliberately **never demotes**: removing an address leaves an existing
+      admin alone, because an admin promoted in-app through the proper endpoint must not
+      be silently revoked by unrelated config drift. Case-insensitive, since an IdP may
+      not preserve the casing a human typed into config.
+- [x] `app/cli.py seed-admin` — for environments with **no IdP at all** (`local`, kind, a
+      fresh prod database before the AAD app registration exists), where the allowlist
+      does nothing because there is no login to promote on. Idempotent; refuses to
+      promote an existing non-admin account unless `--promote-existing` is passed, since
+      that account may belong to a different tenant. `list-admins` answers "is there an
+      admin at all?", which is the question you have when a UI returns 403 and you don't
+      know whether bootstrap ever happened.
+
+      A CLI rather than an endpoint on purpose: running it requires shell access to a host
+      that already holds the database credential, which is exactly the privilege level
+      that *should* be needed to mint the first admin — and a much better boundary than an
+      HTTP route behind a shared bootstrap token that then has to be rotated or disabled
+      forever after.
+
+`AuthService` still reads **no** role claim from a token (`roles`/`wids`/`groups` are all
+ignored); a test asserts a token claiming every admin-shaped role still produces a plain
+user. The allowlist is operator config, not token data, and that distinction is what makes
+it safe.
+
+### Sandbox hardening audit
+
+Full item-by-item audit in **`docs/SECURITY_HARDENING.md`**. Eight of thirteen controls
+were already in place; five needed work:
+
+- [x] **Swap was unbounded** (Docker). The default `MemorySwap` is *twice* the memory
+      limit, so a sandbox declaring 512MiB could touch 1GiB before the OOM killer
+      intervened — with the extra half on host swap, unaccounted and orders of magnitude
+      slower. Now pinned to `Memory`, Docker's documented "no swap at all". Sidecars too.
+- [x] **tmpfs ignored the component's declared `ephemeralStorageMB`** — every writable
+      path got a hardcoded `size=1g`. Now derived from the spec. Note the interaction that
+      makes this safe rather than cosmetic: tmpfs pages are charged to the memory cgroup,
+      so a tmpfs bomb OOM-kills the sandbox instead of filling the host disk — but only
+      because swap is now disabled. The two fixes reinforce each other.
+- [x] **Cloud metadata endpoint (IMDS) blocking** — the highest-value fix. It was already
+      unreachable, but only *incidentally*: NetworkPolicy is additive and has no deny
+      primitive, so the moment anyone adds the obvious rule ("allow 0.0.0.0/0 on 443 so
+      pip works") IMDS reopens and nothing about that rule looks wrong. On a node with a
+      managed identity, IMDS hands IAM credentials to anything that can reach it. Fixed
+      with a second per-namespace policy allowing `0.0.0.0/0` **except** `169.254.0.0/16`,
+      so the exclusion survives being unioned with a permissive rule; same pattern
+      appended to both deploy overlays. The whole `/16`, since AWS also uses
+      `169.254.170.2` for ECS task credentials.
+- [x] **Explicit, configurable seccomp + AppArmor.** Docker previously relied on the
+      daemon's implicit defaults — a daemon started with `--seccomp-profile=unconfined`
+      would run an unfiltered sandbox with nothing in the logs to say so. Both are now
+      named (`seccomp=builtin`, `apparmor=docker-default`) *and configurable*, which
+      matters: naming an AppArmor profile on a host without AppArmor fails **every**
+      container create, and RHEL-family hosts use SELinux instead — so
+      `apparmor_profile: null` is the supported way to run there. Hardcoding it would have
+      made the platform undeployable on those hosts.
+- [x] **Kubernetes AppArmor** — `securityContext.appArmorProfile: RuntimeDefault` (a
+      first-class field since 1.30) on both the sandbox pod and the workspace utility pod.
+      `RuntimeDefault` rather than a named profile so it works on a gVisor/Kata node pool
+      that may not carry a custom one.
+- [ ] **Kubernetes per-pod PID limits** — a real gap between the two backends, and **not
+      closeable from application code**: Kubernetes has no pod-level PID field, only the
+      kubelet's `podPidsLimit`. `access.limits.processes` is honored on Docker and
+      silently ignored on Kubernetes. Documented as a required node-pool setting in
+      `deploy/azure/README.md` §7. A fork bomb on `aks-prod` is still bounded by the pod's
+      memory limit, just by OOM rather than a clean ceiling.
+
+### Bugs found and fixed during this pass
+
+1. **The rate limiter systematically undercounted — worst under load.** The sorted-set
+   member was `f"{now_ms}-{id(rule)}"`, which is the *same string* for every call in the
+   same millisecond with the same rule object, so `zadd` **overwrote** instead of adding
+   and the window never grew past one entry. Two concurrent requests collapsed into one
+   slot; the limiter was least effective exactly when it was the only thing between a
+   runaway client and the cluster. Fixed with a `uuid4` per request. Caught by
+   `test_requests_are_allowed_up_to_the_limit_then_rejected`.
+2. **The naive/aware datetime hazard, for the third time.** A
+   `DateTime(timezone=True)` column comes back aware from Postgres and **naive** from
+   SQLite, and mixing them raises `TypeError`. It had already bitten `deps._is_stale`
+   (Phase 9), was latent behind a feature flag in `destroy_sandbox`'s billing arithmetic,
+   and bit again in the new destroy-time audit entry. Third occurrence earned a shared
+   home: `app/core/timeutil.py`'s `ensure_utc`/`elapsed_seconds`, now used by all three,
+   with `elapsed_seconds` clamping negatives (a backdated row or an NTP step otherwise
+   produces negative billed usage). The asymmetry is what makes this class of bug nasty —
+   it is invisible in a SQLite-backed suite whenever the path only runs against Postgres,
+   and invisible in production whenever it only runs in tests.
+3. **Run audit entries were attributed to `system` instead of the user.** `_audit_run`
+   passed no principal, so `actor_for(None)` returned the system actor for every user's
+   own run — making the audit trail's single most important column wrong for its single
+   most common entry. `SandboxService` threads ids rather than a `Principal`, so
+   `actor_from_ids` was added and the actor threaded through `_persist_run_result`.
+4. **`app.state`-backed dependencies 500'd without a lifespan**, breaking 38 tests. Fixed
+   by giving each a considered fallback rather than a blanket one: audit falls back to a
+   *functional* service (silently dropping audit writes because a lookup missed would
+   defeat the point), rate limiting to a *disabled* one (it needs the Redis client the
+   lifespan built, and "allow" matches its documented fail-open policy).
+
+### Live verification (this pass)
+
+Same environment constraints as Phase 9, and now with a root cause for them:
+
+- **The host's Docker problem is a wedged root filesystem, not a Docker or AppArmor
+  issue.** `jbd2/sda1-8` — the ext4 journal thread for `/` — is stuck in uninterruptible
+  (`D`) sleep, along with **13 `umount` processes** for leftover **kind-cluster**
+  containerd mounts (`/run/containerd/.../k8s.io/...`) and ~19 writeback kworkers. Load
+  average **51 with zero containers running**. Every disk write queues behind the journal,
+  which is why `docker run` hangs, `alembic` hung, and even `cat` on a cold file timed out
+  earlier in these sessions. `D`-state processes ignore `SIGKILL`, so there is no
+  userspace fix — it needs a reboot, and the leftover kind state should be cleared
+  afterwards so it can't recur. Also worth correcting the record: the host is **Ubuntu
+  Core 24** (all-snap by design), so Phase 6-8's "snap-packaged Docker + AppArmor"
+  diagnosis was directionally right about confinement, but today's symptom is a hang
+  rather than a permission error and has a different cause.
+- **Unit suite: 557 passing** (up from 480 — 77 new tests across `test_hardening.py` and
+  `test_hardening_api.py`, plus an updated `test_kubernetes_provisioner.py` for the second
+  NetworkPolicy).
+- **Still unverified live, unchanged from Phase 9**: both Alembic migrations
+  (`9a1c4e77b210`, and the new `c3f81a92e740` for `quotas`) have never been applied to a
+  real database; `helm lint`/`helm template` has never run; OIDC against a real IdP, Key
+  Vault, node pools, gVisor, and OTLP export are all untested. The rate limiter has never
+  run against real Redis — the sliding-window logic is covered by a fake implementing the
+  sorted-set subset it uses, which is what caught the `zadd` bug, but Redis's own
+  behaviour under concurrency is not exercised.
+
+### Known scope boundaries (this pass)
+
+- **Quota accounting uses per-weight-class budgets**, not each live sandbox's resolved
+  cpu/memory limits. `sandboxes` doesn't persist resolved resources, and re-resolving each
+  one's component/template on every quota check would mean registry lookups inside a
+  request that is only trying to count. The budgets are deliberately *conservative* (at or
+  above what a typical component in that class declares) so enforcement errs toward
+  refusing. The exact fix is persisting resolved cpu/memory on the row — a schema change
+  this pass didn't take.
+- **Quota enforcement is check-then-act, not a reservation.** Between the count and the
+  insert, concurrent requests can push a tenant one sandbox over its cap; over-admission
+  is bounded by the number of simultaneous in-flight creates. A hard guarantee needs
+  either `SELECT ... FOR UPDATE` on the quota row (serializing every create for a tenant)
+  or a reservation table with a reaper for crashed reservations. Not worth it for a limit
+  whose purpose is stopping a tenant taking hundreds of sandboxes, not exactly N.
+- **Monthly-minute quota caps compute, not occupancy.** It sums `runs.duration_ms`, the
+  only durable record of how long compute actually ran; a non-ephemeral sandbox's idle
+  *lifetime* isn't included, because it has no `runs` row and double-counting a warm
+  sandbox's runs plus its wall-clock lifetime would overstate usage badly. Concurrency
+  caps occupancy instead.
+- **No egress proxy or package mirror is shipped** — a deployment that needs `pip install`
+  must provide one, and must add the rule carefully (see the IMDS note above for why).
+- **No log shipping is configured**, which matters for the specific threat item 13
+  addresses: anyone who can reach the database can edit `audit_logs`, so the
+  tamper-resistant record has to be the shipped copy. The reconciler's pruning assumes it
+  exists; if it doesn't, lengthen `audit.retention_days` or set it to `null`.
+- **Audit coverage is not yet total.** Component/template publishing, build triggering,
+  entitlement and publish-grant changes, and workspace file reads/writes have action
+  constants defined but no call sites wired. The high-value paths (runs with exit codes,
+  lifecycle, auth, keys, role changes, denials) are covered.
+- **`SANDBOX_ATTACH_REJECTED` is defined but unwired** — the 409 path is in the WS gateway,
+  which raises before the audit service is reachable in the dependency graph.

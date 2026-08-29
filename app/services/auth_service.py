@@ -171,14 +171,22 @@ class AuthService:
         """Look up — or provision on first login — the Tenant and User behind a set of
         validated OIDC claims.
 
-        A newly provisioned user always gets role `user`, never `admin`, regardless of
-        anything in the token: role is a KubeSandbox concept (doc §11's RBAC) and
-        promoting someone must be a deliberate act by an existing admin, not something
-        an IdP claim can grant. An *existing* user's role is never overwritten either,
-        so a promotion survives every subsequent login.
+        A newly provisioned user gets role `user`, never `admin`, regardless of anything
+        in the token: role is a KubeSandbox concept (doc §11's RBAC) and promoting
+        someone must be a deliberate act, not something an IdP claim can grant. No
+        `roles`/`wids`/`groups` claim is read here at all.
+
+        The single exception is `auth.bootstrap_admin_emails` — an operator-configured
+        allowlist, not token data, which exists because the alternative is requiring a
+        direct database write to create the first admin. See that setting's own docstring
+        for why the privilege it confers is narrower than it appears.
+
+        An existing user's role is otherwise never overwritten, so a promotion made
+        through `PATCH /v1/admin/users/{id}/role` survives every subsequent login.
         """
         tenant_key, email = self._identity_from_claims(claims)
         tenant_name = f"{_TENANT_NAME_PREFIX}{tenant_key}"
+        is_bootstrap_admin = self._is_bootstrap_admin(email)
 
         tenant = (
             await session.execute(select(Tenant).where(Tenant.name == tenant_name))
@@ -191,18 +199,37 @@ class AuthService:
 
         user = (await session.execute(select(User).where(User.email == email))).scalar_one_or_none()
         if user is None:
-            user = User(tenant_id=tenant.id, email=email, role="user")
+            user = User(
+                tenant_id=tenant.id, email=email, role="admin" if is_bootstrap_admin else "user"
+            )
             session.add(user)
             await session.flush()
-            logger.info("oidc_user_provisioned", user_id=user.id, tenant_id=tenant.id)
+            logger.info(
+                "oidc_user_provisioned",
+                user_id=user.id,
+                tenant_id=tenant.id,
+                role=user.role,
+                bootstrap_admin=is_bootstrap_admin,
+            )
         elif user.tenant_id != tenant.id:
             # `users.email` is globally unique (doc §10.1's schema), so the same address
             # can't belong to two tenants. Refused rather than silently re-homed: moving
             # a user between tenants would hand them another tenant's sandboxes.
             raise AuthenticationFailed("this identity is already registered under a different tenant")
+        elif is_bootstrap_admin and user.role != "admin":
+            # Promotes an existing user too, so adding an address to the allowlist works
+            # for someone who has already signed in once. Never the reverse — see
+            # `AuthSettings.bootstrap_admin_emails` for why removal doesn't demote.
+            logger.warning("bootstrap_admin_promoted", user_id=user.id, previous_role=user.role)
+            user.role = "admin"
 
         await session.commit()
         return Principal(tenant_id=user.tenant_id, user_id=user.id, role=user.role)
+
+    def _is_bootstrap_admin(self, email: str) -> bool:
+        return email.casefold() in {
+            configured.casefold() for configured in self._settings.bootstrap_admin_emails
+        }
 
     # -- session tokens ---------------------------------------------------------------
 

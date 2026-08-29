@@ -5,7 +5,8 @@ the "standalone users" consumer in `ARCHITECTURE_AND_PLAN.md` §1 — the human 
 terminal, not the workflow-builder (which is batch-only and talks through `sdk/`).
 
 Building the UI is a separate stage of work. This document is the contract it will build
-against, and the honest list of what the backend does and doesn't provide as of Phase 9.
+against, and the honest list of what the backend does and doesn't provide as of the
+post-Phase-9 hardening pass.
 
 ---
 
@@ -56,11 +57,15 @@ default) is on the token response and `session_ttl_seconds` on `/v1/auth/config`
 silent MSAL re-auth and call `/v1/auth/token` again before it lapses. The IdP already
 holds the long-lived session; duplicating that here would add a second thing to revoke.
 
-**Roles**: a first-time user is always created with role `user`. No IdP claim can grant
-`admin` — an existing admin must promote them via
-`PATCH /v1/admin/users/{id}/role`. Note this means **the very first admin has to be
-created by a direct DB write** (or by running locally with `auth.disabled`, where the
-local-dev principal is an admin).
+**Roles**: a first-time user is always created with role `user`, and **no IdP claim can
+grant `admin`** — `roles`, `wids`, and `groups` are all ignored. Promotion happens through
+`PATCH /v1/admin/users/{id}/role` by an existing admin.
+
+The first admin comes from one of two operator-side mechanisms (not a DB write, as an
+earlier draft of this document said): `auth.bootstrap_admin_emails` promotes a listed
+address on OIDC login, and `uv run python -m app.cli seed-admin --email …` creates one
+directly for environments with no IdP at all. A UI should assume an admin already exists
+and surface a clear message on 403 rather than trying to bootstrap anything itself.
 
 ---
 
@@ -173,6 +178,9 @@ Everything a UI needs, grouped by the screen that consumes it.
 | Storage | `GET /v1/workspaces/me` |
 | Billing | `GET /v1/billing/account`, `GET /v1/billing/usage`, `POST`/`GET /v1/billing/credit-requests` |
 | Settings / keys | `POST`/`GET`/`DELETE /v1/api-keys` |
+| Usage / limits | `GET /v1/me/quota` |
+| Activity feed (admin) | `GET /v1/admin/audit-logs` |
+| Quota admin | `GET`/`PATCH /v1/admin/tenants/{id}/quota` |
 | Builds | `GET /v1/builds`, `GET /v1/builds/{id}`, `POST /v1/components/{name}/build` |
 | Admin | `GET /v1/admin/tenants`, `GET /v1/admin/users`, `PATCH /v1/admin/users/{id}/role`, `GET`/`PATCH /v1/admin/entitlements`, `GET`/`PATCH /v1/admin/publish-grants`, `GET`/`POST /v1/admin/pricing-rules`, `PATCH /v1/admin/tenants/{id}/billing`, `POST /v1/admin/tenants/{id}/credit`, `GET /v1/admin/credit-requests`, `PATCH /v1/admin/credit-requests/{id}` |
 
@@ -236,13 +244,7 @@ Being explicit, so the UI isn't designed around something that doesn't exist:
   provisioner and self-heals a stale row) over polling the list, which reports last-known
   DB state.
 - **No collaboration.** One viewer per sandbox, by design.
-- **No rate limiting.** Nothing throttles any endpoint yet, including credit requests. A
-  UI should still debounce, but it will not be told to.
-- **No audit log.** The `audit_logs` table exists and nothing writes to it, so there is no
-  activity feed to render.
-- **No quota enforcement beyond billing.** `QuotaService` (concurrent-sandbox caps,
-  monthly minutes) is not implemented — a UI cannot show a sandbox quota because none is
-  enforced.
+- **No push/subscribe** beyond PTY attach (see above) — a dashboard must poll.
 - **No full run logs.** `GET /v1/runs/{id}` returns the first 10 KB of each stream, which
   is what's persisted. §10.1 puts overflow in object storage; nothing writes or serves it.
 - **No notifications.** A filed credit request is a queued row; nobody is told. An admin
@@ -254,7 +256,49 @@ Being explicit, so the UI isn't designed around something that doesn't exist:
 
 ---
 
-## 10. Local development setup
+## 10. Rate limiting, quotas, and the audit log
+
+All three landed in the hardening pass after Phase 9, and each changes what a UI must
+handle.
+
+**Rate limiting.** Off by default; when on, every response carries `RateLimit-Limit`,
+`RateLimit-Remaining`, `RateLimit-Reset`, and `RateLimit-Policy` — including *successful*
+ones, so a client can slow down before it is blocked rather than discovering the limit by
+being rejected. A 429 additionally carries `Retry-After` in seconds; back off by that
+value rather than retrying immediately, since a rejected request still extends the
+caller's own window.
+
+Three independent budgets, so exhausting one does not affect the others:
+
+| Bucket | Applies to | Default |
+|---|---|---|
+| `execute` | `POST /v1/execute`, `POST /v1/sandboxes`, `POST .../runs` | 30/min |
+| `mutation` | file upload, API keys, credit requests | 120/min |
+| `read` | listing endpoints | 600/min |
+
+Probes (`/healthz`, `/readyz`) and `/metrics` are never limited.
+
+**Quotas.** `GET /v1/me/quota` gives the caller's own position:
+
+```json
+{ "enabled": true, "max_concurrent_sandboxes": 10, "concurrent_sandboxes": 3,
+  "max_monthly_minutes": 10000, "monthly_minutes": 412 }
+```
+
+Check `enabled` before rendering a limit as binding — quotas are recorded but not
+enforced when the deployment has them off, and showing a user a ceiling that isn't real
+is worse than showing nothing. A breach returns **429**, the same status as a billing
+refusal, so distinguish them by the `detail` text: quota messages name the dimension
+("concurrent sandbox quota exceeded"), billing messages name credit or the spend cap.
+
+**Audit log.** `GET /v1/admin/audit-logs` (admin-only, paginated, filterable by
+`tenant_id`/`actor`/`action`/`target`) is now a renderable activity feed. `actor` is a
+user id, `service:<tenant_id>` for an API-key caller, or `system` for the reconciler.
+`detail` holds identifiers, counts, and outcomes — never code, stdin, stdout, or
+credentials, so don't build UI expecting to show what a user ran, only that they ran it
+and how it ended.
+
+## 11. Local development setup
 
 ```bash
 docker compose up -d postgres redis minio registry

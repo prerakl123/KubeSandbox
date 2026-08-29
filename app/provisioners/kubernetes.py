@@ -161,6 +161,47 @@ def _max_single_container_resources(spec: SandboxSpec) -> tuple[str, str]:
     return format_nanocpus_to_cpu(cpu_nanos), format_bytes_to_memory(memory_bytes)
 
 
+_LINK_LOCAL_CIDR = "169.254.0.0/16"
+"""The whole link-local range, not just 169.254.169.254. Azure IMDS also answers on
+169.254.169.254 only, but AWS added 169.254.170.2 for ECS task credentials and GCP uses
+metadata.google.internal -> 169.254.169.254; blocking the range covers every variant and
+costs nothing, since nothing a sandbox legitimately needs lives in link-local space."""
+
+
+def _deny_metadata_egress(namespace: str) -> "client.V1NetworkPolicy":
+    """Allow-everything-except-link-local, as a floor under any overlay allowlist.
+
+    Expressed as an allow rule with an `except` clause rather than as a deny rule, because
+    NetworkPolicy has no deny primitive: policies are additive and a pod's effective
+    egress is the union of every rule that selects it. So the only way to make a range
+    unreachable *regardless of what else is added later* is for every allow rule to
+    exclude it — this one does, and it is created for every sandbox namespace.
+
+    On its own this policy would grant broad egress, which is why the default-deny policy
+    is created alongside it: with both present and no overlay allowlist, the union still
+    permits nothing outbound. It only becomes load-bearing once someone adds a permissive
+    rule, which is exactly when it is needed.
+    """
+    return client.V1NetworkPolicy(
+        metadata=client.V1ObjectMeta(name="deny-metadata-egress", namespace=namespace),
+        spec=client.V1NetworkPolicySpec(
+            pod_selector=client.V1LabelSelector(),
+            policy_types=["Egress"],
+            egress=[
+                client.V1NetworkPolicyEgressRule(
+                    to=[
+                        client.V1NetworkPolicyPeer(
+                            ip_block=client.V1IPBlock(
+                                cidr="0.0.0.0/0", _except=[_LINK_LOCAL_CIDR]
+                            )
+                        )
+                    ]
+                )
+            ],
+        ),
+    )
+
+
 class KubernetesProvisioner:
     backend_name = "kubernetes"
 
@@ -358,6 +399,26 @@ class KubernetesProvisioner:
         )
         await self._networking_v1.create_namespaced_network_policy(namespace, policy)
 
+        # Second policy, and it exists for a specific failure mode rather than for
+        # defence in depth in the abstract.
+        #
+        # The default-deny above already blocks the cloud metadata endpoint
+        # (169.254.169.254 — IMDS on Azure/AWS/GCP), which on a node with a managed
+        # identity hands out IAM credentials to anything that can reach it. But
+        # NetworkPolicy is *additive*: the moment any policy in this namespace allows
+        # egress, the union is what applies. A future allowlist written the obvious way —
+        # "allow 0.0.0.0/0 on 443 so pip works" — silently re-opens IMDS, and nothing
+        # about that policy looks wrong.
+        #
+        # `_deny_metadata_egress` is written so that cannot happen by accident: it allows
+        # everything *except* the link-local range, so unioning it with a permissive rule
+        # still leaves the sandbox able to reach the internet while IMDS stays
+        # unreachable. Doc §12 keeps allowlists in the overlay; this is not an allowlist,
+        # it is a floor under them.
+        await self._networking_v1.create_namespaced_network_policy(
+            namespace, _deny_metadata_egress(namespace)
+        )
+
     async def _create_resource_quota(self, namespace: str, spec: SandboxSpec) -> None:
         # "pods": "1" still holds — a sidecar is another *container* in the one
         # sandbox Pod, not a second Pod. cpu/memory must cover main + every sidecar's
@@ -443,6 +504,13 @@ class KubernetesProvisioner:
                     # the Kubernetes-native equivalent of Docker's explicit tmpfs uid/gid/mode.
                     fs_group=_SANDBOX_UID,
                     seccomp_profile=client.V1SeccompProfile(type="RuntimeDefault"),
+                    # Doc §6 Layer 1's MAC layer, the Kubernetes counterpart to the
+                    # Docker backend's `apparmor=docker-default`. A first-class field
+                    # since 1.30 (previously the `container.apparmor.security.beta`
+                    # annotation); `RuntimeDefault` resolves to whatever profile the
+                    # container runtime ships, so it works on a gVisor/Kata node pool
+                    # without naming a profile that pool may not have.
+                    app_armor_profile=client.V1AppArmorProfile(type="RuntimeDefault"),
                 ),
                 containers=[
                     client.V1Container(
@@ -647,6 +715,13 @@ class KubernetesProvisioner:
                     run_as_group=_SANDBOX_UID,
                     fs_group=_SANDBOX_UID,
                     seccomp_profile=client.V1SeccompProfile(type="RuntimeDefault"),
+                    # Doc §6 Layer 1's MAC layer, the Kubernetes counterpart to the
+                    # Docker backend's `apparmor=docker-default`. A first-class field
+                    # since 1.30 (previously the `container.apparmor.security.beta`
+                    # annotation); `RuntimeDefault` resolves to whatever profile the
+                    # container runtime ships, so it works on a gVisor/Kata node pool
+                    # without naming a profile that pool may not have.
+                    app_armor_profile=client.V1AppArmorProfile(type="RuntimeDefault"),
                 ),
                 containers=[
                     client.V1Container(

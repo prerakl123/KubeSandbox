@@ -34,9 +34,9 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
-from sqlalchemy import select
+from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.cloud.storage import ObjectStorageProvider
@@ -49,7 +49,7 @@ from app.domain.billing import UsageEvent
 from app.domain.execution import SandboxHandle
 from app.extensions.loader import Registry, load_registry
 from app.persistence.db import get_session_factory
-from app.persistence.models import Sandbox, User, Workspace
+from app.persistence.models import AuditLog, Sandbox, User, Workspace
 from app.provisioners.base import Provisioner
 from app.services.billing_service import BillingService
 from app.services.pool_manager import PoolManager
@@ -68,6 +68,7 @@ class ReconcileTickResult:
     workspaces_skipped_active: list[str] = field(default_factory=list)
     workspace_storage_billed: list[str] = field(default_factory=list)
     orphans_reaped: list[str] = field(default_factory=list)
+    audit_entries_pruned: int = 0
 
 
 def _poolable_language_components(registry: Registry):
@@ -205,6 +206,34 @@ async def bill_workspace_storage(
     return billed
 
 
+async def prune_audit_logs(
+    *, session: AsyncSession, retention_days: int | None, now: datetime
+) -> int:
+    """Delete audit entries older than the retention window (doc §6 Layer 5).
+
+    `None` keeps everything forever, which is a legitimate choice for a deployment whose
+    compliance story wants it — the default is a year.
+
+    A bulk DELETE rather than loading rows: this table is append-only and grows with every
+    action, so a year's worth on a busy deployment is the largest table in the database and
+    fetching it into Python to delete it would be absurd. Nothing references an audit row
+    by foreign key, so there are no cascades to worry about.
+
+    Note the asymmetry with doc §6's intent: pruning *this* copy is fine precisely because
+    the tamper-resistant record is the shipped one (structured logs collected off-host).
+    If that shipping isn't configured, lengthen the retention.
+    """
+    if retention_days is None:
+        return 0
+    cutoff = now - timedelta(days=retention_days)
+    result = await session.execute(delete(AuditLog).where(AuditLog.created_at < cutoff))
+    await session.commit()
+    pruned = int(result.rowcount or 0)
+    if pruned:
+        logger.info("audit_logs_pruned", pruned=pruned, cutoff=cutoff.isoformat())
+    return pruned
+
+
 async def run_tick(
     *,
     session: AsyncSession,
@@ -263,6 +292,10 @@ async def run_tick(
         result.workspace_storage_billed = await bill_workspace_storage(
             session=session, billing_service=billing_service, interval_seconds=settings.reconciler.interval_seconds
         )
+
+    result.audit_entries_pruned = await prune_audit_logs(
+        session=session, retention_days=settings.audit.retention_days, now=now
+    )
 
     result.orphans_reaped = await reap_orphans(
         session=session,

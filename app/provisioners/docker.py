@@ -115,12 +115,72 @@ def _half_close_stdin(stream: Stream) -> None:
             transport.write_eof()
 
 
+_DEFAULT_SECCOMP_PROFILE = "builtin"
+_DEFAULT_APPARMOR_PROFILE = "docker-default"
+
+
+def _security_opts(seccomp: str, apparmor: str | None) -> list[str]:
+    """Doc §6 Layer 1's `no-new-privileges` + syscall filter + MAC, as Docker expects them.
+
+    Both profiles are named explicitly rather than left to the daemon's defaults: "the
+    default happens to be right" is not a guarantee, and a daemon started with
+    `--seccomp-profile=unconfined` would otherwise run an unfiltered sandbox with nothing
+    in the logs to say so. Naming them means an unsupported host fails at create time.
+
+    `apparmor=None` omits the option — required on SELinux hosts, where naming an
+    AppArmor profile fails outright and the daemon applies SELinux labelling of its own
+    instead. See `ProvisionerSettings.apparmor_profile`.
+    """
+    opts = ["no-new-privileges", f"seccomp={seccomp}"]
+    if apparmor:
+        opts.append(f"apparmor={apparmor}")
+    return opts
+
+_DEFAULT_TMPFS_SIZE_MB = 1024
+"""Fallback when a component declares no `ephemeralStorageMB`. Previously hardcoded as
+`size=1g` for every writable path regardless of what the component asked for."""
+
+
+def _tmpfs_size_mb(spec: SandboxSpec) -> int:
+    """Doc §6 Layer 1's ephemeral-storage limit, honored on Docker.
+
+    Each writable path gets its own tmpfs of this size, so a spec declaring 512MiB with
+    `/workspace` and `/tmp` writable can hold 1GiB total. That is deliberate and matches
+    how Kubernetes accounts `emptyDir` per-volume rather than per-pod; the real ceiling
+    is the memory cgroup, since tmpfs pages are charged to it — which is exactly why
+    `MemorySwap` above matters, and why a tmpfs bomb OOM-kills the sandbox instead of
+    filling the host disk.
+    """
+    return spec.resources.ephemeral_storage_mb or _DEFAULT_TMPFS_SIZE_MB
+
+
+def _tmpfs_options(size_mb: int) -> str:
+    """`nosuid` and `nodev` are the load-bearing pair: without them a writable mount can
+    hold a setuid binary or a device node, either of which turns "the user can write
+    files" into a privilege-escalation primitive. `exec` is granted deliberately — see
+    the long comment at the call site for why compiled languages need it and why it
+    doesn't weaken containment."""
+    return (
+        f"rw,exec,nosuid,nodev,size={size_mb}m,"
+        f"uid={_SANDBOX_UID},gid={_SANDBOX_UID},mode=0755"
+    )
+
+
 class DockerProvisioner:
     backend_name = "docker"
 
-    def __init__(self, docker: aiodocker.Docker | None = None) -> None:
+    def __init__(
+        self,
+        docker: aiodocker.Docker | None = None,
+        *,
+        seccomp_profile: str = _DEFAULT_SECCOMP_PROFILE,
+        apparmor_profile: str | None = _DEFAULT_APPARMOR_PROFILE,
+    ) -> None:
         self._docker = docker or aiodocker.Docker()
         self._owns_docker = docker is None
+        self._security_opts = _security_opts(seccomp_profile, apparmor_profile)
+        """Computed once — it's the same for every container this provisioner creates,
+        and rebuilding the list per acquire would just be churn."""
 
     async def aclose(self) -> None:
         if self._owns_docker:
@@ -162,13 +222,21 @@ class DockerProvisioner:
             # containment: the sandboxed non-root user can already run arbitrary
             # code via the language interpreter/compiler itself.
             "Tmpfs": {
-                path: f"rw,exec,nosuid,nodev,size=1g,uid={_SANDBOX_UID},gid={_SANDBOX_UID},mode=0755"
-                for path in tmpfs_paths
+                path: _tmpfs_options(_tmpfs_size_mb(spec)) for path in tmpfs_paths
             },
+            # Swap disabled outright by pinning MemorySwap to Memory. Docker's default is
+            # 2x the memory limit, which means a `Memory: 512Mi` sandbox can actually
+            # touch 1GiB before the OOM killer intervenes — and the extra half lands on
+            # host swap, where it is both unaccounted and orders of magnitude slower.
+            # Equal values is Docker's documented way to say "no swap at all".
+            "MemorySwap": parse_memory_to_bytes(spec.resources.memory),
             "CapDrop": ["ALL"],
-            "SecurityOpt": ["no-new-privileges"],
+            "SecurityOpt": self._security_opts,
             # Default-deny is the floor everywhere (doc §12); local has no
             # mirror/egress proxy wired up yet, so full isolation is correct here.
+            # This is also what makes the cloud metadata endpoint (169.254.169.254)
+            # unreachable on this backend — with no network namespace connectivity at
+            # all there is no route to it, so no explicit deny rule is needed.
             "NetworkMode": "none",
         }
         if volume_name is not None:
@@ -334,13 +402,14 @@ class DockerProvisioner:
                 "NanoCpus": parse_cpu_to_nanocpus(sidecar.resources.cpu),
                 "Memory": parse_memory_to_bytes(sidecar.resources.memory),
                 "PidsLimit": sidecar.max_processes,
+                "MemorySwap": parse_memory_to_bytes(sidecar.resources.memory),
                 "Tmpfs": {
                     path: f"rw,exec,nosuid,nodev,size=1g,uid={sidecar.uid},gid={sidecar.uid},mode=0755"
                     for path in sidecar.writable_paths
                 },
                 "CapDrop": ["ALL"],
                 "CapAdd": ["CHOWN", "FOWNER", "DAC_OVERRIDE", "SETUID", "SETGID"],
-                "SecurityOpt": ["no-new-privileges"],
+                "SecurityOpt": self._security_opts,
             },
         }
         try:
@@ -496,7 +565,7 @@ class DockerProvisioner:
                     ],
                     "NetworkMode": "none",
                     "CapDrop": ["ALL"],
-                    "SecurityOpt": ["no-new-privileges"],
+                    "SecurityOpt": self._security_opts,
                 },
             },
             name=f"kubesandbox-wsmount-{uuid.uuid4().hex[:12]}",
@@ -535,7 +604,7 @@ class DockerProvisioner:
                     "NetworkMode": "none",
                     "CapDrop": ["ALL"],
                     "CapAdd": ["CHOWN"],
-                    "SecurityOpt": ["no-new-privileges"],
+                    "SecurityOpt": self._security_opts,
                 },
             },
             name=f"kubesandbox-wsrestore-{uuid.uuid4().hex[:12]}",

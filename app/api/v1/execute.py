@@ -7,6 +7,7 @@ from pydantic import BaseModel, Field, model_validator
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import Principal, get_current_principal, get_sandbox_service
+from app.api.ratelimit_deps import rate_limit_execute
 from app.domain.execution import BatchRunResult
 from app.persistence.db import get_session
 from app.services.sandbox_service import SandboxService
@@ -71,7 +72,9 @@ class AsyncRunAccepted(BaseModel):
     responses={
         200: {"description": "Synchronous run finished; body is the bundled result."},
         202: {"description": "Async run accepted; body carries the run_id to poll."},
+        429: {"description": "Rate limit exceeded; see Retry-After."},
     },
+    dependencies=[Depends(rate_limit_execute)],
 )
 async def execute(
     body: ExecuteRequest,

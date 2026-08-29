@@ -43,7 +43,10 @@ from app.provisioners.kubernetes import KubernetesProvisioner
 async def build_provisioner(settings: Settings):
     backend = settings.provisioner.backend
     if backend == "docker":
-        return DockerProvisioner()
+        return DockerProvisioner(
+            seccomp_profile=settings.provisioner.seccomp_profile,
+            apparmor_profile=settings.provisioner.apparmor_profile,
+        )
     if backend == "kubernetes":
         return await KubernetesProvisioner.create(
             kubeconfig_path=settings.provisioner.kubeconfig_path,

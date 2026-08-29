@@ -49,12 +49,14 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from app.core import metrics
 from app.core.errors import (
     BillingAuthorizationError,
+    QuotaExceededError,
     ComponentNotFoundError,
     KubeSandboxError,
     SandboxNotFoundError,
     TemplateNotFoundError,
 )
 from app.core.logging import get_logger
+from app.core.timeutil import elapsed_seconds
 from app.core.tracing import span
 from app.domain.execution import (
     BatchCommand,
@@ -73,9 +75,12 @@ from app.extensions.loader import Registry
 from app.persistence.models import Run, Sandbox, Workspace
 from app.provisioners.base import Provisioner, PTYStream
 from app.provisioners.resources import parse_duration_to_seconds
+from app.services import audit_service as audit
+from app.services.audit_service import AuditService, actor_from_ids
 from app.services.billing_service import BillingService, db_sidecar_count, estimate_usage_for_spec, usage_events_for_run
 from app.services.credentials import DbCredentials
 from app.services.pool_manager import PoolManager
+from app.services.quota_service import QuotaService
 from app.services.template_render import RenderedTemplateSpec, render_template
 from app.services.weight_class_scheduler import WeightClassScheduler
 from app.services.workspace_service import WorkspaceService
@@ -137,6 +142,8 @@ class SandboxService:
         heavy_tolerations: list[dict[str, str]] | None = None,
         workspace_service: WorkspaceService | None = None,
         billing_service: BillingService | None = None,
+        quota_service: QuotaService | None = None,
+        audit_service: AuditService | None = None,
         session_factory: async_sessionmaker[AsyncSession] | None = None,
     ) -> None:
         self._registry = registry
@@ -149,6 +156,10 @@ class SandboxService:
         self._heavy_tolerations = heavy_tolerations or []
         self._workspace_service = workspace_service
         self._billing_service = billing_service
+        self._quota_service = quota_service
+        """Opt-in like every other subsystem here (`quota.enabled`, false by default):
+        `None` skips enforcement entirely, reproducing pre-quota behavior exactly."""
+        self._audit_service = audit_service
         self._session_factory = session_factory
         """Only the `?async=true` path needs this (doc §5.1, Phase 9): its work runs
         after the triggering request — and its request-scoped session — has already
@@ -282,7 +293,39 @@ class SandboxService:
         )
         auth = await self._billing_service.authorize(tenant_id, estimate, session=session)
         if not auth.authorized:
+            if self._audit_service is not None:
+                # Recorded before raising, and committed by the exception path's own
+                # rollback-free session: a refusal is exactly the kind of event an
+                # operator needs in the audit trail when a tenant reports being blocked.
+                await self._audit_service.record_standalone(
+                    action=audit.DENIED_BILLING,
+                    tenant_id=tenant_id,
+                    detail={"reason": auth.reason, "estimated_cost": auth.estimated_cost},
+                )
             raise BillingAuthorizationError(auth.reason or "billing authorization denied")
+
+    async def _check_quota(
+        self, resolved: _ResolvedSpec, *, tenant_id: str, session: AsyncSession
+    ) -> None:
+        """Doc §11's quota half, run alongside billing pre-authorization and before
+        `acquire()` for the same reason: a refusal must cost nothing.
+
+        Quota is checked *before* billing deliberately. A tenant over its concurrency
+        ceiling should be told that, not told its wallet is short — and a quota check is
+        two cheap counts where authorization prices an estimate against pricing rules.
+        """
+        if self._quota_service is None:
+            return
+        try:
+            await self._quota_service.check(
+                tenant_id, resources=resolved.spec.resources, session=session
+            )
+        except QuotaExceededError as exc:
+            if self._audit_service is not None:
+                await self._audit_service.record_standalone(
+                    action=audit.DENIED_QUOTA, tenant_id=tenant_id, detail={"reason": str(exc)}
+                )
+            raise
 
     async def _acquire_instrumented(self, spec: SandboxSpec, *, source: str) -> SandboxHandle:
         """`provisioner.acquire()` wrapped in doc §14's `provision_latency` histogram
@@ -498,6 +541,7 @@ class SandboxService:
         command: list[str],
         component_ref: str,
         session: AsyncSession,
+        user_id: str | None = None,
     ) -> Run:
         """Write (or complete) the `runs` row for a finished batch run.
 
@@ -522,6 +566,17 @@ class SandboxService:
         if existing_run_id is None:
             run_row = Run(**fields)
             session.add(run_row)
+            # Flushed before auditing: `Run.id` is a Python-side column default, so it is
+            # still None at `add()` time and the audit entry would record `run_id: null`
+            # — the one field that makes the entry joinable back to the run.
+            await session.flush()
+            self._audit_run(
+                run_row,
+                tenant_id=tenant_id,
+                user_id=user_id,
+                component_ref=component_ref,
+                session=session,
+            )
             return run_row
 
         run_row = await session.get(Run, existing_run_id)
@@ -534,7 +589,52 @@ class SandboxService:
             return run_row
         for key, value in fields.items():
             setattr(run_row, key, value)
+        self._audit_run(
+            run_row,
+            tenant_id=tenant_id,
+            user_id=user_id,
+            component_ref=component_ref,
+            session=session,
+        )
         return run_row
+
+    def _audit_run(
+        self,
+        run_row: Run,
+        *,
+        tenant_id: str,
+        user_id: str | None,
+        component_ref: str,
+        session: AsyncSession,
+    ) -> None:
+        """Doc §6 Layer 5 verbatim: "who, what, when, exit code".
+
+        Queued on the same session as the `Run` row, so the audit entry and the run it
+        describes commit or roll back together — see `AuditService`'s module docstring on
+        why an audit log with silent holes is worse than none.
+
+        `command` is recorded but the *code* is not: the command is the interpreter
+        invocation (`["python", "runner.py", "main.py"]`), which is useful and bounded,
+        while the source would turn this table into a copy of every program ever run.
+        """
+        if self._audit_service is None:
+            return
+        self._audit_service.record(
+            session,
+            action=audit.SANDBOX_RUN,
+            actor=actor_from_ids(tenant_id, user_id),
+            tenant_id=tenant_id,
+            target=run_row.sandbox_id,
+            detail={
+                "run_id": run_row.id,
+                "component": component_ref,
+                "command": list(run_row.command or []),
+                "exit_code": run_row.exit_code,
+                "duration_ms": run_row.duration_ms,
+                "timed_out": run_row.timed_out,
+                "truncated": run_row.truncated,
+            },
+        )
 
     async def start_async_run(
         self,
@@ -658,6 +758,7 @@ class SandboxService:
         resolved = self._resolve_spec(language=language, version=version, template=template)
         batch_command = self._build_batch_command(resolved.component, code, stdin)
         idle_ttl_seconds, max_ttl_seconds = self._resolve_ttl_seconds(resolved)
+        await self._check_quota(resolved, tenant_id=tenant_id, session=session)
         await self._authorize_billing(
             resolved, resolved.spec.wall_clock_seconds, tenant_id=tenant_id, session=session
         )
@@ -717,6 +818,7 @@ class SandboxService:
             command=batch_command.command,
             component_ref=resolved.component.key,
             session=session,
+            user_id=user_id,
         )
         sandbox_row.state = "terminated"
 
@@ -753,6 +855,7 @@ class SandboxService:
     ) -> Sandbox:
         resolved = self._resolve_spec(language=language, version=version, template=template)
         idle_ttl_seconds, max_ttl_seconds = self._resolve_ttl_seconds(resolved)
+        await self._check_quota(resolved, tenant_id=tenant_id, session=session)
         await self._authorize_billing(resolved, max_ttl_seconds, tenant_id=tenant_id, session=session)
 
         workspace_id: str | None = None
@@ -811,6 +914,21 @@ class SandboxService:
             max_ttl_seconds=max_ttl_seconds,
         )
         session.add(sandbox_row)
+        if self._audit_service is not None:
+            self._audit_service.record(
+                session,
+                action=audit.SANDBOX_CREATE,
+                tenant_id=tenant_id,
+                target=handle.sandbox_id,
+                detail={
+                    "components": resolved.component_refs,
+                    "template": resolved.template_ref,
+                    "weight_class": resolved.spec.weight_class.value,
+                    "persistent": persistent,
+                    "backend": handle.backend,
+                    "user_id": user_id,
+                },
+            )
         await session.commit()
         await session.refresh(sandbox_row)
         # Incremented only after the commit that makes this sandbox reachable by id:
@@ -872,7 +990,7 @@ class SandboxService:
             # Also covers a TTL reap for free: the reconciler's reap_expired_sandboxes()
             # already calls destroy_sandbox() directly, so no separate wiring is needed
             # there (see usage_events_for_run's own docstring).
-            duration_ms = max(0, int((now - row.created_at).total_seconds() * 1000))
+            duration_ms = int(elapsed_seconds(row.created_at, now) * 1000)
             for event in usage_events_for_run(
                 self._spec_resources_for_row(row),
                 duration_ms,
@@ -884,6 +1002,20 @@ class SandboxService:
 
         row.state = "terminated"
         row.terminated_at = now
+        if self._audit_service is not None:
+            self._audit_service.record(
+                session,
+                action=audit.SANDBOX_DESTROY,
+                tenant_id=tenant_id,
+                target=row.id,
+                detail={
+                    "lifetime_seconds": int(elapsed_seconds(row.created_at, now))
+                    if row.created_at
+                    else None,
+                    "persistent": row.persistent,
+                    "backend": row.backend,
+                },
+            )
         await session.commit()
         # Mirrors create_sandbox()'s increment. Guarded by the `state == "terminated"`
         # early return above, so a repeated destroy of the same sandbox (idempotent by
@@ -903,6 +1035,14 @@ class SandboxService:
         if row.state == "terminated":
             raise SandboxNotFoundError(sandbox_id)
         await self._touch_workspace(row, session)
+        if self._audit_service is not None:
+            # An interactive session is the least reconstructible thing that happens here
+            # — a PTY leaves no `runs` row and no command history the control plane can
+            # see, so without this entry there is no record a human ever attached.
+            self._audit_service.record(
+                session, action=audit.SANDBOX_ATTACH, tenant_id=tenant_id, target=row.id
+            )
+            await session.commit()
         return await self._provisioner.attach(self._handle_from_row(row))
 
     async def _touch_workspace(self, row: Sandbox, session: AsyncSession) -> None:

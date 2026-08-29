@@ -868,18 +868,31 @@ remains for v1; remaining unknowns are implementation-level (exact pricing numbe
 pool sizing, specific mirror URLs) and will surface naturally per-environment during
 Phase 6–9 rather than blocking the design.
 
-**Still open after Phase 9**, all cross-cutting rather than structural, and all recorded
-with their reasoning in `docs/TASK_CHECKLIST.md`:
+**Closed after Phase 9**, in a follow-up hardening pass — all five cross-cutting items
+plus the admin bootstrap gap. `AuditService` makes §6 Layer 5 true, `QuotaService` adds
+§11's ceilings (and the `quotas` table §10.1 listed but nothing had ever created),
+`RateLimiter` adds §11's throttling, and `auth.bootstrap_admin_emails` + `app/cli.py
+seed-admin` remove the need for a direct DB write to mint the first admin. That pass also
+audited the sandbox against a standard 13-point hardening checklist — see
+`docs/SECURITY_HARDENING.md` for the item-by-item result.
 
-- **Rate limiting** per API key/user — nothing throttles any endpoint yet.
-- **`QuotaService`** — §11's concurrent-sandbox caps, cpu/mem quotas, and monthly-minute
-  quotas; only billing pre-authorization gates creation today.
-- **`AuditLog` writes** — the table has existed since Phase 0 and nothing writes to it,
-  so §6 Layer 5's "full audit log of every command/run" is not yet true.
+**Still open**, all recorded with their reasoning in `docs/TASK_CHECKLIST.md` and
+`docs/SECURITY_HARDENING.md`:
+
+- **Kubernetes per-pod PID limits** — §6's fork-bomb protection is enforced on the Docker
+  backend but has no pod-level equivalent in Kubernetes; it is a kubelet setting
+  (`podPidsLimit`) owned by whoever provisions the node pool. Not closeable from
+  application code; documented as a required setting in `deploy/azure/README.md`.
+- **No egress proxy / package mirror** — §12 correctly makes the allowlist an overlay
+  concern, but nothing ships one, so a deployment needing `pip install` must provide it.
+- **No log shipping configured** — the audit table is queryable but not tamper-resistant
+  on its own (anyone who can reach the database can edit it), so §6's intent depends on a
+  shipped copy that this repo doesn't set up.
 - **Full run logs in object storage** (§10.1) — `runs` keeps a 10 KB excerpt per stream
   and nothing writes or serves the overflow.
-- **Admin bootstrap** — no IdP claim can grant the `admin` role (deliberately), and
-  promotion requires an existing admin, so the *first* admin needs a direct DB write.
 - **Async-run durability** — a control-plane restart leaves an in-flight `?async=true`
   run marked `running` forever; nothing resumes or reaps it.
+- **Quota accounting is approximate** — per-weight-class budgets rather than each live
+  sandbox's resolved limits, because `sandboxes` doesn't persist resolved cpu/memory.
+  Conservative (errs toward refusing), and the exact fix is a schema change.
 ```

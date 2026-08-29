@@ -251,6 +251,47 @@ class PoolState(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
+class Quota(Base):
+    """Per-tenant resource ceilings (doc §10.1's `quotas` table, doc §11's "quotas (max
+    concurrent sandboxes, cpu/mem, monthly minutes, credit balance/spend cap) enforced by
+    QuotaService/BillingService before create").
+
+    Doc §10.1 lists this table and it had never actually been created — the whole quota
+    half of that sentence was unimplemented, with only billing pre-authorization gating
+    creation. Added in the post-Phase-9 cross-cutting pass.
+
+    One row per tenant, created lazily on first check with the configured defaults (the
+    same `get_or_create` shape `BillingAccount` and `Workspace` use). A null column means
+    "no limit for this dimension", which is what lets an operator cap concurrency without
+    also having to invent a monthly-minutes number.
+
+    Credit balance and spend cap deliberately live on `billing_accounts`/`credit_wallets`
+    instead: doc §11 groups them with quotas conceptually, but they're enforced by a
+    different service with different semantics (a wallet is consumed, a quota is a
+    ceiling), and duplicating them here would create two sources of truth.
+    """
+
+    __tablename__ = "quotas"
+
+    tenant_id: Mapped[str] = mapped_column(ForeignKey("tenants.id"), primary_key=True)
+    max_concurrent_sandboxes: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    """Counted as non-terminated `sandboxes` rows. The single most important limit here:
+    without it one tenant can occupy the whole cluster, and doc §4.3's weight-class
+    segregation protects *classes* of workload from each other, not tenants."""
+    max_cpu_millicores: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    max_memory_mb: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    """Summed across the tenant's live sandboxes from each one's resolved *limits*, plus
+    the pending request. Same "configured limits, not measured consumption" caveat Phase
+    8's billing carries — there is no metrics pipeline feeding real usage back in."""
+    max_monthly_minutes: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    """Wall-clock sandbox minutes per calendar month, derived from `runs.duration_ms` plus
+    non-ephemeral sandbox lifetimes. The calendar month matches PAYG billing's own cycle
+    definition so a tenant isn't reasoning about two different month boundaries."""
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+
 class PoolMember(Base):
     """One idle, claimable sandbox sitting in a warm pool (doc §4.3), keyed by
     `(image_ref, weight_class)`. Deliberately NOT a row in `sandboxes`: a pool member

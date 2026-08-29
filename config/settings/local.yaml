@@ -65,6 +65,30 @@ billing:
   # to actually exercise pre-authorization/usage-recording locally.
   enabled: false
 
+quota:
+  # Off by default like every other opt-in subsystem. Flip to true to exercise the
+  # concurrency/monthly-minute caps locally — the defaults below then apply per tenant.
+  enabled: false
+  default_max_concurrent_sandboxes: 10
+  default_max_cpu_millicores: null
+  default_max_memory_mb: null
+  default_max_monthly_minutes: 10000
+
+rate_limit:
+  # Off locally: throttling a developer hitting /docs by hand is pure friction, and the
+  # limiter needs Redis (docker-compose provides it, but not everyone runs it).
+  enabled: false
+  execute_per_minute: 30
+  mutation_per_minute: 120
+  read_per_minute: 600
+
+audit:
+  # ON, unlike the others — doc §6 Layer 5 counts the audit log as a security layer, not
+  # a feature, and a local deployment that isn't recording actions gives a misleading
+  # picture of what prod will do.
+  enabled: true
+  retention_days: 365
+
 observability:
   # Metrics cost nothing locally and make `GET /metrics` available for eyeballing
   # during development. Tracing needs a real OTLP collector, which local doesn't run

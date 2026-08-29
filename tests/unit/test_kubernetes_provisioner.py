@@ -128,12 +128,26 @@ async def test_acquire_creates_hardened_namespace_scoped_resources(provisioner):
     ns_call = provisioner._core_v1.create_namespace.call_args
     assert ns_call.args[0].metadata.name == handle.native_ref
 
-    netpol = provisioner._networking_v1.create_namespaced_network_policy.call_args
-    assert netpol.args[0] == handle.native_ref
-    netpol_body = netpol.args[1]
-    assert netpol_body.spec.policy_types == ["Ingress", "Egress"]
-    assert netpol_body.spec.ingress == []
-    assert netpol_body.spec.egress == []
+    # Two policies per sandbox namespace now: the default-deny, and the
+    # allow-except-link-local floor that keeps the cloud metadata endpoint unreachable
+    # even if a later overlay adds a permissive egress rule (NetworkPolicy is additive,
+    # so `except` on an allow rule is the only construct that survives that union).
+    netpol_calls = provisioner._networking_v1.create_namespaced_network_policy.call_args_list
+    assert len(netpol_calls) == 2
+    by_name = {c.args[1].metadata.name: c for c in netpol_calls}
+    assert set(by_name) == {"default-deny", "deny-metadata-egress"}
+
+    deny_all = by_name["default-deny"]
+    assert deny_all.args[0] == handle.native_ref
+    assert deny_all.args[1].spec.policy_types == ["Ingress", "Egress"]
+    assert deny_all.args[1].spec.ingress == []
+    assert deny_all.args[1].spec.egress == []
+
+    metadata_guard = by_name["deny-metadata-egress"].args[1]
+    assert metadata_guard.spec.policy_types == ["Egress"]
+    guard_block = metadata_guard.spec.egress[0].to[0].ip_block
+    assert guard_block.cidr == "0.0.0.0/0"
+    assert guard_block._except == ["169.254.0.0/16"]
 
     quota_call = provisioner._core_v1.create_namespaced_resource_quota.call_args
     assert quota_call.args[1].spec.hard["requests.cpu"] == "500m"

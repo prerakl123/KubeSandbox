@@ -134,6 +134,24 @@ helm upgrade --install kubesandbox ../helm/kubesandbox \
 The chart's `NOTES.txt` warns about anything still unconfigured after install —
 including the two that block a UI outright (CORS disabled, no OIDC issuer).
 
+## 7. Required kubelet setting: per-pod PID limit
+
+**Not set by anything in this repo, and it needs to be.** Kubernetes has no pod-level PID
+limit field — it is a kubelet setting, so it belongs to whoever provisions the node pool:
+
+```bash
+# In the node pool's kubelet config (AKS: --kubelet-config with a JSON file)
+{ "podPidsLimit": 256 }
+```
+
+Without it, doc §6's fork-bomb protection exists only on the Docker backend. A fork bomb on
+`aks-prod` is still bounded — the pod's memory limit stops it — but by OOM rather than by a
+clean PID ceiling, with more collateral scheduling noise. `access.limits.processes` in a
+component manifest (128 by default) is honored on Docker and silently ignored on
+Kubernetes, which is the asymmetry this setting closes.
+
+See `docs/SECURITY_HARDENING.md` item 6.
+
 ## What is still not automated
 
 Honestly: the AAD app registrations. Creating the API and SPA app registrations,

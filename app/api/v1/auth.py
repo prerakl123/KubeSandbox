@@ -18,12 +18,21 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.deps import Principal, get_auth_service, get_current_principal
+from app.api.deps import (
+    Principal,
+    get_audit_service,
+    get_auth_service,
+    get_current_principal,
+    get_quota_service,
+)
 from app.core.config import Settings, get_settings
 from app.core.errors import ConfigurationError
 from app.persistence.db import get_session
 from app.persistence.models import User
+from app.services import audit_service as audit
+from app.services.audit_service import AuditService
 from app.services.auth_service import AuthenticationFailed, AuthService
+from app.services.quota_service import QuotaService
 
 router = APIRouter(prefix="/v1", tags=["Auth"])
 
@@ -159,10 +168,15 @@ async def exchange_token(
     body: TokenRequest,
     session: AsyncSession = Depends(get_session),
     auth_service: AuthService = Depends(get_auth_service),
+    audit_svc: AuditService = Depends(get_audit_service),
 ) -> TokenResponse:
     try:
         token = await auth_service.login(body.oidc_token, session)
     except AuthenticationFailed as exc:
+        # Standalone: `login()` already rolled back, and a failed login has no tenant to
+        # attribute to. Recorded because a burst of these is the clearest signal of a
+        # credential-stuffing attempt against the exchange endpoint.
+        await audit_svc.record_standalone(action=audit.AUTH_LOGIN_FAILED, detail={"reason": str(exc)})
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, str(exc)) from exc
     except ConfigurationError as exc:
         # 503, not 500: the deployment is missing configuration, which is an
@@ -174,6 +188,15 @@ async def exchange_token(
     if token.principal.user_id is not None:
         user = await session.get(User, token.principal.user_id)
         email = user.email if user is not None else None
+
+    # `login()` has already committed the tenant/user provisioning, so this is its own
+    # write rather than a join onto that transaction.
+    await audit_svc.record_standalone(
+        action=audit.AUTH_LOGIN,
+        principal=token.principal,
+        target=token.principal.user_id,
+        detail={"role": token.principal.role},
+    )
 
     return TokenResponse(
         access_token=token.access_token,
@@ -206,4 +229,50 @@ async def me(
         principal=_principal_response(principal, email),
         features=_features(settings),
         app_env=settings.app_env,
+    )
+
+
+class MyQuotaResponse(BaseModel):
+    """The caller's own tenant quota position — the read a UI needs to render "3 of 10
+    sandboxes" without being an admin.
+
+    Read-only by definition: a tenant seeing its own ceiling is useful, a tenant able to
+    raise it is not. Changing quotas is `PATCH /v1/admin/tenants/{id}/quota`.
+    """
+
+    enabled: bool = Field(
+        description="False means quotas are recorded but not enforced in this deployment — "
+        "a UI should not render a limit as binding when it isn't."
+    )
+    max_concurrent_sandboxes: int | None = Field(description="Null = no limit.")
+    max_monthly_minutes: int | None
+    concurrent_sandboxes: int
+    monthly_minutes: int
+
+
+@router.get(
+    "/me/quota",
+    response_model=MyQuotaResponse,
+    summary="The caller's own quota position",
+    description=(
+        "Concurrency and monthly-minute usage against this tenant's ceilings (doc §11). "
+        "Deliberately narrower than the admin view: cpu/memory ceilings are reported to "
+        "admins but omitted here, because their accounting is an approximation over "
+        "per-weight-class budgets and showing a user a precise-looking number they can't "
+        "reconcile against anything is worse than not showing it."
+    ),
+)
+async def my_quota(
+    principal: Principal = Depends(get_current_principal),
+    quota_service: QuotaService = Depends(get_quota_service),
+    session: AsyncSession = Depends(get_session),
+) -> MyQuotaResponse:
+    usage = await quota_service.usage(principal.tenant_id, session=session)
+    await session.commit()  # persists the lazily-created row on first look
+    return MyQuotaResponse(
+        enabled=get_settings().quota.enabled,
+        max_concurrent_sandboxes=usage.max_concurrent_sandboxes,
+        max_monthly_minutes=usage.max_monthly_minutes,
+        concurrent_sandboxes=usage.concurrent_sandboxes,
+        monthly_minutes=usage.monthly_minutes,
     )

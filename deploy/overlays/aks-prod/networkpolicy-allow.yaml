@@ -35,3 +35,30 @@ spec:
           port: 5432
         - protocol: TCP
           port: 6380
+---
+# Floor under every rule above: allow-everything-EXCEPT link-local, so the cloud metadata
+# endpoint (169.254.169.254 — IMDS) stays unreachable no matter what else is added here.
+#
+# Why this shape. NetworkPolicy is additive and has no deny primitive: a pod's effective
+# egress is the union of every rule selecting it. So a rule added later in good faith —
+# "allow 0.0.0.0/0 on 443 so the package mirror works" — silently re-opens IMDS, and on a
+# node with a managed identity IMDS hands out IAM credentials to anything that can reach
+# it. Expressing the exclusion as `except` on an allow rule means it survives that union.
+#
+# Nothing legitimate lives in link-local space, so the whole /16 is excluded rather than
+# the single address: Azure answers on 169.254.169.254, AWS also uses 169.254.170.2 for
+# ECS task credentials, and GCP resolves metadata.google.internal to the same /16.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: deny-metadata-egress
+  namespace: kubesandbox-system
+spec:
+  podSelector: {}
+  policyTypes: ["Egress"]
+  egress:
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 169.254.0.0/16
